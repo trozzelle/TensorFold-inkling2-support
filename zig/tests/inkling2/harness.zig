@@ -84,27 +84,53 @@ pub const Check = struct {
     n: usize = 0,
     bad: usize = 0,
     worst: f64 = 0,
+    first: ?[2]f64 = null, // the first failing output and its reference, printed on failure
 
+    fn miss(c: *Check, got: f64, want: f64) void {
+        c.bad += 1;
+        if (c.first == null) c.first = .{ got, want };
+    }
     /// A bf16 output within one bf16 step of the reference rounded to bf16.
     pub fn b16(c: *Check, got: u16, want: f64) void {
+        c.b16n(got, want, 1);
+    }
+    /// A bf16 output that passes through `n` bf16 rounding points: within n steps of the reference.
+    pub fn b16n(c: *Check, got: u16, want: f64, n: u32) void {
         c.n += 1;
         const d = ulps(got, bf(want));
         c.worst = @max(c.worst, @as(f64, @floatFromInt(d)));
-        if (d > 1) c.bad += 1;
+        if (d > n) c.miss(fb(got), want);
+    }
+    /// b16n, also passing when the output is within `abs` of the reference: a sum that cancels toward zero keeps its
+    /// absolute error, which is many bf16 steps of a value near zero.
+    pub fn b16a(c: *Check, got: u16, want: f64, n: u32, abs: f64) void {
+        c.n += 1;
+        const d = ulps(got, bf(want));
+        if (@abs(fb(got) - want) > abs) c.worst = @max(c.worst, @as(f64, @floatFromInt(d)));
+        if (d > n and @abs(fb(got) - want) > abs) c.miss(fb(got), want);
     }
     /// An f32 output within a relative `rel` of the reference.
     pub fn f(c: *Check, got: f32, want: f64, rel: f64) void {
         c.n += 1;
         const e = @abs(@as(f64, got) - want) / @max(@abs(want), 1e-6);
         c.worst = @max(c.worst, e);
-        if (e > rel) c.bad += 1;
+        if (e > rel) c.miss(got, want);
+    }
+    /// An f32 output within `tol` of the reference relative to max(|want|, mag): sums that cancel toward zero keep
+    /// their absolute error, so they are judged against the outputs' magnitude.
+    pub fn near(c: *Check, got: f32, want: f64, tol: f64, mag: f64) void {
+        c.n += 1;
+        const e = @abs(@as(f64, got) - want) / @max(@abs(want), mag);
+        c.worst = @max(c.worst, e);
+        if (e > tol) c.miss(got, want);
     }
     pub fn same(c: *Check, a: []const u8, b: []const u8) void {
         c.n += 1;
-        if (!std.mem.eql(u8, a, b)) c.bad += 1;
+        if (!std.mem.eql(u8, a, b)) c.miss(0, 0);
     }
     pub fn done(c: *const Check) !void {
-        std.debug.print("{s} {s}: {d} checks, worst {d:.3e}, {d} bad\n", .{ if (c.bad == 0) "PASS" else "FAIL", c.name, c.n, c.worst, c.bad });
+        std.debug.print("{s} {s}: {d} checks, worst {e:.3}, {d} bad\n", .{ if (c.bad == 0) "PASS" else "FAIL", c.name, c.n, c.worst, c.bad });
+        if (c.first) |x| std.debug.print("  first: got {e:.6}, want {e:.6}\n", .{ x[0], x[1] });
         if (c.bad != 0) return error.KernelMismatch;
     }
 };
