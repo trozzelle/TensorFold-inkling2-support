@@ -9,6 +9,8 @@ const plan = @import("plan.zig");
 const pack = @import("expert_pack.zig");
 
 pub const Tensor = ck.Tensor;
+/// The checkpoint a weight load fills (for callers that build single-layer tables).
+pub const Checkpoint = ck.Checkpoint;
 /// A bf16 [n, k] matrix in torch's Linear layout, as core/bf16_matvec.metal reads it.
 pub const Dense = struct { t: Tensor, n: u32, k: u32 };
 /// A short convolution's taps: static [C, 1, 4] bf16, or the global layers' static [4, C] plus their projection.
@@ -99,6 +101,30 @@ fn matrix(c: *const ck.Checkpoint, base: []const u8, k: usize, n: usize, widths:
     return m;
 }
 
+/// Layer `layer`'s experts from its pack files into `c`, as one table of 2 * E descriptors: w13's, then w2's.
+pub fn expertTable(gpa: std.mem.Allocator, device: mtl.Device, c: *ck.Checkpoint, dir: []const u8, batches: []const pack.Batch, layer: u32, H: usize, I: usize, E: usize, widths: *[5]u32) !mtl.Buffer {
+    const table = try device.buffer(2 * E * @sizeOf(exl3.ExpertDescriptor), mtl.ResourceOptions.shared);
+    errdefer table.deinit();
+    const desc = table.slice(exl3.ExpertDescriptor, 2 * E);
+    for (batches) |batch| {
+        const file = try std.fs.path.joinZ(gpa, &.{ dir, "experts", batch.file });
+        defer gpa.free(file);
+        var fb: [32]u8 = undefined;
+        const fp = try fmt(&fb, "x{d}.{d}.", .{ layer, batch.start });
+        try c.addFile(device, file, fp);
+        for (batch.start..batch.end) |e| {
+            var eb: [96]u8 = undefined;
+            // kortexa files name experts by their index in the file; accept the layer index as well
+            const local = try fmt(&eb, "{s}experts.{d}.w13.trellis", .{ fp, e - batch.start });
+            const idx = if (c.tensors.contains(local)) e - batch.start else e;
+            var mb: [96]u8 = undefined;
+            desc[e] = try exl3.descriptor(try matrix(c, try fmt(&mb, "{s}experts.{d}.w13", .{ fp, idx }), H, 2 * I, widths));
+            desc[E + e] = try exl3.descriptor(try matrix(c, try fmt(&mb, "{s}experts.{d}.w2", .{ fp, idx }), I, H, widths));
+        }
+    }
+    return table;
+}
+
 /// The dense file and the first `layers` layers' expert files into `c`, then every view the forward reads.
 pub fn load(gpa: std.mem.Allocator, device: mtl.Device, c: *ck.Checkpoint, t: *const config.Text, p: *const plan.Plan, ex: *const pack.Pack, dir: []const u8, layers: u32) !Weights {
     const path = try std.fs.path.joinZ(gpa, &.{ dir, "model-dense.safetensors" });
@@ -167,26 +193,9 @@ pub fn load(gpa: std.mem.Allocator, device: mtl.Device, c: *ck.Checkpoint, t: *c
         l.router = try dense(c, try N.n(&nb, pre, "mlp.gate.weight"), E, H);
         l.bias = try tensor(c, try N.n(&nb, pre, "mlp.gate.bias"), .f32, &.{E});
         // the experts: each file under its own prefix, each expert's two projections into this layer's table
-        const table = try device.buffer(2 * E * @sizeOf(exl3.ExpertDescriptor), mtl.ResourceOptions.shared);
+        const table = try expertTable(gpa, device, c, dir, ex.layers[li], i, H, I, E, &w.widths);
         w.tables[li] = table;
         tables_made += 1;
-        const desc = table.slice(exl3.ExpertDescriptor, 2 * E);
-        for (ex.layers[li]) |batch| {
-            const file = try std.fs.path.joinZ(gpa, &.{ dir, "experts", batch.file });
-            defer gpa.free(file);
-            var fb: [32]u8 = undefined;
-            const fp = try fmt(&fb, "x{d}.{d}.", .{ i, batch.start });
-            try c.addFile(device, file, fp);
-            for (batch.start..batch.end) |e| {
-                var eb: [96]u8 = undefined;
-                // kortexa files name experts by their index in the file; accept the layer index as well
-                const local = try fmt(&eb, "{s}experts.{d}.w13.trellis", .{ fp, e - batch.start });
-                const idx = if (c.tensors.contains(local)) e - batch.start else e;
-                var mb: [96]u8 = undefined;
-                desc[e] = try exl3.descriptor(try matrix(c, try fmt(&mb, "{s}experts.{d}.w13", .{ fp, idx }), H, 2 * I, &w.widths));
-                desc[E + e] = try exl3.descriptor(try matrix(c, try fmt(&mb, "{s}experts.{d}.w2", .{ fp, idx }), I, H, &w.widths));
-            }
-        }
         l.w13 = .{ .descriptors = .{ .buffer = table }, .count = E, .k = H, .n = 2 * I };
         l.w2 = .{ .descriptors = .{ .buffer = table, .offset = E * @sizeOf(exl3.ExpertDescriptor) }, .count = E, .k = I, .n = H };
     }

@@ -376,6 +376,7 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
         .{ .name = "tf-minimax-vision", .path = "zig/tests/minimax_m3/vision.zig", .about = "MiniMax-M3.1-Flash's image tower alone: an image's patches and text rows, for tools/vision_ref.py's check" },
         .{ .name = "tf-inkling-run", .path = "zig/tests/inkling2/run.zig", .about = "Inkling 2 (EXL3 experts) on Metal: load check, layer dumps, teacher-forced finals, exactness, greedy decoding" },
         .{ .name = "tf-inkling-kernels", .path = "zig/tests/inkling2/kernels.zig", .about = "Inkling 2's Metal glue against FP64 references: values, row independence, non-finite containment" },
+        .{ .name = "tf-inkling-bench", .path = "zig/tests/inkling2/bench.zig", .about = "Inkling 2 benches: tensor-unit GEMM at the dense shapes, the DSpark hold block as matvecs, the core EXL3 expert projections on recorded inputs" },
         .{ .name = "tf-llama-run", .path = "zig/tests/llama/run.zig", .about = "Llama on Metal: greedy tokens, every position's logits or a prompt's last logits, for the reference's check" },
         .{ .name = "tf-flint-run", .path = "zig/tests/flint/run.zig", .about = "Flint greedy tokens, every position's logits or a prompt's last logits, for the reference's check" },
         .{ .name = "tf-qwen36-row-seam", .path = "zig/tests/qwen36_row_seam.zig", .about = "Model-free fixture: the row projection's bias sums stay fp32 at every width" },
