@@ -7,10 +7,14 @@ pub const state = @import("state.zig");
 pub const model = @import("model.zig");
 pub const Model = model.Model;
 pub const forward = @import("forward.zig");
+pub const budget = @import("budget.zig");
+pub const residency = @import("residency.zig");
+pub const backend = @import("backend.zig");
 
 test {
     _ = config;
     _ = plan;
     _ = expert_pack;
     _ = state;
+    _ = budget;
 }
