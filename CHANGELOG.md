@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Metal: Inkling 2 Small with EXL3 routed experts (`kortexa-inkling2-exl3-v1` packs, the rest in bf16) serves text in one stream on a 256 GB Mac, with `--load-limit-gb` setting its memory limit; see [the recipe](docs/recipes/inkling2-exl3-metal.md).
+
 ## 1.3.2
 
 - Metal: Nemotron 3.5 Bolt (`nemotron_h_puzzle`, MLX affine 4-bit) serves text on M1 to M4 Macs, with its per-layer expert counts, latent MoE, bf16 head and Bolt-width Mamba kernels under the kernel contract; an M5 refuses it by name before any weight file is opened, and images and drafts stay deferred (#4162, lands #1038, part of #962).
