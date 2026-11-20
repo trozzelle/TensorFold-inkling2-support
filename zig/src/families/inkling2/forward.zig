@@ -29,8 +29,15 @@ fn t(x: wts.Tensor) B {
 }
 
 /// What a forward writes besides the cache: finals, logits of the last row or every row, every layer's output.
-pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null };
+pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null };
 pub const Timing = struct { encode: f64 = 0, gpu: f64 = 0 };
+/// Rows recorded for the drafter and kernel studies: the inputs of the drafter's tapped layers, every layer's expert
+/// picks, and the MoE inputs of `xm_layers` (layouts: h [7][n][H] bf16, eids [layers][n][8] u32, xm [2][n][H] bf16).
+pub const Taps = struct { h: mtl.Buffer, eids: mtl.Buffer, xm: ?mtl.Buffer = null };
+/// The target layers whose input the DSpark head reads; its eighth tap is the finals.
+pub const tap_layers = [_]u32{ 5, 11, 17, 23, 29, 35, 41 };
+/// Layers whose MoE inputs the expert benches replay: one all-K3 layer and one mixed K2/K3 layer.
+pub const xm_layers = [_]u32{ 0, 30 };
 
 /// core/bf16_matvec.metal's tf_bf16_mv_args.
 const MvArgs = extern struct { rows: u32, n: u32, k: u32, ldy: u32 };
@@ -122,7 +129,17 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     const nr: u32 = @intCast(n);
     x.glue(.embed, .{ .rows = nr, .width = c.hidden, .eps = c.eps }, &.{ b(s.ids), t(m.weights.embed.t), t(m.weights.embed_norm), b(s.h) }, .{ n, 1, 1 }, .{ 1024, 1, 1 }, true);
     for (0..m.layers) |i| {
+        if (out.taps) |tp| for (tap_layers, 0..) |l, k| if (l == i) {
+            x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(tp.h, k * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+        };
         try layer(x, @intCast(i));
+        if (out.taps) |tp| {
+            // eight u32 picks a row are sixteen 16-bit words: the bf16 copy moves them bit for bit
+            x.glue(.copy, .{ .rows = nr, .width = 16 }, &.{ b(s.eids), bo(tp.eids, i * n * 32) }, .{ 16, n, 1 }, .{ 16, 1, 1 }, false);
+            if (tp.xm) |xmb| for (xm_layers, 0..) |l, k| if (l == i) {
+                x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.xm), bo(xmb, k * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            };
+        }
         if (out.dump) |d| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(d, i * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
     }
     if (out.finals or out.logits != .none) final(x);

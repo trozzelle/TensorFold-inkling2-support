@@ -12,6 +12,7 @@ const usage =
     \\tf-inkling-run <model> exact <ids.json> <at> [layers]    ids[at..] (ids at most 512) as one-row steps, 16-row
     \\                                                         windows and inside one chunk: outputs bit for bit
     \\tf-inkling-run <model> greedy <ids.json> <n>             the prompt, then n one-row greedy steps; tokens, tok/s
+    \\tf-inkling-run <model> taps <index.txt> <out_dir> <steps>   each prompt, then steps greedy tokens: taps, picks, MoE inputs
     \\
 ;
 
@@ -25,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
     defer pool.pop();
     if (std.mem.eql(u8, args[2], "check")) return check(init, args);
     if (std.mem.eql(u8, args[2], "layers")) return layersMode(init, args);
+    if (std.mem.eql(u8, args[2], "taps")) return tapsMode(init, args);
     if (std.mem.eql(u8, args[2], "finals")) return finalsMode(init, args);
     if (std.mem.eql(u8, args[2], "exact")) return exactMode(init, args);
     if (std.mem.eql(u8, args[2], "greedy")) return greedyMode(init, args);
@@ -229,4 +231,99 @@ fn now() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// Per listed prompt: the prompt in chunks, then greedy steps; every fed row's taps (layers 5..41 and the finals),
+/// every layer's expert picks and the MoE inputs of layers 0 and 30, written beside the tokens.
+fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
+    if (args.len != 6) return error.ExpectedIndexOutDirSteps;
+    const steps = try std.fmt.parseInt(usize, args[5], 10);
+    if (steps < 2) return error.AtLeastTwoSteps;
+    const index = try std.Io.Dir.cwd().readFileAlloc(init.io, args[3], init.gpa, .limited(1 << 20));
+    defer init.gpa.free(index);
+    const m = try ik.Model.load(init.gpa, init.io, args[1], .{});
+    defer m.deinit();
+    const c = &m.config.text;
+    const H: usize = c.hidden;
+    const L: usize = c.layers;
+    const R: usize = ik.state.prompt_rows;
+    var s = try ik.state.Scratch.init(m.device, c);
+    defer s.deinit();
+    const tp: ik.forward.Taps = .{
+        .h = try m.device.buffer(ik.forward.tap_layers.len * R * H * 2, mtl.ResourceOptions.shared),
+        .eids = try m.device.buffer(L * R * 32, mtl.ResourceOptions.shared),
+        .xm = try m.device.buffer(ik.forward.xm_layers.len * R * H * 2, mtl.ResourceOptions.shared),
+    };
+    defer tp.h.deinit();
+    defer tp.eids.deinit();
+    defer tp.xm.?.deinit();
+    var it = std.mem.tokenizeAny(u8, index, "\r\n");
+    var seq: usize = 0;
+    while (it.next()) |path| : (seq += 1) {
+        const ids = try readIds(init, path);
+        defer ids.deinit();
+        const P = ids.value.len;
+        const T = P + steps - 1;
+        const taps = try init.gpa.alloc(u16, T * 8 * H);
+        defer init.gpa.free(taps);
+        const eids = try init.gpa.alloc(u32, T * L * 8);
+        defer init.gpa.free(eids);
+        const xm = try init.gpa.alloc(u16, T * 2 * H);
+        defer init.gpa.free(xm);
+        var tokens: std.ArrayList(u32) = .empty;
+        defer tokens.deinit(init.gpa);
+        try tokens.appendSlice(init.gpa, ids.value);
+        var cache = try ik.state.Cache.init(m.device, c, T + 1, L);
+        defer cache.deinit();
+        const t0 = now();
+        var row: usize = 0;
+        var at: usize = 0;
+        while (at < P) {
+            const n = @min(P - at, R);
+            try ik.forward.run(m, &s, &cache, ids.value[at..][0..n], .{ .finals = true, .logits = if (at + n == P) .last else .none, .taps = tp });
+            gather(&s, tp, n, row, H, L, taps, eids, xm);
+            cache.len += n;
+            row += n;
+            at += n;
+        }
+        for (0..steps) |k| {
+            const pick = argmax(s.logits.slice(u16, c.vocab));
+            try tokens.append(init.gpa, pick);
+            if (k + 1 == steps) break;
+            try ik.forward.run(m, &s, &cache, &.{pick}, .{ .finals = true, .taps = tp });
+            gather(&s, tp, 1, row, H, L, taps, eids, xm);
+            cache.len += 1;
+            row += 1;
+        }
+        std.debug.assert(row == T);
+        try writeSeq(init, args[4], seq, "taps.bin", std.mem.sliceAsBytes(taps));
+        try writeSeq(init, args[4], seq, "eids.bin", std.mem.sliceAsBytes(eids));
+        try writeSeq(init, args[4], seq, "xm.bin", std.mem.sliceAsBytes(xm));
+        var w: std.Io.Writer.Allocating = .init(init.gpa);
+        defer w.deinit();
+        try std.json.Stringify.value(.{ .prompt = P, .tokens = tokens.items }, .{}, &w.writer);
+        try writeSeq(init, args[4], seq, "tokens.json", w.written());
+        std.debug.print("{{\"seq\": {d}, \"prompt\": {d}, \"rows\": {d}, \"seconds\": {d:.1}}}\n", .{ seq, P, T, @as(f64, @floatFromInt(now() - t0)) / 1e9 });
+    }
+}
+
+/// The `n` rows just run, from the capture buffers and s.finals into the host arrays at `row`.
+fn gather(s: *ik.state.Scratch, tp: ik.forward.Taps, n: usize, row: usize, H: usize, L: usize, taps: []u16, eids: []u32, xm: []u16) void {
+    const th = tp.h.slice(u16, ik.forward.tap_layers.len * n * H);
+    const fin = s.finals.slice(u16, n * H);
+    const te = tp.eids.slice(u32, L * n * 8);
+    const tx = tp.xm.?.slice(u16, ik.forward.xm_layers.len * n * H);
+    for (0..n) |r| {
+        const dst = taps[(row + r) * 8 * H ..][0 .. 8 * H];
+        for (0..ik.forward.tap_layers.len) |k| @memcpy(dst[k * H ..][0..H], th[(k * n + r) * H ..][0..H]);
+        @memcpy(dst[7 * H ..][0..H], fin[r * H ..][0..H]);
+        for (0..L) |l| @memcpy(eids[((row + r) * L + l) * 8 ..][0..8], te[(l * n + r) * 8 ..][0..8]);
+        for (0..ik.forward.xm_layers.len) |k| @memcpy(xm[((row + r) * 2 + k) * H ..][0..H], tx[(k * n + r) * H ..][0..H]);
+    }
+}
+
+fn writeSeq(init: std.process.Init, dir: []const u8, seq: usize, suffix: []const u8, data: []const u8) !void {
+    const path = try std.fmt.allocPrint(init.gpa, "{s}/seq-{d:0>5}.{s}", .{ dir, seq, suffix });
+    defer init.gpa.free(path);
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = data });
 }
