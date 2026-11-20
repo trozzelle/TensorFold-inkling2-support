@@ -55,7 +55,9 @@ pub const Pack = struct {
         const a = arena.allocator();
         const path = try std.fs.path.join(a, &.{ dir, "experts", "checkpoint.json" });
         const json = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
-        return .{ .arena = arena, .layers = try parse(a, json, layers, experts) };
+        const batches = try parse(a, json, layers, experts);
+        // the arena is copied after the parse: its node list is by value, so later allocations would be lost
+        return .{ .arena = arena, .layers = batches };
     }
 
     pub fn deinit(p: *Pack) void {
