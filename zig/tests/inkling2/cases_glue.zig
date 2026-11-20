@@ -13,6 +13,22 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseResidSoftcap(g, r);
 }
 
+/// A bf16 output within `steps` of its f64 reference, counting the outputs that are not equal to it: an f32 product and an
+/// f64 one can split a rounding, so a rare output differs.
+fn pinned(c: *h.Check, off: *usize, got: u16, want: f64, steps: u32) void {
+    c.b16n(got, want, steps);
+    if (got != h.bf(want)) off.* += 1;
+}
+
+/// A norm that rounds once too few or too many differs from its reference in about a quarter of its outputs.
+fn pin(c: *h.Check, off: usize, of: usize) void {
+    c.n += 1;
+    if (off * 500 > of) {
+        c.bad += 1;
+        std.debug.print("  {s}: {d} of {d} outputs differ from the reference's roundings\n", .{ c.name, off, of });
+    }
+}
+
 /// Three ids gathered from a 16-row table and weighted-RMS-normed; each row alone gives the batch's bits.
 fn caseEmbed(g: *const h.Gpu, r: std.Random) !void {
     const rows = 3;
@@ -31,14 +47,17 @@ fn caseEmbed(g: *const h.Gpu, r: std.Random) !void {
     const a: h.Args = .{ .rows = rows, .width = H, .eps = 1e-6 };
     try g.run("ik_embed", a, &.{ .{ .buf = ids }, .{ .buf = table }, .{ .buf = w }, .{ .buf = y } }, .{ rows, 1, 1 }, .{ 1024, 1, 1 }, true);
     var c: h.Check = .{ .name = "embed" };
+    var off: usize = 0;
     const ys = y.slice(u16, rows * H);
     for (0..rows) |t| {
         const x = ts[id[t] * H ..][0..H];
         var ss: f64 = 0;
         for (x) |v| ss += h.fb(v) * h.fb(v);
         const inv = 1 / @sqrt(ss / H + 1e-6);
-        for (0..H) |d| c.b16(ys[t * H + d], h.fb(ws[d]) * (h.fb(x[d]) * inv));
+        // mlx's kernel rounds x * rsqrt to bf16, then the weighted product again
+        for (0..H) |d| pinned(&c, &off, ys[t * H + d], h.fb(ws[d]) * h.rb(h.fb(x[d]) * inv), 2);
     }
+    pin(&c, off, rows * H);
     const all = try std.heap.page_allocator.dupe(u8, y.slice(u8, rows * H * 2));
     defer std.heap.page_allocator.free(all);
     for (0..rows) |t| {
@@ -62,15 +81,17 @@ fn caseRmsNorm(g: *const h.Gpu, r: std.Random) !void {
     try g.run("ik_rms", .{ .rows = rows, .width = H, .eps = 1e-6 }, &.{ .{ .buf = x }, .{ .buf = y } }, .{ rows, 1, 1 }, .{ 1024, 1, 1 }, true);
     try g.run("ik_norm", .{ .rows = rows, .width = H, .stride = H, .eps = 1e-6 }, &.{ .{ .buf = x }, .{ .buf = w }, .{ .buf = z } }, .{ rows, 1, 1 }, .{ 1024, 1, 1 }, true);
     var c: h.Check = .{ .name = "rms, norm" };
+    var off: usize = 0;
     for (0..rows) |t| {
         var ss: f64 = 0;
         for (0..H) |d| ss += h.fb(xs[t * H + d]) * h.fb(xs[t * H + d]);
         const inv = 1 / @sqrt(ss / H + 1e-6);
         for (0..H) |d| {
             c.f(y.slice(f32, rows * H)[t * H + d], h.fb(xs[t * H + d]) * inv, 1e-5);
-            c.b16(z.slice(u16, rows * H)[t * H + d], h.fb(ws[d]) * (h.fb(xs[t * H + d]) * inv));
+            pinned(&c, &off, z.slice(u16, rows * H)[t * H + d], h.fb(ws[d]) * h.rb(h.fb(xs[t * H + d]) * inv), 2);
         }
     }
+    pin(&c, off, rows * H);
     try c.done();
     try h.independent(g, "ik_norm", .{ .rows = rows, .width = H, .stride = H, .eps = 1e-6 }, x, H * 2, &.{w}, z, H * 2, rows, true);
 }
@@ -88,12 +109,14 @@ fn caseNormF32(g: *const h.Gpu, r: std.Random) !void {
     const ws = h.fill16(w, H, r, 1.5);
     try g.run("ik_norm", .{ .rows = rows, .width = H, .stride = stride, .flags = 1, .eps = 1e-6 }, &.{ .{ .buf = x }, .{ .buf = w }, .{ .buf = z } }, .{ rows, 1, 1 }, .{ 1024, 1, 1 }, true);
     var c: h.Check = .{ .name = "norm f32 in" };
+    var off: usize = 0;
     for (0..rows) |t| {
         var ss: f64 = 0;
         for (0..H) |d| ss += @as(f64, xs[t * stride + d]) * xs[t * stride + d];
         const inv = 1 / @sqrt(ss / H + 1e-6);
-        for (0..H) |d| c.b16(z.slice(u16, rows * H)[t * H + d], h.fb(ws[d]) * (@as(f64, xs[t * stride + d]) * inv));
+        for (0..H) |d| pinned(&c, &off, z.slice(u16, rows * H)[t * H + d], h.fb(ws[d]) * (@as(f64, xs[t * stride + d]) * inv), 1);
     }
+    pin(&c, off, rows * H);
     // ik_rms reads its rows densely.
     try g.run("ik_rms", .{ .rows = rows, .width = H, .flags = 1, .eps = 1e-6 }, &.{ .{ .buf = x }, .{ .buf = y } }, .{ rows, 1, 1 }, .{ 1024, 1, 1 }, true);
     for (0..rows) |t| {

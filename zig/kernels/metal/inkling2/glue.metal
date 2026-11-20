@@ -30,7 +30,8 @@ inline float ik_sum(float v, threadgroup float* buf, uint sg, uint lane, uint gr
 #define IK_ROW uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], \
   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint nt [[threads_per_threadgroup]]
 
-// embed_norm(embed_tokens(ids)): the weighted RMSNorm of the bf16 rows, one rounding to bf16.
+// embed_norm(embed_tokens(ids)): the weighted RMSNorm of the bf16 rows; as mlx's kernel in bf16, x * rsqrt rounds to bf16
+// before the weight multiplies it, then the product rounds again.
 [[kernel]] void ik_embed(constant ik_args& a [[buffer(0)]], const device uint* ids [[buffer(1)]],
     const device bfloat* table [[buffer(2)]], const device bfloat* w [[buffer(3)]], device bfloat* y [[buffer(4)]], IK_ROW) {
   threadgroup float buf[32];
@@ -38,7 +39,7 @@ inline float ik_sum(float v, threadgroup float* buf, uint sg, uint lane, uint gr
   float ss = 0.0f;
   for (uint d = tid; d < a.width; d += nt) { const float v = float(x[d]); ss += v * v; }
   const float r = rsqrt(ik_sum(ss, buf, sg, lane, nt / 32) / float(a.width) + a.eps);
-  for (uint d = tid; d < a.width; d += nt) y[ulong(row) * a.width + d] = bfloat(float(w[d]) * (float(x[d]) * r));
+  for (uint d = tid; d < a.width; d += nt) y[ulong(row) * a.width + d] = bfloat(float(w[d]) * float(bfloat(float(x[d]) * r)));
 }
 
 // _unweighted_rms_norm (eps 1e-6) of bf16 or f32 rows into f32 rows.
@@ -51,7 +52,8 @@ inline float ik_sum(float v, threadgroup float* buf, uint sg, uint lane, uint gr
   for (uint d = tid; d < a.width; d += nt) y[ulong(row) * a.width + d] = ik_in(x, f, ulong(row) * a.width + d) * r;
 }
 
-// nn.RMSNorm of bf16 or f32 rows (a.stride elements apart) into bf16 rows: w * (x * rsqrt(mean x^2 + eps)).
+// nn.RMSNorm of bf16 or f32 rows (a.stride elements apart) into bf16 rows: w * (x * rsqrt(mean x^2 + eps)). A bf16 row
+// rounds x * rsqrt to bf16 before the weight (mlx's kernel works in the input's type); an f32 row rounds once, at the end.
 [[kernel]] void ik_norm(constant ik_args& a [[buffer(0)]], const device void* x [[buffer(1)]],
     const device bfloat* w [[buffer(2)]], device bfloat* y [[buffer(3)]], IK_ROW) {
   threadgroup float buf[32];
@@ -59,7 +61,10 @@ inline float ik_sum(float v, threadgroup float* buf, uint sg, uint lane, uint gr
   float ss = 0.0f;
   for (uint d = tid; d < a.width; d += nt) { const float v = ik_in(x, f, ulong(row) * a.stride + d); ss += v * v; }
   const float r = rsqrt(ik_sum(ss, buf, sg, lane, nt / 32) / float(a.width) + a.eps);
-  for (uint d = tid; d < a.width; d += nt) y[ulong(row) * a.width + d] = bfloat(float(w[d]) * (ik_in(x, f, ulong(row) * a.stride + d) * r));
+  for (uint d = tid; d < a.width; d += nt) {
+    const float u = ik_in(x, f, ulong(row) * a.stride + d) * r;
+    y[ulong(row) * a.width + d] = bfloat(float(w[d]) * (f ? u : float(bfloat(u))));
+  }
 }
 
 constant uint IK_MAXN = 10, IK_MAXQ = 3;
