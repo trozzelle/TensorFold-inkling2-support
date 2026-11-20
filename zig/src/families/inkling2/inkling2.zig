@@ -2,7 +2,10 @@
 pub const config = @import("config.zig");
 pub const plan = @import("plan.zig");
 pub const expert_pack = @import("expert_pack.zig");
+pub const weights = @import("weights.zig");
 pub const state = @import("state.zig");
+pub const model = @import("model.zig");
+pub const Model = model.Model;
 pub const forward = @import("forward.zig");
 
 test {
