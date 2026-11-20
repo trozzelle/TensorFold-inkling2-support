@@ -517,6 +517,8 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     b.step("test-lfm2", "The LFM2-MoE family's tests: config, draws, state and its shared rounds on this Mac's GPU").dependOn(&lfm2_tests.step);
     const lfm2_dspark = b.addRunArtifact(b.addTest(.{ .root_module = engine, .filters = &.{"lfm2 dspark:"} }));
     b.step("test-lfm2-dspark", "LFM2's taps for a drafter: the tap kernel on this Mac's GPU").dependOn(&lfm2_dspark.step);
+    const inkling2_tests = b.addRunArtifact(b.addTest(.{ .root_module = engine, .filters = &.{"inkling2"} }));
+    b.step("test-inkling2-engine", "The Inkling 2 family's engine tests: state sizes, load budget and the Metal backend on this Mac's GPU").dependOn(&inkling2_tests.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes })).step);
     // the fake fabric maps windows with mmap (the Macs' RDMA, not Windows); verbs is its own module, with its own root
     if (target.result.os.tag != .windows) {

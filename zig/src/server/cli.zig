@@ -118,6 +118,7 @@ pub const flags = [_]Flag{
     .{ .name = "--mtp-confidence", .native = served("--mtp-confidence") },
     .{ .name = "--lane-kernels", .choices = &.{ "auto", "on", "off" } },
     .{ .name = "--prompt-cache-gib", .native = true },
+    .{ .name = "--load-limit-gb", .native = true },
     .{ .name = "--prompt-cache-disk", .path = true, .native = true },
     .{ .name = "--prompt-cache-over-cap", .kind = .store_true, .native = true },
     .{ .name = "--checkpoint-slots", .native = served("--checkpoint-slots") },
@@ -200,6 +201,7 @@ pub const Args = struct {
     redraw: @import("speech_redraw.zig").Policy = .{},
     speed_up: ?[]const u8 = null, // speed-up mode: this Mac's settings for the two-Mac link (Flash Next and the GLMs)
     prompt_cache_gib: ?f64 = null, // kept prompt states' budget (0: none; null: what 70% of RAM leaves past the loaded server)
+    load_limit_gb: ?f64 = null, // --load-limit-gb: decimal GB a family that reads it may hold (null: its own default)
     ssd_experts_gib: ?f64 = null,
     ple_on_ssd: bool = false,
     fsr_trace: ?[]const u8 = null,
@@ -386,6 +388,13 @@ pub fn gib(u: *Usage, a: Allocator, name: []const u8, v: []const u8) error{ Usag
     return g;
 }
 
+/// A finite decimal GB count above 0: a limit that must hold something.
+pub fn gb(u: *Usage, a: Allocator, name: []const u8, v: []const u8) error{ Usage, OutOfMemory }!f64 {
+    const g = try float(u, a, name, v);
+    if (!std.math.isFinite(g) or g <= 0) return fail(u, a, "argument {s}: expected a finite number of GB above 0: '{s}'", .{ name, v });
+    return g;
+}
+
 pub const Repeated = struct { alias: std.ArrayList([]const u8) = .empty, priorities: std.ArrayList([]const u8) = .empty, keys: std.ArrayList([]const u8) = .empty, hosts: std.ArrayList([]const u8) = .empty, origins: std.ArrayList([]const u8) = .empty, cors: std.ArrayList([]const u8) = .empty };
 
 fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usage, repeated: *Repeated) error{ Usage, OutOfMemory }!void {
@@ -477,6 +486,8 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         out.learn_conversations = true;
     } else if (is(name, "--learn-daily-gib")) {
         out.learn_daily_gib = try gib(u, a, name, v);
+    } else if (is(name, "--load-limit-gb")) {
+        out.load_limit_gb = try gb(u, a, name, v);
     } else if (is(name, "--decode-share")) {
         out.decode_share = try float(u, a, name, v);
         if (!(out.decode_share.? >= 0 and out.decode_share.? < 1)) return fail(u, a, "argument --decode-share: expected a share from 0 to under 1: '{s}'", .{v});
@@ -550,6 +561,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .prompt_int8 = std.mem.eql(u8, args.prompt_precision, "int8"),
         .speed_up = args.speed_up,
         .prompt_cache_gib = args.prompt_cache_gib,
+        .load_limit_gb = args.load_limit_gb,
         .prompt_cache_over_cap = args.prompt_cache_over_cap,
         .ssd_experts_gib = args.ssd_experts_gib,
         .ple_on_ssd = args.ple_on_ssd,

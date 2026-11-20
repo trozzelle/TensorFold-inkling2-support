@@ -311,6 +311,8 @@ pub const Open = struct {
     record: ?[]const u8 = null,
     speed_up: ?[]const u8 = null,
     prompt_cache_gib: ?f64 = null,
+    /// --load-limit-gb: the most a family that reads it may hold (weights, scratch, caches), in decimal GB.
+    load_limit_gb: ?f64 = null,
     prompt_cache_over_cap: bool = false,
     ssd_experts_gib: ?f64 = null,
     ple_on_ssd: bool = false,

@@ -270,6 +270,13 @@ test "parse and capabilities share the table" {
     try std.testing.expectEqualStrings("/r", named.recall_dir.?);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--recall-gib", "0.001" }, &u));
     for ([_][]const u8{ "1e300", "inf", "nan", "-1", "17179869184" }) |bad| try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--prompt-cache-gib", bad }, &u));
+    try std.testing.expectEqual(@as(?f64, 236), (try parse(a, &.{ "m", "--load-limit-gb", "236" }, &u)).load_limit_gb);
+    try std.testing.expectEqual(@as(?f64, 0.5), (try parse(a, &.{ "m", "--load-limit-gb=0.5" }, &u)).load_limit_gb);
+    try std.testing.expectEqual(@as(?f64, null), (try parse(a, &.{"m"}, &u)).load_limit_gb);
+    for ([_][]const u8{ "0", "-1", "abc", "inf", "nan" }) |bad| {
+        try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--load-limit-gb", bad }, &u));
+        try std.testing.expect(std.mem.indexOf(u8, u.message, "--load-limit-gb") != null);
+    }
     var out: std.Io.Writer.Allocating = .init(a);
     try capabilities(&out.writer, .{ .version = "0.6.5" });
     const doc = out.written();
