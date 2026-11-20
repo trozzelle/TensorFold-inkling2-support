@@ -57,6 +57,7 @@ fn experts(c: *const Text, i: u32, prec: plan.Precision, sink: anytype) !void {
     const L = .{i};
     try put(sink, "model.llm.layers.{d}.mlp.gate.weight", L, .bf16, &.{ e, h });
     try put(sink, "model.llm.layers.{d}.mlp.gate.bias", L, .f32, &.{e});
+    if (prec == .exl3) return; // the pack's experts are admitted by expert_pack.zig and the loader
     // gate and up are one tensor, w13: 2 * intermediate rows
     const rows = [2][2]u64{ .{ 2 * m, h }, .{ h, m } };
     inline for (.{ "w13", "w2" }, 0..) |w, n| {
@@ -73,6 +74,7 @@ fn experts(c: *const Text, i: u32, prec: plan.Precision, sink: anytype) !void {
                 try put(sink, "model.llm.layers.{d}.mlp.experts." ++ w ++ "_weight", L, .f8_e4m3, &.{ e, r, k });
                 try put(sink, "model.llm.layers.{d}.mlp.experts." ++ w ++ "_weight_scale", L, .u8, &.{ e, r, k / 32 });
             },
+            .exl3 => unreachable, // returned above
         }
     }
 }
@@ -229,7 +231,9 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
 /// `entries` against the map of `file`; expert precisions come from the entries themselves (lists live in `arena`).
 pub fn check(arena: std.mem.Allocator, c: *const config.Config, entries: st.Header, file: File) !Report {
     var prec: [config.max_layers]plan.Precision = undefined;
-    if (file == .model) try precisions(entries, c.text.layers, &prec);
+    if (file == .model) {
+        if (c.quant == .exl3) @memset(prec[0..c.text.layers], .exl3) else try precisions(entries, c.text.layers, &prec);
+    }
     const seen = try arena.alloc(bool, entries.count());
     @memset(seen, false);
     var r: Report = .{};
