@@ -49,7 +49,7 @@ Measured on an M5 Ultra (256 GB):
 | | |
 |---|---|
 | Prompt | about 66 tok/s (8,192 tokens in 125 s) |
-| Decode, one stream after a 512-token prompt | 9.0 tok/s (110 ms of GPU time a token) |
+| Decode, one stream | 9.0 tok/s after a 512-token prompt (110 ms of GPU time a token); 9.8 tok/s served (256-token replies, 2.3 s to the first token for a 116-token prompt) |
 
 The experts run through the core EXL3 projection, which is what limits decode speed.
 
@@ -67,3 +67,6 @@ Teacher-forced on a 62,526-token held-out set against the MXFP8 release as teach
 - One stream; `--parallel` above 1 is refused.
 - Draft requests are served as plain and copy-drafted rounds; there is no draft head yet.
 - `--vision` is refused.
+- The server does not yet split Inkling's reply channels: a thinking reply's `reasoning_content` starts with the
+  raw channel markers (`<|message_model|><|content_thinking|>`). Send
+  `chat_template_kwargs {"enable_thinking": false}`, or serve with `--no-thinking`, for replies without thinking.
