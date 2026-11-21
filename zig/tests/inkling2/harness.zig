@@ -134,6 +134,7 @@ pub const Check = struct {
     /// A bf16 output that passes through `n` bf16 rounding points: within n steps of the reference.
     pub fn b16n(c: *Check, got: u16, want: f64, n: u32) void {
         c.n += 1;
+        if (c.finiteMiss(fb(got), want)) return;
         const d = ulps(got, bf(want));
         c.worst = @max(c.worst, @as(f64, @floatFromInt(d)));
         if (d > n) c.miss(fb(got), want);
@@ -142,24 +143,36 @@ pub const Check = struct {
     /// absolute error, which is many bf16 steps of a value near zero.
     pub fn b16a(c: *Check, got: u16, want: f64, n: u32, abs: f64) void {
         c.n += 1;
+        if (c.finiteMiss(fb(got), want)) return;
         const d = ulps(got, bf(want));
-        if (@abs(fb(got) - want) > abs) c.worst = @max(c.worst, @as(f64, @floatFromInt(d)));
-        if (d > n and @abs(fb(got) - want) > abs) c.miss(fb(got), want);
+        const err = @abs(fb(got) - want);
+        if (!(err <= abs)) c.worst = @max(c.worst, @as(f64, @floatFromInt(d)));
+        if (!(d <= n) and !(err <= abs)) c.miss(fb(got), want);
     }
     /// An f32 output within a relative `rel` of the reference.
     pub fn f(c: *Check, got: f32, want: f64, rel: f64) void {
         c.n += 1;
+        if (c.finiteMiss(got, want)) return;
         const e = @abs(@as(f64, got) - want) / @max(@abs(want), 1e-6);
         c.worst = @max(c.worst, e);
-        if (e > rel) c.miss(got, want);
+        if (!(e <= rel)) c.miss(got, want);
     }
     /// An f32 output within `tol` of the reference relative to max(|want|, mag): sums that cancel toward zero keep
     /// their absolute error, so they are judged against the outputs' magnitude.
     pub fn near(c: *Check, got: f32, want: f64, tol: f64, mag: f64) void {
         c.n += 1;
+        if (c.finiteMiss(got, want)) return;
         const e = @abs(@as(f64, got) - want) / @max(@abs(want), mag);
         c.worst = @max(c.worst, e);
-        if (e > tol) c.miss(got, want);
+        if (!(e <= tol)) c.miss(got, want);
+    }
+    /// Settles an output or reference that is not finite: it passes only when both are the same infinity or both NaN,
+    /// else it is a miss. Returns true when settled (no tolerance applies).
+    fn finiteMiss(c: *Check, got: f64, want: f64) bool {
+        if (std.math.isFinite(got) and std.math.isFinite(want)) return false;
+        const same_kind = (std.math.isNan(got) and std.math.isNan(want)) or got == want;
+        if (!same_kind) c.miss(got, want);
+        return true;
     }
     pub fn same(c: *Check, a: []const u8, b: []const u8) void {
         c.n += 1;
