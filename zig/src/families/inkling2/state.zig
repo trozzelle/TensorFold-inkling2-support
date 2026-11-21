@@ -57,7 +57,7 @@ pub fn cacheBytes(c: *const cfg.Text, capacity: usize, layers: usize) usize {
 pub const Cache = struct {
     kv: mtl.Buffer,
     conv: mtl.Buffer,
-    logits: mtl.Buffer, // the last row's bf16 logits, the next first draw's
+    logits: mtl.Buffer, // the prompt's last row's bf16 logits, kept for the first draw
     capacity: usize,
     layers: usize,
     len: usize = 0,

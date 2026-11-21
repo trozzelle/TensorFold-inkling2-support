@@ -243,7 +243,7 @@ fn greedyMode(init: std.process.Init, args: []const [:0]const u8) !void {
     var tm: ik.forward.Timing = .{};
     t0 = now();
     for (picks) |*p| {
-        p.* = argmax(s.logits.slice(u16, c.vocab));
+        p.* = ik.greedy.argmax(s.logits.slice(u16, c.vocab));
         try ik.forward.run(m, &s, &cache, &.{p.*}, .{ .timing = &tm });
         cache.len += 1;
     }
@@ -252,18 +252,6 @@ fn greedyMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer w.deinit();
     try std.json.Stringify.value(picks, .{}, &w.writer);
     std.debug.print("{s}\n{{\"prompt_tokens\": {d}, \"prompt_ms\": {d:.0}, \"steps\": {d}, \"tok_s\": {d:.2}, \"gpu_ms\": {d:.1}, \"encode_ms\": {d:.1}}}\n", .{ w.written(), ids.value.len, prompt_ms, steps, @as(f64, @floatFromInt(steps)) / secs, tm.gpu * 1e3 / @as(f64, @floatFromInt(steps)), tm.encode * 1e3 / @as(f64, @floatFromInt(steps)) });
-}
-
-fn argmax(l: []const u16) u32 {
-    var best: usize = 0;
-    for (l, 0..) |x, i| if (logit(x) > logit(l[best])) {
-        best = i;
-    };
-    return @intCast(best);
-}
-
-fn logit(word: u16) f32 {
-    return @bitCast(@as(u32, word) << 16);
 }
 
 fn now() u64 {
@@ -334,7 +322,7 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
             at += n;
         }
         for (0..steps) |k| {
-            const pick = argmax(s.logits.slice(u16, c.vocab));
+            const pick = ik.greedy.argmax(s.logits.slice(u16, c.vocab));
             try tokens.append(init.gpa, pick);
             if (k + 1 == steps) break;
             try ik.forward.run(m, &s, &cache, &.{pick}, .{ .finals = true, .taps = tp });

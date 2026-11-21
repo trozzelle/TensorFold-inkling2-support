@@ -4,6 +4,7 @@ const mtl = @import("metal");
 const lanes = @import("lanes");
 const st = @import("state.zig");
 const fwd = @import("forward.zig");
+const greedy = @import("greedy.zig");
 const Model = @import("model.zig").Model;
 const row = @import("../step5/backend.zig").row;
 const be = lanes.backend;
@@ -89,6 +90,7 @@ pub const Metal = struct {
         return self.caches.get(stream) orelse error.UnknownInkling2Stream;
     }
 
+    /// The prompt's last row's logits, kept by `feed` for the first draw; no later round writes or reads them.
     fn logits(self: *Metal, cache: *st.Cache) []const u16 {
         return cache.logits.slice(u16, self.model.config.text.vocab);
     }
@@ -96,9 +98,10 @@ pub const Metal = struct {
     /// Greedy argmax or the keyed draw (lanes' gpu_full host twin) at `position`, a grammar mask's tokens only.
     fn draw(self: *Metal, l: []const u16, sampling: ?lanes.Sampling, position: u64, mask: []const u32) !u32 {
         const t = sampled(sampling) orelse {
+            if (mask.len == 0) return greedy.argmax(l);
             var best: ?usize = null;
             for (l, 0..) |w, id| {
-                if (mask.len > 0 and !lanes.grammar.allows(mask, id)) continue;
+                if (!lanes.grammar.allows(mask, id)) continue;
                 if (best == null or logit(w) > logit(l[best.?])) best = id;
             }
             return @intCast(best orelse 0);
@@ -183,9 +186,8 @@ pub const Metal = struct {
         };
         if (tok >= self.model.config.text.vocab) return error.InvalidInkling2Token;
         try fwd.run(self.model, &self.scratch, cache, &.{tok}, .{ .logits = .last });
-        @memcpy(cache.logits.slice(u16, self.model.config.text.vocab), self.scratch.logits.slice(u16, self.model.config.text.vocab));
         cache.len += 1;
-        return self.put(try self.draw(self.logits(cache), stream.sampling, position, &.{}));
+        return self.put(try self.draw(self.scratch.logits.slice(u16, self.model.config.text.vocab), stream.sampling, position, &.{}));
     }
 
     fn readFn(ptr: *anyopaque, handle: u64) !u32 {
@@ -198,7 +200,7 @@ pub const Metal = struct {
     fn firstRowFn(ptr: *anyopaque, stream: *lanes.Stream) !lanes.LogprobRow {
         const self = cast(ptr);
         const l = self.logits(try self.cacheOf(stream));
-        return row(l, @intCast(argmax(l)), stream.logprobs orelse 0);
+        return row(l, greedy.argmax(l), stream.logprobs orelse 0);
     }
 
     /// One stream's pending token and copy drafts in one forward, every row drawn; keep() rolls back by length.
@@ -226,7 +228,6 @@ pub const Metal = struct {
             o.sampled[r] = try self.draw(l, w.stream.sampling, w.positions[r], mask);
             if (o.rows.len == rows) o.rows[r] = row(l, o.sampled[r], w.stream.logprobs orelse 0);
         }
-        @memcpy(cache.logits.slice(u16, c.vocab), all[(rows - 1) * c.vocab ..][0..c.vocab]);
     }
 
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) !void {
@@ -260,12 +261,4 @@ pub const Metal = struct {
 
 fn logit(word: u16) f32 {
     return @bitCast(@as(u32, word) << 16);
-}
-
-fn argmax(l: []const u16) usize {
-    var best: usize = 0;
-    for (l, 0..) |w, i| if (logit(w) > logit(l[best])) {
-        best = i;
-    };
-    return best;
 }
