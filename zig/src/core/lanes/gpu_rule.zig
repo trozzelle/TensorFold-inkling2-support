@@ -65,6 +65,53 @@ pub fn better(_: void, a: Cand, b: Cand) bool {
     return ka > kb or (ka == kb and a.i < b.i);
 }
 
+/// The `n` best of `all` in `better`'s order at `all[0..n]`, the rest in no order: the first `n` entries of a full sort,
+/// ties included, since `better` breaks every tie by id. `all` holds its candidates in id order, as `sample` and
+/// `gpu_full.plan` fill it. Radix passes over the values' keys, most significant digit first, find the cut (the n-th
+/// best key and how many keys lie above it); one more pass keeps what lies above it and the lowest ids at it, and only
+/// those `n` are sorted. Past a quarter of `all` a full sort costs no more, and runs instead.
+pub fn orderTop(all: []Cand, n: usize) void {
+    std.debug.assert(n <= all.len);
+    if (n == 0) return;
+    if (n * 4 > all.len) return std.mem.sort(Cand, all, {}, better);
+    var hist: [1 << 11]u32 = undefined;
+    var prefix: u64 = 0; // the cut key's digits so far
+    var above: usize = 0; // the keys above those digits' bin, counted digit by digit
+    var shift: u6 = 32;
+    inline for (.{ 11, 11, 10 }) |bits| {
+        shift -= bits;
+        const bins = 1 << bits;
+        @memset(hist[0..bins], 0);
+        for (all) |c| {
+            const k: u64 = key(c.v);
+            if (k >> (shift + bits) == prefix) hist[@intCast((k >> shift) & (bins - 1))] += 1;
+        }
+        // whole bins from the top while their keys stay short of n: the n-th best lies in the bin that reaches it
+        var d: usize = bins;
+        var seen = above;
+        while (true) {
+            d -= 1;
+            if (seen + hist[d] >= n) break;
+            seen += hist[d];
+        }
+        above = seen;
+        prefix = prefix << bits | d;
+    }
+    const cut: u32 = @intCast(prefix);
+    var ties = n - above; // keys equal to the cut's that the n best hold
+    var kept: usize = 0;
+    for (all) |c| {
+        const k = key(c.v);
+        if (k > cut or (k == cut and ties > 0)) {
+            ties -= @intFromBool(k == cut);
+            all[kept] = c;
+            kept += 1;
+        }
+    }
+    std.debug.assert(kept == n);
+    std.mem.sort(Cand, all[0..n], {}, better);
+}
+
 /// One row's draw under the kernel's rule; `ids` maps columns to token ids (a draft head's subset vocabulary).
 pub fn sample(gpa: Allocator, logits: []const f32, s: ?Sampling, position: u32, ids: ?[]const u32) !u32 {
     const st = s orelse {
@@ -85,8 +132,8 @@ pub fn sample(gpa: Allocator, logits: []const f32, s: ?Sampling, position: u32, 
         m = @max(m, c.v);
     }
     const z = threadSum(all, m);
-    std.mem.sort(Cand, all, {}, better);
     const n: usize = @min(@min(all.len, candidates), cap);
+    orderTop(all, n);
     var norm = z;
     if (kc != 0) {
         norm = 0.0;

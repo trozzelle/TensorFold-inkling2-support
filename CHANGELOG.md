@@ -5,6 +5,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 ## Unreleased
 
 - Metal: Inkling 2 Small with EXL3 routed experts (`kortexa-inkling2-exl3-v1` packs, the rest in bf16) serves text in one stream on a 256 GB Mac, with `--load-limit-gb` setting its memory limit; see [the recipe](docs/recipes/inkling2-exl3-metal.md).
+- Sampler: the host draw behind sampled rows on Flint, Inkling 2, Kimi K3, Llama, MiniMax M3 and Spark2.5 no longer sorts all of a row's candidates for each token. It selects only the candidates the draw reads (the best 1,024, or `top_k` when that is smaller or larger) and sorts those, and sorts nothing when `top_k` and `top_p` are off, with the same tokens and the same plans for the same seed; a 201,024-logit row draws in about 1 ms where it took about 10 ms.
 
 ## 1.3.2
 
