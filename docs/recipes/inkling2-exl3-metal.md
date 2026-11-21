@@ -5,7 +5,7 @@ TensorFold serves `thinkingmachines/Inkling-2-Small` on one Mac with 256 GB of m
   2 to 4 bits;
 - everything else in the source checkpoint's bf16.
 
-Text only, one stream; no draft head, prompt cache or image tower yet.
+Text only, one stream; drafts come from the checkpoint's DSpark draft head. No prompt cache or image tower yet.
 
 ## Model directory
 
@@ -15,6 +15,8 @@ Text only, one stream; no draft head, prompt cache or image tower yet.
   (`*.mlp.experts.*`), bytes unchanged. That covers embeddings, norms, attention, short convolutions,
   attention-residual queries, routers and the unembedding.
 - From the source: `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `special_tokens_map.json`.
+- `mtp.safetensors`: the source checkpoint's DSpark draft head, bytes unchanged. Serving with drafts loads it;
+  `--no-drafts` serves without it.
 - `experts/`: the pack.
   - `checkpoint.json`: its format, `"status": "complete"`, and each layer's files and expert ranges.
   - `layers/NN/experts-FFF-LLL.safetensors`, with `experts.E.{w13,w2}.{trellis,suh,svh,mul1}`.
@@ -40,7 +42,8 @@ checks that each row's result is independent of the rows beside it, and that a N
 - The load limit covers weights, scratch and caches. The default is 75% of RAM, which leaves no room for caches
   beside this pack on a 256 GB Mac.
   - `--load-limit-gb` sets the limit; `INKLING_LOAD_LIMIT_GB` is the fallback.
-  - At 236 GB, about 27 GiB is left for caches.
+  - At 236 GB, about 25 GiB is left for caches with the draft head (about 27 GiB with `--no-drafts`), roughly 130k
+    tokens.
 - Caches take 192 KiB a token, because every layer keeps its whole context, plus 33 MiB of convolution rings a
   stream.
 - `INKLING_ROUND_TIMING=1` logs, when each reply ends, what an average round spent: GPU and encode time, the rest of
@@ -57,13 +60,33 @@ checks that each row's result is independent of the rows beside it, and that a N
   of the last hidden rows to compare two configurations bit for bit. `tf-inkling-kernels time` times the fused norm
   kernels at the block and query counts of the real layers.
 
-Measured on an M5 Ultra (256 GB):
+## Drafts
+
+The draft head proposes up to 7 tokens a round from the target's features (layers 5 to 41 and the final row); the
+target verifies them in one window, so every reply has the same tokens as plain decoding, greedy or sampled with a
+seed.
+- The head's layer projections are quantized at load to the MLX affine 8-bit form (group 64); the Markov head,
+  norms and unembedding stay bf16. It takes 1.9 GiB. `INKLING_DRAFT_BITS=16` keeps the layers bf16 (3.3 GiB).
+- `INKLING_DRAFT_CONFIDENCE` (default 0.7) is the floor for a draft's own probability, the top-1 probability of its
+  step: a round verifies the first draft, then each next one while its probability is at least the floor. `off`
+  verifies every draft a round holds.
+- `INKLING_DRAFT_DEPTH` caps the drafts held (1 to 7; unset is 7 with a floor, 4 with `off`); `auto` leaves the depth
+  to the lane core's cost rule.
+- `tf-inkling-run MODEL greedy ids.json STEPS --drafts` decodes with drafts and prints the rounds and acceptance;
+  `tf-inkling-run MODEL dspark TAPS SEQS OUT` replays the head on recorded features, and `tf-inkling-bench dspark`
+  times a hold.
+
+Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a bench prompt and 12 chat prompts
+(about 60 to 1,100 prompt tokens; decode tokens over decode time):
 
 | | |
 |---|---|
 | Prompt | about 65 tok/s (8,202 tokens in 126 s to the first token) |
-| Decode, one stream, served | 38.8 tok/s with a 116-token prompt (256-token replies, 2.2 s to the first token); 37.9 tok/s after an 8,202-token prompt |
-| Decode, sampled (temperature 0.7, top_p 0.95) | about 32 tok/s |
+| Decode with drafts (default) | 61.4 tok/s (65.2 on the bench prompt) |
+| Decode with drafts, every draft verified at depth 4 | 57.1 tok/s |
+| Decode, `--no-drafts` | 39.4 tok/s; 37.9 tok/s after an 8,202-token prompt |
+| Decode with drafts, sampled (temperature 0.7) | 56.8 tok/s |
+| Decode, sampled, `--no-drafts` | about 32 tok/s |
 
 Decode steps of up to 16 rows take a decode path: the experts run a rate-grouped EXL3 chain (adapted from Sushi), and
 attention, norms and the attention-input matvecs have their own kernels. A step takes about 25 ms of GPU time. Prompt
@@ -84,7 +107,7 @@ Teacher-forced on a 62,526-token held-out set against the MXFP8 release as teach
 ## Limits
 
 - One stream; `--parallel` above 1 is refused.
-- Draft requests are served as plain and copy-drafted rounds; there is no draft head yet.
+- Drafts come from the draft head for one stream; there is no prompt cache, so a repeated prompt is computed again.
 - `--vision` is refused.
 - The server does not yet split Inkling's reply channels: a thinking reply's `reasoning_content` starts with the
   raw channel markers (`<|message_model|><|content_thinking|>`). Send
