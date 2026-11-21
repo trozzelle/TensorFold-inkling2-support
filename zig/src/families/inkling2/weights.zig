@@ -145,11 +145,23 @@ pub fn xdOk(table: []const exl3.ExpertDescriptor, count: usize, hidden: usize, i
     return true;
 }
 
-/// The dense file and the first `layers` layers' expert files into `c`, then every view the forward reads.
+/// The tensors of the layers and of their attention-residual queries (the file's names sort them between the embedding and
+/// the unembedding, so they cannot be left out as a range).
+fn perLayer(name: []const u8, rank: usize) bool {
+    _ = rank;
+    return std.mem.startsWith(u8, name, "model.llm.layers.") or std.mem.startsWith(u8, name, "model.llm.attn_res.attn_queries.") or
+        std.mem.startsWith(u8, name, "model.llm.attn_res.mlp_queries.");
+}
+
+/// The dense file and the first `layers` layers' expert files into `c`, then every view the forward reads. With no layers the
+/// file's per-layer tensors stay unread in it: the embedding, the norms and the unembedding are all that load.
 pub fn load(gpa: std.mem.Allocator, device: mtl.Device, c: *ck.Checkpoint, t: *const config.Text, p: *const plan.Plan, ex: *const pack.Pack, dir: []const u8, layers: u32) !Weights {
     const path = try std.fs.path.joinZ(gpa, &.{ dir, "model-dense.safetensors" });
     defer gpa.free(path);
-    try c.addFile(device, path, "");
+    if (layers == 0) {
+        try c.addFileSplit(device, path, "", null, perLayer);
+        c.closeFiles();
+    } else try c.addFile(device, path, "");
     const first = c.shards.items.len;
     const H: usize = t.hidden;
     const I: usize = t.expert_inter;

@@ -67,6 +67,23 @@ const Seg = struct { x: B, w: wts.Dense, y: B };
 /// ik_attn_part's threadgroup: 24 simdgroups, 8 key groups of 32 keys (a 256-key block) by 3 pairs of q heads (a key head's six).
 const part_group = [3]usize{ 32, 24, 1 };
 
+/// out = in W^T on `e` for `rows` rows of the bf16 [d.n, d.k] matrix `d` (torch's Linear layout), in slabs of at most 32:
+/// the row-count kernel of the slab, whose bits do not depend on the slab. `in` rows are d.k wide, `out` rows d.n.
+pub fn matvec(e: mtl.ComputeEncoder, m: *const Model, d: wts.Dense, in: B, out: B, rows: usize) void {
+    var r: usize = 0;
+    while (r < rows) {
+        const k = @min(rows - r, 32);
+        const g: Glue = if (k <= 8) .matvec_8 else if (k <= 16) .matvec_16 else .matvec_32;
+        e.setPipeline(m.pipe(g));
+        e.setBuffer(in.buf, in.off + r * d.k * 2, 0);
+        e.setBuffer(d.t.buffer, d.t.offset, 1);
+        e.setValue(MvArgs{ .rows = @intCast(k), .n = d.n, .k = d.k, .ldy = d.n }, 2);
+        e.setBuffer(out.buf, out.off + r * d.n * 2, 3);
+        e.dispatchGroups(mtl.Size.of((d.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+        r += k;
+    }
+}
+
 const Enc = struct {
     e: *mtl.ComputeEncoder,
     m: *const Model,
@@ -115,18 +132,7 @@ const Enc = struct {
 
     /// out = in W^T for `rows` rows in slabs of at most 32 (one row's bits do not depend on the slab).
     fn mv(x: Enc, d: wts.Dense, in: B, out: B, rows: usize) void {
-        var r: usize = 0;
-        while (r < rows) {
-            const k = @min(rows - r, 32);
-            const g: Glue = if (k <= 8) .matvec_8 else if (k <= 16) .matvec_16 else .matvec_32;
-            x.e.setPipeline(x.m.pipe(g));
-            x.e.setBuffer(in.buf, in.off + r * d.k * 2, 0);
-            x.e.setBuffer(d.t.buffer, d.t.offset, 1);
-            x.e.setValue(MvArgs{ .rows = @intCast(k), .n = d.n, .k = d.k, .ldy = d.n }, 2);
-            x.e.setBuffer(out.buf, out.off + r * d.n * 2, 3);
-            x.e.dispatchGroups(mtl.Size.of((d.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
-            r += k;
-        }
+        matvec(x.e.*, x.m, d, in, out, rows);
     }
 
     /// Up to `max_segs` matvecs over the same k in one dispatch (at most `window_rows` rows). The segment table lives
@@ -330,7 +336,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
 const warm_spin = 0.015;
 const warm_slack = 0.0015;
 
-fn waitWarm(cb: mtl.CommandBuffer, expected: f64, committed: f64) void {
+pub fn waitWarm(cb: mtl.CommandBuffer, expected: f64, committed: f64) void {
     const nap = committed + expected - warm_spin - warm_slack - seconds();
     if (expected > 0 and nap > 0) {
         const ts: std.c.timespec = .{ .sec = @intFromFloat(nap), .nsec = @intFromFloat((nap - @floor(nap)) * 1e9) };

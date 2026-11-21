@@ -18,6 +18,11 @@ const usage =
     \\tf-inkling-run <model> ftaps <ids.json> <out.bin> [at [window]]   every row's serving taps: bf16 [T, 8, H], the inputs of layers
     \\                                                         5, 11, .. 41, then the finals. ids[..at] (default: all) go through in
     \\                                                         prompt chunks, the rest in decode windows of at most `window` rows (16)
+    \\tf-inkling-run <model> dspark <taps_dir> <seqs> <out_dir> [--depth d]   the draft head over recorded taps (taps mode's files), from the
+    \\                                                         embedding, the unembedding and mtp.safetensors alone: <seqs> is N, A..B (inclusive)
+    \\                                                         or a comma list; per sequence out_dir gets seq-NNNNN.props.bin (int32 [T][7],
+    \\                                                         -1 where no hold ran) and seq-NNNNN.logits.bin (bf16 [16][7][vocab]: the first 16
+    \\                                                         holds' step logits after the softcap and the padded vocabulary's mask)
     \\tf-inkling-run <model> profile <layers> <pos> <rows> <steps> [repeat]   per-class GPU time of decode steps
     \\                                                         (the layers run repeat times a step, default 48/layers)
     \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat]   decode steps each followed by the greedy draw: median
@@ -37,6 +42,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[2], "layers")) return layersMode(init, args);
     if (std.mem.eql(u8, args[2], "taps")) return tapsMode(init, args);
     if (std.mem.eql(u8, args[2], "ftaps")) return ftapsMode(init, args);
+    if (std.mem.eql(u8, args[2], "dspark")) return @import("replay.zig").run(init, args);
     if (std.mem.eql(u8, args[2], "finals")) return finalsMode(init, args);
     if (std.mem.eql(u8, args[2], "exact")) return exactMode(init, args);
     if (std.mem.eql(u8, args[2], "greedy")) return greedyMode(init, args);

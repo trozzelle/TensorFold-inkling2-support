@@ -6,6 +6,8 @@ const ck = @import("../../core/checkpoint_metal.zig");
 const config = @import("config.zig");
 const wts = @import("weights.zig");
 const mix = @import("dspark_alpha.zig");
+const fwd = @import("forward.zig");
+const Model = @import("model.zig").Model;
 
 pub const Tensor = wts.Tensor;
 pub const Dense = wts.Dense;
@@ -146,3 +148,66 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Check
     return w;
 }
 
+/// Bytes of the fold's two tensors: fold_w [vocab, rank] and fold_b [vocab], bf16.
+pub fn foldBytes(vocab: usize, rank: usize) usize {
+    return vocab * rank * 2 + vocab * 2;
+}
+
+/// The fold, once, on the GPU: the unembedding applied to hidden_out, so a Markov step's latent reaches the vocabulary as
+/// `bf16(bf16(latent . fold_w[v]) + fold_b[v])` instead of through hidden_out and then the unembedding. Each fold value is
+/// the f32 sum over the hidden width rounded to bf16 once. The unembedding's bf16 matvec takes hidden_out's `rank` columns
+/// and its bias as `rank + 1` input rows, and `transpose` (ikd_fold_t) lays its output [rank + 1][vocab] out by token. The
+/// two tensors live in one buffer the checkpoint owns, named `markov_head.fold_w` and `markov_head.fold_b`; a head already
+/// folded is left as it is.
+pub fn fold(w: *Weights, c: *ck.Checkpoint, device: mtl.Device, queue: mtl.Queue, model: *const Model, transpose: mtl.Pipeline) !void {
+    if (w.fold_w != null) return;
+    const unembed = model.weights.unembed;
+    const hidden: usize = unembed.k;
+    const vocab: usize = unembed.n;
+    const rank: usize = w.markov.hidden_out.k;
+    if (w.markov.hidden_out.n != hidden or w.markov.w1.n != vocab or w.markov.w1.k != rank) return error.UnexpectedInkling2Tensor;
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const rows = rank + 1;
+    const input = try device.buffer(rows * hidden * 2, mtl.ResourceOptions.shared);
+    defer input.deinit();
+    // input row `col` is hidden_out's column `col` ([hidden, rank] on disk); the last row is its bias
+    const x = input.slice(u16, rows * hidden);
+    const weight = w.markov.hidden_out.t.host(u16);
+    for (0..rank) |col| for (0..hidden) |h| {
+        x[col * hidden + h] = weight[h * rank + col];
+    };
+    @memcpy(x[rank * hidden ..][0..hidden], w.markov.hidden_out_b.host(u16));
+    const y = try device.buffer(rows * vocab * 2, mtl.ResourceOptions.shared);
+    defer y.deinit();
+    const w_bytes = vocab * rank * 2;
+    const total = foldBytes(vocab, rank);
+    const out = try device.buffer(total, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    errdefer out.deinit();
+    const cb = queue.commandBuffer();
+    const e = cb.compute(.serial);
+    fwd.matvec(e, model, unembed, .{ .buf = input }, .{ .buf = y }, rows);
+    e.setPipeline(transpose);
+    e.setValue(extern struct { vocab: u32 }{ .vocab = @intCast(vocab) }, 0);
+    e.setBuffer(y, 0, 1);
+    e.setBuffer(out, 0, 2);
+    e.setBuffer(out, w_bytes, 3);
+    e.dispatchGroups(mtl.Size.of((vocab + 31) / 32, 1, 1), mtl.Size.of(256, 1, 1));
+    e.end();
+    cb.commit();
+    cb.wait();
+    if (cb.failure()) |msg| {
+        std.log.err("inkling2 draft fold: {s}", .{msg});
+        return error.GpuFailed;
+    }
+    var fw: Tensor = .{ .buffer = out, .offset = 0, .bytes = w_bytes, .dtype = .bf16, .rank = 2 };
+    fw.shape[0] = vocab;
+    fw.shape[1] = rank;
+    var fb: Tensor = .{ .buffer = out, .offset = w_bytes, .bytes = vocab * 2, .dtype = .bf16, .rank = 1 };
+    fb.shape[0] = vocab;
+    try c.set("markov_head.fold_w", fw);
+    try c.set("markov_head.fold_b", fb);
+    try c.own(out, total);
+    w.fold_w = .{ .t = fw, .n = @intCast(vocab), .k = @intCast(rank) };
+    w.fold_b = fb;
+}

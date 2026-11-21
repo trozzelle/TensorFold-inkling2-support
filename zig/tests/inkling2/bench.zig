@@ -1,5 +1,5 @@
 //! Inkling 2 benches: tensor-unit bf16 GEMM at Inkling's dense shapes, the DSpark hold block as byte-equivalent bf16
-//! matvecs, the core EXL3 expert projections on recorded MoE inputs, and the EXL3 decode chain (usage).
+//! matvecs, the draft head's real hold and absorb, the core EXL3 expert projections on recorded MoE inputs, and the EXL3 decode chain (usage).
 const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
@@ -10,6 +10,8 @@ const exl3 = @import("tensorfold").exl3_projection;
 const usage =
     \\tf-inkling-bench gemm                                         tensor-unit GEMM at the dense shapes, M 512/2048/4096
     \\tf-inkling-bench draft                                        the DSpark hold block as bf16 matvecs
+    \\tf-inkling-bench dspark <model>                               the DSpark draft head's hold at depth 5 and 7 and an absorb of one row on <model>'s real weights
+    \\                                                              (the embedding, the unembedding and mtp.safetensors; no layers): median of 9 runs each
     \\tf-inkling-bench dense [rows...]                              48 layers' dense matvecs (default rows 1 2 4 6 8 16), per shape at 1 and 8 rows, unembed at 1 row
     \\tf-inkling-bench experts <model> <layer> <xm.bin> <eids.bin> <rows> <row0> <act.bin> <out>
     \\                                                              w13 and w2 on recorded MoE inputs, bf16 out
@@ -35,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "gemm")) return gemm(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "draft")) return draft(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "dense")) return dense(init, args[2..]);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "dspark")) return @import("bench_dspark.zig").run(init, args);
     if (args.len == 10 and std.mem.eql(u8, args[1], "experts")) return experts(init, args);
     if (args.len == 10 and std.mem.eql(u8, args[1], "xd-dump")) return xdDumpLeg(init, args);
     if (args.len >= 7 and std.mem.eql(u8, args[1], "xd")) return xdLeg(init, args);

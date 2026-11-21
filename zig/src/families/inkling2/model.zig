@@ -9,6 +9,7 @@ const plan = @import("plan.zig");
 const pack = @import("expert_pack.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
+const dspark_weights = @import("dspark_weights.zig");
 
 pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap" };
 pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap };
@@ -20,8 +21,10 @@ comptime {
     for (members, glue_names) |member, name| std.debug.assert(std.mem.eql(u8, "ik_" ++ member, name));
 }
 
-/// `layers`: load only the first layers (the per-layer checks on a Mac that cannot hold the model).
-pub const Options = struct { layers: ?u32 = null };
+/// `layers`: load only the first layers (the per-layer checks on a Mac that cannot hold the model); 0 loads none, and no
+/// experts: the embedding, the final norm and the unembedding alone, enough to run the draft head over recorded taps.
+/// `drafts`: also load the DSpark draft head from the folder's mtp.safetensors, when the config has one and the file is there.
+pub const Options = struct { layers: ?u32 = null, drafts: bool = false };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -34,6 +37,8 @@ pub const Model = struct {
     weights: wts.Weights,
     glue: [glue_names.len]mtl.Pipeline,
     exl3: exl3.Pipelines,
+    /// The draft head's tensors in `checkpoint`, when `Options.drafts` asked for them and they exist.
+    draft: ?dspark_weights.Weights,
     /// Whether decode steps wait warm (forward.zig's `waitWarm`); INKLING_WARM_WAIT=0 turns it off.
     warm_wait: bool,
     /// Layers a decode step commits in a command buffer of their own, before the rest are encoded (0: the step is one
@@ -63,14 +68,14 @@ pub const Model = struct {
         var prec: [cfg.max_layers]plan.Precision = @splat(.exl3);
         m.plan = try plan.build(t, prec[0..t.layers]);
         m.layers = opts.layers orelse t.layers;
-        if (m.layers == 0 or m.layers > t.layers) return error.InvalidInkling2Layers;
+        if (m.layers > t.layers) return error.InvalidInkling2Layers;
         m.device = try mtl.Device.init();
         errdefer m.device.deinit();
         m.queue = try m.device.queue();
         errdefer m.queue.deinit();
         m.checkpoint = ck.Checkpoint.init(gpa);
         errdefer m.checkpoint.deinit();
-        var p = try pack.Pack.read(gpa, io, dir, t.layers, t.experts);
+        var p = if (m.layers == 0) pack.Pack{ .arena = std.heap.ArenaAllocator.init(gpa), .layers = &.{} } else try pack.Pack.read(gpa, io, dir, t.layers, t.experts);
         defer p.deinit();
         m.weights = try wts.load(gpa, m.device, &m.checkpoint, t, &m.plan, &p, dir, m.layers);
         errdefer m.weights.deinit(gpa);
@@ -86,6 +91,11 @@ pub const Model = struct {
         }
         errdefer for (m.glue) |x| x.deinit();
         m.exl3 = try exl3.Pipelines.load(m.device);
+        errdefer m.exl3.deinit();
+        m.draft = null;
+        if (opts.drafts) {
+            if (m.config.mtp) |mtp| m.draft = try dspark_weights.load(gpa, io, m.device, &m.checkpoint, dir, mtp) else std.log.info("inkling2: the config has no mtp_config; the draft head stays off", .{});
+        }
         return m;
     }
 
@@ -94,6 +104,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(m: *Model) void {
+        if (m.draft) |*w| w.deinit(m.gpa);
         m.exl3.deinit();
         for (m.glue) |x| x.deinit();
         m.weights.deinit(m.gpa);
