@@ -16,6 +16,9 @@ const wts = @import("weights.zig");
 const Model = @import("model.zig").Model;
 const glue_names = @import("model.zig").glue_names;
 const dspark = @import("dspark.zig");
+const backend = @import("backend.zig");
+const budget = @import("budget.zig");
+const state = @import("state.zig");
 
 const t = std.testing;
 const gpa = t.allocator;
@@ -465,19 +468,23 @@ test "inkling2 dspark: two streams absorbed and held in one round each hold what
     try t.expectEqualSlices(u16, last[0 .. 4 * vocab], d.captured()[0 .. 4 * vocab]);
 }
 
-/// A residency hook that counts the buffers joined and left.
+/// A residency hook that counts the buffers joined and left, and their bytes.
 const Counter = struct {
     joined: usize = 0,
     left: usize = 0,
+    joined_bytes: usize = 0,
+    left_bytes: usize = 0,
 
-    fn join(ctx: *anyopaque, _: mtl.Buffer) void {
+    fn join(ctx: *anyopaque, buf: mtl.Buffer) void {
         const c: *Counter = @ptrCast(@alignCast(ctx));
         c.joined += 1;
+        c.joined_bytes += buf.length();
     }
 
-    fn leave(ctx: *anyopaque, _: mtl.Buffer) void {
+    fn leave(ctx: *anyopaque, buf: mtl.Buffer) void {
         const c: *Counter = @ptrCast(@alignCast(ctx));
         c.left += 1;
+        c.left_bytes += buf.length();
     }
 
     fn follow(c: *Counter) mtl.ResidencySet.Follow {
@@ -510,4 +517,110 @@ test "inkling2 dspark: a residency hook gets the scratch, each lane's buffers as
     try t.expectEqual(@as(usize, 13), c.left);
     d.setResident(null);
     try t.expectEqual(c.joined, c.left);
+}
+
+test "inkling2 dspark: the bytes the load counts for the head are the buffers the head makes" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const w = &f.model.draft.?;
+    const d = try f.drafter(5);
+    defer d.deinit();
+    // the fold joined the checkpoint's shards when the head was made
+    const fold = dw.foldBytes(vocab, 256);
+    try t.expectEqual(fold, w.fold_w.?.t.bytes + w.fold_b.?.bytes);
+    try t.expectEqual(fold, f.model.checkpoint.residentBytes());
+    // a residency hook is given the scratch, then a stream's buffers: their bytes are the ones counted
+    var c: Counter = .{};
+    d.setResident(c.follow());
+    try t.expectEqual(d.scratchBytes(), c.joined_bytes);
+    var s = try lanes.Stream.init(gpa, .{ .id = "bytes", .prompt = &.{ 5, 6 }, .max_new = 1 });
+    defer s.deinit(gpa);
+    const dv = d.drafter();
+    try dv.open(&s);
+    try t.expectEqual(d.laneBytes(), c.joined_bytes - d.scratchBytes());
+    try t.expectEqual(dv.facts().stream_bytes, d.laneBytes());
+    try t.expectEqual(d.scratchBytes() + d.laneBytes(), d.extraBytes(1));
+    try t.expectEqual(d.scratchBytes() + 3 * d.laneBytes(), d.extraBytes(3));
+    // the whole head: the draft file's shard (as the loader records it), the fold, the scratch and the streams
+    w.bytes = 12345;
+    try t.expectEqual(12345 + fold + d.extraBytes(2), d.residentBytes(2));
+    dv.release(&s);
+    d.setResident(null);
+    try t.expectEqual(c.joined_bytes, c.left_bytes);
+}
+
+test "inkling2 dspark: the load's budget takes the head's file, fold, scratch and stream off the caches' room" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const w = &f.model.draft.?;
+    // a load without the head: the backbone's shards and the scratch
+    const dense = 5 << 20;
+    try f.model.checkpoint.own(try f.device.buffer(dense, mtl.ResourceOptions.shared), dense);
+    const plain = try budget.held(f.model, 0);
+    try t.expectEqual(dense + try state.scratchBytes(&f.model.config.text, 0), plain);
+    // with drafts: the draft file joins the shards (as `Model.load` leaves it), then the head is made and its fold joins them
+    const file = 3 << 20;
+    try f.model.checkpoint.own(try f.device.buffer(file, mtl.ResourceOptions.shared), file);
+    w.bytes = file;
+    const d = try f.drafter(5);
+    defer d.deinit();
+    const drafted = try budget.held(f.model, d.extraBytes(1));
+    try t.expectEqual(plain + d.residentBytes(1), drafted);
+    // under a 236 GB limit on a 256 GiB Mac the caches' room falls by the head's resident bytes, no more and no less
+    const gib: u64 = 1 << 30;
+    const base = 186 * gib; // the rest of the backbone's shards
+    const room_plain = try budget.caches(256 * gib, 240 * gib, 236, base + plain);
+    const room_drafted = try budget.caches(256 * gib, 240 * gib, 236, base + drafted);
+    try t.expect(room_plain > 20 * gib);
+    try t.expectEqual(d.residentBytes(1), room_plain - room_drafted);
+}
+
+test "inkling2 dspark: a drafted load's facts fix the depth or leave it to the rule, with the timed window costs and the logprob rows kept" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const metal = try backend.Metal.init(gpa, f.model, .{ .capacity = 64, .budget = 1 << 30 });
+    defer metal.deinit();
+    // a load without drafts: no costs timed, no head, no fixed depth
+    const plain = metal.facts();
+    try t.expect(!plain.mtp and !plain.speculate and plain.fixed_depth == null and plain.window_costs.len == 0);
+    try t.expect(!metal.tapped);
+    for (&metal.costs, 1..) |*cost, rows| cost.* = .{ .width = @intCast(rows), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(rows)) };
+    metal.timed = backend.measured_widths;
+    for ([_]dspark.Depth{ .{ .fixed = 3 }, .{ .fixed = 7 }, .auto }) |depth| {
+        const d = try f.drafter(depth.most());
+        defer d.deinit();
+        var wrap = try dspark.wrap(gpa, metal.backend(), d);
+        defer wrap.deinit();
+        // the target writes the drafter's taps, and the wrapped backend still gives a first token's logprob row
+        try t.expect(metal.tapped);
+        try t.expect(wrap.backend().vtable.first_row != null);
+        const facts = dspark.laneFacts(&wrap, metal.facts(), depth);
+        try t.expectEqual(depth.fixedDepth(), facts.fixed_depth);
+        try t.expect(facts.mtp and facts.speculate and facts.fixed_draft_block and facts.plain_guard);
+        try t.expectEqual(depth.most(), facts.drafts);
+        try t.expectEqual(@as(usize, backend.measured_widths), facts.window_costs.len);
+        var cfg = try lanes.Config.init(gpa, facts, state.window_rows, state.window_rows - 1);
+        defer cfg.deinit(gpa);
+        try t.expect(cfg.family_mtp);
+        try t.expectEqual(depth.fixedDepth(), cfg.fixed_depth);
+        try t.expectEqual(depth.most(), cfg.most_drafts);
+        try t.expectEqual(@as(?f64, 9.0), cfg.family_costs.get(2));
+        try t.expectEqual(@as(?f64, 21.0), cfg.family_costs.get(8));
+        try t.expectEqual(@as(?f64, null), cfg.family_costs.get(9));
+    }
 }

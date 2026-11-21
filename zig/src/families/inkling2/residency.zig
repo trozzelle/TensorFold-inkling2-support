@@ -1,4 +1,5 @@
-//! The weights and scratch in one residency set for the keepalive, when the 70% limit holds them.
+//! The weights and scratch in one residency set for the keepalive, when the 70% limit holds them; the draft head's scratch and
+//! its streams' state follow the set.
 const std = @import("std");
 const mtl = @import("metal");
 const Resident = mtl.resident.Resident;
@@ -11,12 +12,16 @@ pub fn hold(h: anytype) !void {
     try list.appendSlice(h.gpa, m.weights.tables);
     try mtl.resident.fields.append(h.gpa, &list, &h.metal.scratch);
     h.resident = try Resident.hold(h.gpa, h.io, m.device, m.queue, list.items, "inkling2");
-    if (h.resident) |*r| h.metal.setResident(r.follow());
+    if (h.resident) |*r| {
+        h.metal.setResident(r.follow());
+        if (h.draft) |d| d.setResident(r.follow());
+    }
     h.warm = if (h.resident) |*r| r.target() else .{ .queue = m.queue };
 }
 
 pub fn drop(h: anytype) void {
     h.metal.setResident(null);
+    if (h.draft) |d| d.setResident(null);
     if (h.resident) |*r| r.deinit();
     h.resident = null;
     h.warm = .{ .queue = h.model.queue };

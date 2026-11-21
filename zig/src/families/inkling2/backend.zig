@@ -12,6 +12,9 @@ const be = lanes.backend;
 
 pub const Options = struct { capacity: usize, budget: u64 };
 
+/// Widths `measure` times: a pending token and up to seven drafts, the deepest verify a head asks for.
+pub const measured_widths = 8;
+
 /// Token handles: drawn tokens and host-fed ones, in a host ring.
 const ring = 4096;
 
@@ -50,6 +53,9 @@ pub const Metal = struct {
     tapped: bool = false,
     /// A drafting prompt pass's: takes each chunk's tapped rows as they are made.
     sink: ?be.FeatureSink = null,
+    /// The forward's ms by window rows, timed by `measure` for the depth rule (`timed` of them; none until it runs).
+    costs: [measured_widths]lanes.config.Cost = undefined,
+    timed: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         const out = try gpa.create(Metal);
@@ -87,10 +93,10 @@ pub const Metal = struct {
         while (it.next()) |cache| cache.*.setResident(hook);
     }
 
-    /// Rows are independent in every kernel: any window gives one-row bits. One stream; no draft head.
+    /// Rows are independent in every kernel: any window gives one-row bits. One stream; a draft head's facts come from
+    /// `Drafted.facts`. The window forwards' costs are those `measure` timed, if it ran.
     pub fn facts(self: *const Metal) lanes.Model {
-        _ = self;
-        return .{ .exact_width = st.window_rows, .gpu_tokens = false, .batch_rows = st.window_rows, .mtp = false, .speculate = false, .speculate_early = false, .drafts = 1, .max_streams = 1, .streams_exact = true };
+        return .{ .exact_width = st.window_rows, .gpu_tokens = false, .batch_rows = st.window_rows, .mtp = false, .speculate = false, .speculate_early = false, .drafts = 1, .max_streams = 1, .streams_exact = true, .window_costs = self.costs[0..self.timed] };
     }
 
     /// A 16-token prompt on a throwaway cache: the first request skips the GPU's first touch of every weight.
@@ -101,6 +107,28 @@ pub const Metal = struct {
         var ids: [st.window_rows]u32 = undefined;
         for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37);
         try fwd.run(self.model, &self.scratch, &cache, &ids, .{ .logits = .all });
+    }
+
+    /// A window of each width 1 to `measured_widths` on a throwaway cache at position 0, the second of two runs timed, with
+    /// the rows tapped as a drafted round's are once the features are prepared: what the depth rule prices a round's window by.
+    pub fn measure(self: *Metal) !void {
+        const c = &self.model.config.text;
+        var cache = try st.Cache.init(self.model.device, c, 32, c.layers);
+        defer cache.deinit();
+        var ids: [measured_widths]u32 = undefined;
+        for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37);
+        const to: ?fwd.B = if (self.tapped) .{ .buf = self.scratch.ftaps } else null;
+        for (1..measured_widths + 1) |rows| {
+            var ms: f64 = 0;
+            for (0..2) |run| {
+                cache.len = 0;
+                const began = nowSeconds();
+                try fwd.run(self.model, &self.scratch, &cache, ids[0..rows], .{ .logits = .all, .feature_taps = to });
+                if (run == 1) ms = (nowSeconds() - began) * 1e3;
+            }
+            self.costs[rows - 1] = .{ .width = @intCast(rows), .ms = ms };
+        }
+        self.timed = measured_widths;
     }
 
     pub fn backend(self: *Metal) be.Backend {

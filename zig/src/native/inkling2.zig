@@ -1,4 +1,5 @@
-//! Inkling 2 Small with EXL3 experts served by the lane host: one stream, plain and copy-drafted rounds.
+//! Inkling 2 Small with EXL3 experts served by the lane host: one stream, plain and copy-drafted rounds, and the DSpark draft
+//! head's drafts when the model folder has its weights.
 const std = @import("std");
 const mtl = @import("metal");
 const api = @import("engine_api");
@@ -12,6 +13,8 @@ const Host = struct {
     io: std.Io,
     model: *fl.Model,
     metal: *fl.backend.Metal,
+    draft: ?*fl.dspark.Drafter = null, // the DSpark draft head, when drafts are on and the model folder has it
+    wrap: ?lanes.drafted.Drafted = null, // the head in front of `metal`
     warm: mtl.keepalive.Target = undefined, // the residency set's, or the bare queue's, for the lane host's idle ticker
     resident: ?Resident = null, // weights and scratch kept wired between requests, when they fit the 70% limit
     config: lanes.Config,
@@ -25,6 +28,8 @@ const Host = struct {
         h.core.deinit();
         h.config.deinit(h.gpa);
         fl.residency.drop(h);
+        if (h.wrap) |*w| w.deinit();
+        if (h.draft) |d| d.deinit();
         h.metal.deinit();
         h.model.deinit();
         h.gpa.destroy(h);
@@ -44,14 +49,35 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = "--parallel: the Inkling 2 EXL3 engine serves one stream; give --parallel 1";
         return null;
     }
-    if (o.drafts) std.log.info("inkling2: no draft head yet; serving plain and copy-drafted rounds", .{});
+    // how deep a round drafts: only a load with drafts reads it
+    var depth: fl.dspark.Depth = .default;
+    if (o.drafts) depth = fl.dspark.Depth.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null) catch {
+        problem.* = "INKLING_DRAFT_DEPTH is not a draft depth: give a whole number from 1 to 7, or auto; unset it for 5";
+        return null;
+    };
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
-    const model = fl.Model.load(gpa, io, o.dir, .{}) catch |err| {
-        problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 EXL3 engine cannot load this checkpoint ({s})", .{@errorName(err)});
+    // with drafts, the model also loads the draft head's weights (mtp.safetensors) when the folder has them: they are among the
+    // checkpoint's shards, so the budget below counts them
+    const model = fl.Model.load(gpa, io, o.dir, .{ .drafts = o.drafts }) catch |err| {
+        problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 EXL3 engine cannot load this checkpoint ({s}){s}", .{ @errorName(err), if (o.drafts) "; with drafts on it also loads mtp.safetensors, which --no-drafts skips" else "" });
         return null;
     };
     errdefer model.deinit();
+    // the head before the budget: its fold joins the checkpoint's shards when it is made, and its scratch is known
+    var draft: ?*fl.dspark.Drafter = null;
+    if (model.draft) |*head_weights| {
+        draft = fl.dspark.Drafter.init(gpa, model.device, model, head_weights, .{ .depth = depth.most() }) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "the Inkling 2 draft head cannot start ({s}); --no-drafts serves without it", .{@errorName(err)});
+            model.deinit();
+            return null;
+        };
+    } else if (o.drafts) std.log.info("inkling2: no draft head loaded; serving plain and copy-drafted rounds", .{});
+    errdefer if (draft) |d| d.deinit();
+    if (draft) |d| switch (depth) {
+        .fixed => |n| std.log.info("inkling2: DSpark draft head, {d} drafts a round, {d:.2} GiB resident", .{ n, gib(d.residentBytes(1)) }),
+        .auto => std.log.info("inkling2: DSpark draft head, 1 to {d} drafts a round chosen by the cost rule, {d:.2} GiB resident", .{ depth.most(), gib(d.residentBytes(1)) }),
+    };
     // refusals that return null free what they hold themselves: errdefer runs only for errors
     var ram: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -59,16 +85,18 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     // --load-limit-gb, else INKLING_LOAD_LIMIT_GB, else 75% of RAM
     const env_text: ?[]const u8 = if (std.c.getenv("INKLING_LOAD_LIMIT_GB")) |v| std.mem.span(v) else null;
     const limit_gb: ?f64 = o.load_limit_gb orelse fl.budget.parseLimit(env_text) catch {
-        model.deinit();
+        free(model, draft);
         problem.* = "INKLING_LOAD_LIMIT_GB is not a load limit: give a number of GB above 0 (or --load-limit-gb), or unset it for 75% of RAM";
         return null;
     };
     const c = &model.config.text;
+    // the checkpoint's shards, the draft head's file and fold among them
     const weights: u64 = model.checkpoint.residentBytes();
-    // the scratch but for the partials that grow with the context, which `longest` counts beside the caches
-    const scratch: u64 = try fl.state.scratchBytes(c, 0);
-    const room = fl.budget.caches(ram, model.device.maxWorkingSet(), limit_gb, weights + scratch) catch {
-        model.deinit();
+    // what the caches' room is left after: those, the scratch but for the partials that grow with the context (`longest`
+    // counts them beside the caches), and the draft head's scratch and its one stream's state
+    const held = try fl.budget.held(model, if (draft) |d| d.extraBytes(1) else 0);
+    const room = fl.budget.caches(ram, model.device.maxWorkingSet(), limit_gb, held) catch {
+        free(model, draft);
         problem.* = "--load-limit-gb is not a load limit: give a number of GB above 0, or leave it out for 75% of RAM";
         return null;
     };
@@ -76,25 +104,37 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     const window: i64 = o.context orelse @intCast(fits);
     if (window < 1 or window > fits) {
         problem.* = try std.fmt.allocPrint(a, "--context {d}: this Mac's Inkling 2 caches fit {d} tokens under its load limit (75% of RAM, or --load-limit-gb, or INKLING_LOAD_LIMIT_GB)", .{ window, fits });
-        model.deinit(); // after the message, so a failed allocation leaves the model to the errdefer
+        free(model, draft); // after the message, so a failed allocation leaves them to the errdefers
         return null;
     }
     // the partials of this window come off what the caches may hold
     const budget = room - fl.state.partBytes(c, @as(usize, @intCast(window)) + 1);
-    std.log.info("inkling2: {d:.1} GiB of weights, {d:.1} GiB for caches, context up to {d} tokens", .{ @as(f64, @floatFromInt(weights)) / (1 << 30), @as(f64, @floatFromInt(budget)) / (1 << 30), window });
+    std.log.info("inkling2: {d:.1} GiB of weights, {d:.1} GiB for caches, context up to {d} tokens", .{ gib(weights), gib(budget), window });
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.gpa = gpa;
     h.io = io;
     h.model = model;
     h.resident = null;
+    h.draft = draft;
+    h.wrap = null;
     h.metal = try fl.backend.Metal.init(gpa, model, .{ .capacity = @intCast(window), .budget = budget });
     errdefer h.metal.deinit();
     try h.metal.warm();
-    h.config = try lanes.Config.init(gpa, h.metal.facts(), fl.state.window_rows, fl.state.window_rows - 1);
+    errdefer if (h.wrap) |*w| w.deinit();
+    var facts = h.metal.facts();
+    if (draft) |d| {
+        // the target writes the drafter's taps from here on, so the windows are timed with them, as a drafted round verifies
+        h.wrap = try fl.dspark.wrap(gpa, h.metal.backend(), d);
+        try h.metal.measure();
+        var text: [256]u8 = undefined;
+        std.log.info("inkling2: window forwards by rows, ms: {s}", .{costsText(&text, h.metal.facts().window_costs)});
+        facts = fl.dspark.laneFacts(&h.wrap.?, h.metal.facts(), depth);
+    }
+    h.config = try lanes.Config.init(gpa, facts, fl.state.window_rows, fl.state.window_rows - 1);
     errdefer h.config.deinit(gpa);
     h.clock = .{ .io = io };
-    h.core = lanes.Engine.init(gpa, &h.config, h.metal.backend(), h.clock.clock());
+    h.core = lanes.Engine.init(gpa, &h.config, if (h.wrap) |*w| w.backend() else h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = 1, .context_window = @intCast(window), .prefill_step = fl.state.prompt_rows, .structures = true, .logprobs = true });
     try fl.residency.hold(h);
@@ -104,4 +144,21 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick, .probe = mtl.keepalive.Target.busy };
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+fn gib(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1 << 30);
+}
+
+/// What a refusal frees: the draft head before the model it reads.
+fn free(model: *fl.Model, draft: ?*fl.dspark.Drafter) void {
+    if (draft) |d| d.deinit();
+    model.deinit();
+}
+
+/// The timed window forwards, "rows: ms" each, for the log.
+fn costsText(buf: []u8, costs: []const lanes.config.Cost) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    for (costs, 0..) |cost, i| w.print("{s}{d}: {d:.1}", .{ if (i == 0) "" else ", ", cost.width, cost.ms }) catch break;
+    return w.buffered();
 }

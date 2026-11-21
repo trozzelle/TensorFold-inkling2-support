@@ -62,6 +62,8 @@ pub const Weights = struct {
     /// unembed . hidden_out: fold_w [vocab, rank] and fold_b [vocab] (bf16), filled by the fold pass after load.
     fold_w: ?Dense = null,
     fold_b: ?Tensor = null,
+    /// Bytes the draft file takes among the checkpoint's shards (the fold's are counted apart: `foldBytes`).
+    bytes: usize = 0,
 
     pub fn deinit(w: *Weights, gpa: std.mem.Allocator) void {
         w.alpha_buffer.deinit();
@@ -117,6 +119,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Check
     const taps: usize = m.taps_n;
     const h: usize = m.hidden;
     const rank: usize = m.rank;
+    const before = c.residentBytes();
     try c.addFile(device, path, "");
     const fuse = try wts.tensor(c, "fuse_weight", .bf16, &.{ rows, taps });
     const markov: Markov = .{
@@ -141,6 +144,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Check
         .mask_embed = mask_embed,
         .norm = norm,
         .markov = markov,
+        .bytes = c.residentBytes() - before,
     };
     mix.softmaxRows(fuse.host(u16), rows, taps, &w.alpha);
     const packed_alpha = w.alpha_buffer.slice(u16, rows * taps);

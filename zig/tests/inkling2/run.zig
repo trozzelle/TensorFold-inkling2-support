@@ -13,7 +13,10 @@ const usage =
     \\                                                         16-row windows through the decode path
     \\tf-inkling-run <model> exact <ids.json> <at> [layers]    ids[at..] (ids at most 512) after ids[..at]: one-row steps
     \\                                                         against 16-row windows, bit for bit
-    \\tf-inkling-run <model> greedy <ids.json> <n>             the prompt, then n one-row greedy steps; tokens, tok/s
+    \\tf-inkling-run <model> greedy <ids.json> <n> [--drafts]   the prompt, then n one-row greedy steps; tokens, tok/s
+    \\                                                         --drafts: the same n tokens through the lane engine with the draft head in
+    \\                                                         front of the target, as served (INKLING_DRAFT_DEPTH: 1 to 7 or auto, 5 when
+    \\                                                         unset); needs mtp.safetensors in the folder; also prints rounds, drafts, accepted
     \\tf-inkling-run <model> taps <index.txt> <out_dir> <steps>   each prompt, then steps greedy tokens: taps, picks, MoE inputs
     \\tf-inkling-run <model> ftaps <ids.json> <out.bin> [at [window]]   every row's serving taps: bf16 [T, 8, H], the inputs of layers
     \\                                                         5, 11, .. 41, then the finals. ids[..at] (default: all) go through in
@@ -236,10 +239,12 @@ fn exactMode(init: std.process.Init, args: []const [:0]const u8) !void {
 }
 
 fn greedyMode(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (args.len != 5) return error.ExpectedIdsSteps;
+    const drafts = args.len == 6 and std.mem.eql(u8, args[5], "--drafts");
+    if (args.len != 5 and !drafts) return error.ExpectedIdsStepsAndMaybeDrafts;
     const steps = try std.fmt.parseInt(usize, args[4], 10);
     const ids = try readIds(init, args[3]);
     defer ids.deinit();
+    if (drafts) return @import("drafted.zig").greedy(init, args[1], ids.value, steps);
     const m = try ik.Model.load(init.gpa, init.io, args[1], .{});
     defer m.deinit();
     const c = &m.config.text;

@@ -194,6 +194,59 @@ const Lane = struct {
     held_len: u32 = 0,
 };
 
+/// How deep a served round drafts (INKLING_DRAFT_DEPTH): a whole number from 1 to `max_depth` holds every round at that depth,
+/// `auto` leaves it to the lane core's cost rule, which chooses among 1 to `max_depth` by what the drafts and the window
+/// forwards cost.
+pub const Depth = union(enum) {
+    fixed: u8,
+    auto,
+
+    /// What an unset or blank setting means.
+    pub const default: Depth = .{ .fixed = 5 };
+
+    /// The setting's text: null or blank is the default, `auto` (any case) or a whole number from 1 to `max_depth`.
+    pub fn parse(text: ?[]const u8) error{BadDraftDepth}!Depth {
+        const t = std.mem.trim(u8, text orelse "", " \t");
+        if (t.len == 0) return default;
+        if (std.ascii.eqlIgnoreCase(t, "auto")) return .auto;
+        const n = std.fmt.parseInt(u8, t, 10) catch return error.BadDraftDepth;
+        if (n == 0 or n > max_depth) return error.BadDraftDepth;
+        return .{ .fixed = n };
+    }
+
+    /// Drafts a hold makes at most: the drafter's `Options.depth`, which it offers the depth rule and times its drafts at.
+    pub fn most(d: Depth) u32 {
+        return switch (d) {
+            .fixed => |n| n,
+            .auto => max_depth,
+        };
+    }
+
+    /// The lane core's `Model.fixed_depth` (null: the cost rule chooses).
+    pub fn fixedDepth(d: Depth) ?u8 {
+        return switch (d) {
+            .fixed => |n| n,
+            .auto => null,
+        };
+    }
+};
+
+/// The lane core's facts for a load that drafts: `target`'s through `drafted` (the drafter's depth, step cost and prior among
+/// them) and `depth`'s fixed depth. `target` should carry the window forwards' timed costs, which the cost rule of `auto` reads.
+pub fn laneFacts(drafted: *const lanes.drafted.Drafted, target: lanes.Model, depth: Depth) lanes.Model {
+    var m = drafted.facts(target);
+    m.fixed_depth = depth.fixedDepth();
+    return m;
+}
+
+/// `d` in front of `target`: the target is told the drafter's taps, so its forwards write them, and its logprob rows for a
+/// stream's first token stay on offer.
+pub fn wrap(gpa: std.mem.Allocator, target: lanes.backend.Backend, d: *Drafter) !lanes.drafted.Drafted {
+    var w = try lanes.drafted.Drafted.init(gpa, target, d.drafter());
+    w.first_rows = true;
+    return w;
+}
+
 pub const Options = struct {
     /// Drafts a round at most (1 to 7): what `facts` offers the depth rule, and the cost of a draft is priced against.
     depth: u32 = 5,
@@ -294,6 +347,17 @@ pub const Drafter = struct {
     pub fn laneBytes(d: *const Drafter) usize {
         _ = d;
         return 2 * draft_layers * ringBytes() + hidden * 2 + rank * 2 + block * 4;
+    }
+
+    /// Device bytes the head holds that no checkpoint shard counts: the scratch and `streams` streams' draft state.
+    pub fn extraBytes(d: *const Drafter, streams: usize) usize {
+        return d.scratchBytes() + streams * d.laneBytes();
+    }
+
+    /// Device bytes the whole head holds with `streams` streams: its file's shard and the fold, both shards of the checkpoint,
+    /// and `extraBytes`.
+    pub fn residentBytes(d: *const Drafter, streams: usize) usize {
+        return d.w.bytes + d.w.fold_w.?.t.bytes + d.w.fold_b.?.bytes + d.extraBytes(streams);
     }
 
     /// Device bytes of the scratch (with the step logits' buffer, if it is made).
@@ -670,4 +734,24 @@ test "inkling2 dspark: the attention's blocks are the 256-key blocks that meet t
         try std.testing.expectEqual(meet + 1, attnBlocks(end, win));
         try std.testing.expect(attnBlocks(end, win) <= max_blocks);
     }
+}
+
+test "inkling2 dspark: the depth setting is a whole number from 1 to 7 that fixes every round's drafts, auto, or 5 when unset" {
+    const t = std.testing;
+    for ([_]?[]const u8{ null, "", "  \t" }) |text| try t.expectEqual(Depth{ .fixed = 5 }, try Depth.parse(text));
+    for (1..max_depth + 1) |n| {
+        var buf: [4]u8 = undefined;
+        const want: u8 = @intCast(n);
+        const d = try Depth.parse(try std.fmt.bufPrint(&buf, " {d}", .{n}));
+        try t.expectEqual(Depth{ .fixed = want }, d);
+        try t.expectEqual(@as(u32, want), d.most());
+        try t.expectEqual(@as(?u8, want), d.fixedDepth());
+    }
+    for ([_][]const u8{ "auto", "AUTO", " Auto " }) |text| {
+        const d = try Depth.parse(text);
+        try t.expectEqual(Depth.auto, d);
+        try t.expectEqual(@as(u32, max_depth), d.most());
+        try t.expectEqual(@as(?u8, null), d.fixedDepth());
+    }
+    for ([_][]const u8{ "0", "8", "-1", "3.5", "five", "autos", "256", "1 2" }) |text| try t.expectError(error.BadDraftDepth, Depth.parse(text));
 }

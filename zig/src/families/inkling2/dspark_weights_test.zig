@@ -144,6 +144,9 @@ test "inkling2 draft weights: a tiny mtp.safetensors loads with every shape chec
         try t.expectEqual(want[r][j], packed_alpha[r * w.taps + j]);
     };
     try t.expect(w.fold_w == null and w.fold_b == null);
+    // the file's shard is all the checkpoint holds, and the weights record its bytes for the budget
+    try t.expect(w.bytes > 0);
+    try t.expectEqual(ckp.residentBytes(), w.bytes);
 }
 
 test "inkling2 draft weights: a model folder without mtp.safetensors loads no draft head" {
