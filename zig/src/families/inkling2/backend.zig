@@ -14,6 +14,23 @@ pub const Options = struct { capacity: usize, budget: u64 };
 /// Token handles: drawn tokens and host-fed ones, in a host ring.
 const ring = 4096;
 
+/// Seconds a stream's rounds spent, by where (INKLING_ROUND_TIMING): the forward's encode and GPU time by its own
+/// clocks, the forward call, the draws, and the time between one round's end and the next one's start.
+const Spent = struct {
+    rounds: u64 = 0,
+    forward: fwd.Timing = .{},
+    run: f64 = 0,
+    draw: f64 = 0,
+    between: f64 = 0,
+    ended: f64 = 0,
+
+    fn log(s: Spent) void {
+        if (s.rounds == 0) return;
+        const per_ms = 1e3 / @as(f64, @floatFromInt(s.rounds));
+        std.log.info("inkling2: {d} rounds; a round took gpu {d:.2} ms, encode {d:.2} ms, commit and wake {d:.2} ms, draw {d:.2} ms, between rounds {d:.2} ms", .{ s.rounds, s.forward.gpu * per_ms, s.forward.encode * per_ms, (s.run - s.forward.gpu - s.forward.encode) * per_ms, s.draw * per_ms, s.between * per_ms });
+    }
+};
+
 pub const Metal = struct {
     gpa: std.mem.Allocator,
     model: *Model,
@@ -25,6 +42,8 @@ pub const Metal = struct {
     tokens: []u32,
     next: u64 = 0,
     values: []f32,
+    /// Set by INKLING_ROUND_TIMING: what the stream's rounds spend, logged when it ends; null when off.
+    spent: ?Spent = null,
 
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         const out = try gpa.create(Metal);
@@ -36,7 +55,7 @@ pub const Metal = struct {
         errdefer gpa.free(tokens);
         const values = try gpa.alloc(f32, model.config.text.vocab);
         errdefer gpa.free(values);
-        out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = scratch, .tokens = tokens, .values = values };
+        out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = scratch, .tokens = tokens, .values = values, .spent = if (std.c.getenv("INKLING_ROUND_TIMING") != null) Spent{} else null };
         return out;
     }
 
@@ -158,6 +177,7 @@ pub const Metal = struct {
         try self.caches.put(self.gpa, stream, cache);
         errdefer _ = self.caches.remove(stream);
         stream.cached = 0;
+        if (self.spent != null) self.spent = .{};
         try self.feed(cache, ids, stream);
     }
 
@@ -218,7 +238,12 @@ pub const Metal = struct {
         var ids: [st.window_rows]u32 = undefined;
         ids[0] = w.pending;
         @memcpy(ids[1..][0..w.tokens.len], w.tokens);
-        try fwd.run(self.model, &self.scratch, cache, ids[0..rows], .{ .logits = .all });
+        const began = nowSeconds();
+        if (self.spent) |*s| if (s.ended != 0) {
+            s.between += began - s.ended;
+        };
+        try fwd.run(self.model, &self.scratch, cache, ids[0..rows], .{ .logits = .all, .timing = if (self.spent) |*s| &s.forward else null });
+        const ran = nowSeconds();
         cache.len += rows;
         @memcpy(o.drafts, w.tokens);
         const all = self.scratch.logits.slice(u16, rows * c.vocab);
@@ -227,6 +252,12 @@ pub const Metal = struct {
             const mask = if (w.masks.len >= (r + 1) * words) w.masks[r * words ..][0..words] else &.{};
             o.sampled[r] = try self.draw(l, w.stream.sampling, w.positions[r], mask);
             if (o.rows.len == rows) o.rows[r] = row(l, o.sampled[r], w.stream.logprobs orelse 0);
+        }
+        if (self.spent) |*s| {
+            s.ended = nowSeconds();
+            s.rounds += 1;
+            s.run += ran - began;
+            s.draw += s.ended - ran;
         }
     }
 
@@ -256,9 +287,19 @@ pub const Metal = struct {
             entry.value.deinit();
             self.gpa.destroy(entry.value);
         }
+        if (self.spent) |s| {
+            s.log();
+            self.spent = .{};
+        }
     }
 };
 
 fn logit(word: u16) f32 {
     return @bitCast(@as(u32, word) << 16);
+}
+
+fn nowSeconds() f64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(f64, @floatFromInt(ts.sec)) + @as(f64, @floatFromInt(ts.nsec)) * 1e-9;
 }

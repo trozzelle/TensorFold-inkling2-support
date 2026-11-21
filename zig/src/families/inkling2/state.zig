@@ -199,12 +199,16 @@ pub const Scratch = struct {
     sums: mtl.Buffer,
     /// Positions of the longest cache this scratch serves: the split attention's partials hold that many keys' blocks.
     capacity: usize,
+    /// The GPU seconds a decode step of each row count is expected to take (0: none yet), for the next one's wait: a
+    /// shorter step replaces it at once, a longer one moves it a quarter of the way.
+    expected: [window_rows + 1]f64,
 
     pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize) !Scratch {
         @setEvalBranchQuota(10000);
         const sz = try sizes(c, capacity);
         var s: Scratch = undefined;
         s.capacity = capacity;
+        s.expected = @splat(0);
         var made: [fields.len]bool = @splat(false);
         errdefer inline for (fields, 0..) |f, i| if (made[i]) @field(s, f).deinit();
         inline for (fields, 0..) |f, i| {

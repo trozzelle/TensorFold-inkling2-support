@@ -1,5 +1,6 @@
 //! Inkling 2 kernel checks: split-K decode attention against an FP64 reference, a window's rows against the same rows
-//! run one at a time, and a row's blocks against the same row with empty blocks around them.
+//! run one at a time, a row's blocks against the same row with empty blocks around them, and its relative bias formed
+//! in the kernel against the table ik_relbias writes.
 const std = @import("std");
 const mtl = @import("metal");
 const h = @import("harness.zig");
@@ -8,6 +9,7 @@ const Hq = 48;
 const KV = 8;
 const D = 128;
 const E = 1024; // relative-bias extent, also the local layers' window
+const REL = 16; // dims of the relative state
 const KEYS = 256; // keys in one block
 const PART_SIMDGROUPS = 24; // the partial kernel's threadgroup: 8 key groups of 32 keys, 3 pairs of q heads
 const SLOT = D + 2; // floats in one (row, head, block) partial: m, l, acc[D]
@@ -17,11 +19,15 @@ const MAX_BLOCKS = (CAP + KEYS - 1) / KEYS + 3; // the cache's blocks and three 
 const OUT_ROW = Hq * D * 2; // bytes of one row's attention output
 
 /// Random inputs for ROWS rows over a CAP-key cache, and the buffers the two kernels write. Scores spread over several
-/// units, so blocks differ in their maxima and the merge's rescaling matters.
+/// units, so blocks differ in their maxima and the merge's rescaling matters. `reln` and `proj` are the relative state
+/// and projection the kernel forms its bias from; `pb` holds the bias table of the same, formed on the host as
+/// ik_relbias forms it (and read back through `pbv`).
 const Inputs = struct {
     qn: mtl.Buffer,
     keys: mtl.Buffer,
     vals: mtl.Buffer,
+    reln: mtl.Buffer,
+    proj: mtl.Buffer,
     pb: mtl.Buffer,
     sink: mtl.Buffer,
     gate: mtl.Buffer,
@@ -30,6 +36,8 @@ const Inputs = struct {
     qv: []u16,
     kv: []u16,
     vv: []u16,
+    relv: []u16,
+    projv: []u16,
     pbv: []u16,
     sv: []u16,
     gv: []u16,
@@ -38,15 +46,19 @@ const Inputs = struct {
         const qn = try g.buf(ROWS * Hq * D * 2);
         const keys = try g.buf(CAP * KV * D * 2);
         const vals = try g.buf(CAP * KV * D * 2);
+        const reln = try g.buf(ROWS * Hq * REL * 2);
+        const proj = try g.buf(REL * E * 2);
         const pb = try g.buf(ROWS * Hq * E * 2);
         const sink = try g.buf(ROWS * Hq * 2);
         const gate = try g.buf(ROWS * Hq * D * 2);
         const att = try g.buf(ROWS * OUT_ROW);
         const part = try g.buf(ROWS * Hq * MAX_BLOCKS * SLOT * 4);
-        return .{
+        const x: Inputs = .{
             .qn = qn,
             .keys = keys,
             .vals = vals,
+            .reln = reln,
+            .proj = proj,
             .pb = pb,
             .sink = sink,
             .gate = gate,
@@ -55,14 +67,28 @@ const Inputs = struct {
             .qv = h.fill16(qn, ROWS * Hq * D, r, 2.5),
             .kv = h.fill16(keys, CAP * KV * D, r, 2.5),
             .vv = h.fill16(vals, CAP * KV * D, r, 1.0),
-            .pbv = h.fill16(pb, ROWS * Hq * E, r, 2.0),
+            .relv = h.fill16(reln, ROWS * Hq * REL, r, 1.0),
+            .projv = h.fill16(proj, REL * E, r, 1.5),
+            .pbv = pb.slice(u16, ROWS * Hq * E),
             .sv = h.fill16(sink, ROWS * Hq, r, 2.0),
             .gv = h.fill16(gate, ROWS * Hq * D, r, 3.0),
+        };
+        x.formBias();
+        return x;
+    }
+
+    /// The bias table of the current relative state and projection: bf16 of the 16 products (each exact in f32) summed
+    /// in index order in f32.
+    fn formBias(x: Inputs) void {
+        for (0..ROWS * Hq) |rh| for (0..E) |d| {
+            var s: f32 = 0;
+            for (0..REL) |i| s += @as(f32, @floatCast(h.fb(x.relv[rh * REL + i]))) * @as(f32, @floatCast(h.fb(x.projv[i * E + d])));
+            x.pbv[rh * E + d] = h.bf(s);
         };
     }
 
     fn deinit(x: Inputs) void {
-        for ([_]mtl.Buffer{ x.qn, x.keys, x.vals, x.pb, x.sink, x.gate, x.att, x.part }) |b| b.deinit();
+        for ([_]mtl.Buffer{ x.qn, x.keys, x.vals, x.reln, x.proj, x.pb, x.sink, x.gate, x.att, x.part }) |b| b.deinit();
     }
 
     /// The attention bytes of rows `first` .. `first + n`.
@@ -79,13 +105,32 @@ fn blocksOf(pos: u32, rows: u32, window: u32) struct { f0: u32, n: u32 } {
     return .{ .f0 = f0, .n = (pos + rows - 1) / KEYS - f0 + 1 };
 }
 
-/// ik_attn_part, then ik_attn_merge, over `rows` rows that start at input row `row` and position `pos`, with blocks
-/// f0 .. f0 + n. The partials and the output start as NaN, so anything the kernels leave unwritten shows.
-fn attend(g: *const h.Gpu, x: Inputs, row: usize, rows: u32, pos: u32, window: u32, f0: u32, n: u32) !void {
+fn argsOf(rows: u32, pos: u32, window: u32, f0: u32, n: u32) h.Args {
+    return .{ .rows = rows, .heads = Hq, .kv = KV, .dim = D, .pos = pos, .window = window, .extent = E, .blocks = n, .queries = f0, .scale = @floatCast(1 / @sqrt(@as(f64, D))) };
+}
+
+/// The partial kernel alone over `rows` rows that start at input row `row` and position `pos`, with blocks f0 .. f0 + n:
+/// `ik_attn_part`, which forms the relative bias from the rows' state and the projection, or `ik_attn_part_table`,
+/// which reads the bias table `table` (rows from `row`). The partials and the output start as NaN, so anything the
+/// kernels leave unwritten shows.
+fn runPart(g: *const h.Gpu, x: Inputs, name: [:0]const u8, table: mtl.Buffer, row: usize, rows: u32, pos: u32, window: u32, f0: u32, n: u32) !void {
     @memset(x.part.slice(f32, rows * Hq * n * SLOT), std.math.nan(f32));
     @memset(x.out(row, rows), 0xff);
-    const a: h.Args = .{ .rows = rows, .heads = Hq, .kv = KV, .dim = D, .pos = pos, .window = window, .extent = E, .blocks = n, .queries = f0, .scale = @floatCast(1 / @sqrt(@as(f64, D))) };
-    try g.run("ik_attn_part", a, &.{ .{ .buf = x.qn, .off = row * Hq * D * 2 }, .{ .buf = x.keys }, .{ .buf = x.vals }, .{ .buf = x.pb, .off = row * Hq * E * 2 }, .{ .buf = x.part } }, .{ KV, rows, n }, .{ 32, PART_SIMDGROUPS, 1 }, true);
+    const q: h.Bind = .{ .buf = x.qn, .off = row * Hq * D * 2 };
+    const a = argsOf(rows, pos, window, f0, n);
+    const grid: [3]usize = .{ KV, rows, n };
+    const group: [3]usize = .{ 32, PART_SIMDGROUPS, 1 };
+    if (std.mem.eql(u8, name, "ik_attn_part")) {
+        try g.run(name, a, &.{ q, .{ .buf = x.keys }, .{ .buf = x.vals }, .{ .buf = x.reln, .off = row * Hq * REL * 2 }, .{ .buf = x.proj }, .{ .buf = x.part } }, grid, group, true);
+    } else {
+        try g.run(name, a, &.{ q, .{ .buf = x.keys }, .{ .buf = x.vals }, .{ .buf = table, .off = row * Hq * E * 2 }, .{ .buf = x.part } }, grid, group, true);
+    }
+}
+
+/// ik_attn_part, then ik_attn_merge, over the same rows and blocks.
+fn attend(g: *const h.Gpu, x: Inputs, row: usize, rows: u32, pos: u32, window: u32, f0: u32, n: u32) !void {
+    try runPart(g, x, "ik_attn_part", x.pb, row, rows, pos, window, f0, n);
+    const a = argsOf(rows, pos, window, f0, n);
     try g.run("ik_attn_merge", a, &.{ .{ .buf = x.part }, .{ .buf = x.sink, .off = row * Hq * 2 }, .{ .buf = x.gate, .off = row * Hq * D * 2 }, .{ .buf = x.att, .off = row * OUT_ROW } }, .{ Hq, rows, 1 }, .{ 32, 1, 1 }, true);
 }
 
@@ -160,7 +205,8 @@ fn caseSplitRef(g: *const h.Gpu, r: std.Random) !void {
 }
 
 /// A window's rows equal the same rows run one at a time (each with its own first block and block count) in bytes, over
-/// windows that start and end near block edges and the bias extent; a NaN in row 1's query stays in row 1.
+/// windows that start and end near block edges and the bias extent; a NaN in row 1's query, or in its relative state,
+/// stays in row 1.
 fn caseSplitWindow(g: *const h.Gpu, r: std.Random) !void {
     const x = try Inputs.init(g, r);
     defer x.deinit();
@@ -185,6 +231,12 @@ fn caseSplitWindow(g: *const h.Gpu, r: std.Random) !void {
             x.qv[nan_at] = 0x7fc0;
             try attend(g, x, 0, ROWS, pos, window, grid.f0, grid.n);
             x.qv[nan_at] = kept;
+            for (0..ROWS) |t| if (t != 1) c.same(x.out(t, 1), saved[t * OUT_ROW ..][0..OUT_ROW]);
+            const rel_at = Hq * REL + 3 * REL; // head 3 of row 1
+            const rel_kept = x.relv[rel_at];
+            x.relv[rel_at] = 0x7fc0;
+            try attend(g, x, 0, ROWS, pos, window, grid.f0, grid.n);
+            x.relv[rel_at] = rel_kept;
             for (0..ROWS) |t| if (t != 1) c.same(x.out(t, 1), saved[t * OUT_ROW ..][0..OUT_ROW]);
             if (c.bad != bad) std.debug.print("  failing: pos {d}\n", .{pos});
         }
@@ -215,8 +267,51 @@ fn caseSplitBlocks(g: *const h.Gpu, r: std.Random) !void {
     }
 }
 
+/// A relative state of +-1 and a projection whose every column holds a large pair of opposite signs among small terms:
+/// for the heads whose two state values agree the pair cancels, and wherever it sits in the f32 sum it absorbs the small
+/// terms' low bits, so the sum's order shows in the bf16 biases (about a tenth of them change when it does).
+fn cancelling(x: Inputs, r: std.Random) void {
+    for (x.relv) |*v| v.* = if (r.boolean()) 0x3f80 else 0xbf80;
+    for (0..E) |d| {
+        for (0..REL) |i| x.projv[i * E + d] = h.bf((r.float(f64) * 2 - 1) / 16);
+        const up = r.uintLessThan(usize, REL);
+        const down = (up + 1 + r.uintLessThan(usize, REL - 1)) % REL;
+        const big = std.math.pow(f64, 2, @floatFromInt(r.intRangeAtMost(i32, 8, 12)));
+        x.projv[up * E + d] = h.bf(big);
+        x.projv[down * E + d] = h.bf(-big);
+    }
+    x.formBias();
+}
+
+/// The relative bias formed in the kernel is the table ik_relbias writes: the partials of ik_attn_part equal those of the
+/// same body reading ik_relbias's output on the GPU (and the host's table, which ik_relbias must equal), for windows
+/// that put some keys beyond the bias extent and some within it, at one row and at a window's rows.
+fn caseSplitBias(g: *const h.Gpu, r: std.Random) !void {
+    const x = try Inputs.init(g, r);
+    defer x.deinit();
+    cancelling(x, r);
+    const gpu_pb = try g.buf(ROWS * Hq * E * 2);
+    defer gpu_pb.deinit();
+    const alloc = std.heap.page_allocator;
+    const saved = try alloc.alloc(u8, ROWS * Hq * MAX_BLOCKS * SLOT * 4);
+    defer alloc.free(saved);
+    var c: h.Check = .{ .name = "split relative bias" };
+    try g.run("ik_relbias", .{ .rows = ROWS, .heads = Hq, .extent = E, .dim = REL }, &.{ .{ .buf = x.reln }, .{ .buf = x.proj }, .{ .buf = gpu_pb } }, .{ E, Hq, ROWS }, .{ 256, 1, 1 }, false);
+    c.same(gpu_pb.slice(u8, ROWS * Hq * E * 2), x.pb.slice(u8, ROWS * Hq * E * 2));
+    for ([_]u32{ 1024, 0 }) |window| for ([_]u32{ 0, 255, 700, 1020, 1500, 3000 }) |pos| for ([_]u32{ 1, 5, ROWS }) |rows| {
+        const grid = blocksOf(pos, rows, window);
+        const bytes = rows * Hq * grid.n * SLOT * 4;
+        try runPart(g, x, "ik_attn_part_table", gpu_pb, 0, rows, pos, window, grid.f0, grid.n);
+        @memcpy(saved[0..bytes], x.part.slice(u8, bytes));
+        try runPart(g, x, "ik_attn_part", gpu_pb, 0, rows, pos, window, grid.f0, grid.n);
+        c.same(x.part.slice(u8, bytes), saved[0..bytes]);
+    };
+    try c.done();
+}
+
 pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseSplitRef(g, r);
     try caseSplitWindow(g, r);
     try caseSplitBlocks(g, r);
+    try caseSplitBias(g, r);
 }

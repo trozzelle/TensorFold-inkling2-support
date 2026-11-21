@@ -99,7 +99,8 @@ fn caseRdn(g: *const h.Gpu, r: std.Random, rows: usize, Q: u32, K: u32, boundary
         try g.run("ik_depth", .{ .rows = @intCast(rows), .width = H, .blocks = K, .queries = Q, .stride = stride, .scale = scale() }, &.{ .{ .buf = blocks_a }, nrd_a, .{ .buf = query }, .{ .buf = ai } }, grid, one, true);
         for (0..Q) |j| try g.run("ik_norm", .{ .rows = @intCast(rows), .width = H, .stride = Q * H, .flags = f32_in, .eps = eps_norm }, &.{ .{ .buf = ai, .off = j * H * 4 }, .{ .buf = norms, .off = j * H * 2 }, .{ .buf = xin_a, .off = j * rows * H * 2 } }, grid, one, true);
     }
-    try g.run("ik_rdn", fused, &rdnBinds(.{ .buf = hb }, .{ .buf = blocks_b }, nrdBind(nr_b, blocks_b, boundary, K, 0), query, norms, q, .{ .buf = xin_b }), grid, one, true);
+    const kernel: [:0]const u8 = if (Q > 1) "ik_rdn3" else "ik_rdn"; // the instance for the layer's query count
+    try g.run(kernel, fused, &rdnBinds(.{ .buf = hb }, .{ .buf = blocks_b }, nrdBind(nr_b, blocks_b, boundary, K, 0), query, norms, q, .{ .buf = xin_b }), grid, one, true);
 
     var name: [64]u8 = undefined;
     var c: h.Check = .{ .name = std.fmt.bufPrint(&name, "rdn rows {d} Q {d} K {d}{s}{s}", .{ rows, Q, K, if (boundary) " boundary" else "", if (f32input) " f32" else "" }) catch "rdn" };
@@ -112,7 +113,7 @@ fn caseRdn(g: *const h.Gpu, r: std.Random, rows: usize, Q: u32, K: u32, boundary
     for (0..rows) |t| {
         var one_row = fused;
         one_row.rows = 1;
-        try g.run("ik_rdn", one_row, &rdnBinds(.{ .buf = hb, .off = t * H * esz }, .{ .buf = blocks_c, .off = t * H * 4 }, nrdBind(nr_c, blocks_c, boundary, K, t), query, norms, q, .{ .buf = xin_c }), .{ 1, 1, 1 }, one, true);
+        try g.run(kernel, one_row, &rdnBinds(.{ .buf = hb, .off = t * H * esz }, .{ .buf = blocks_c, .off = t * H * 4 }, nrdBind(nr_c, blocks_c, boundary, K, t), query, norms, q, .{ .buf = xin_c }), .{ 1, 1, 1 }, one, true);
         for (0..Q) |j| c.same(row(xin_c.slice(u8, q * H * 2), j, H * 2), row(xb, j * rows + t, H * 2));
     }
     c.same(blocks_c.slice(u8, bbytes), blocks_b.slice(u8, bbytes));
@@ -121,7 +122,7 @@ fn caseRdn(g: *const h.Gpu, r: std.Random, rows: usize, Q: u32, K: u32, boundary
     // A NaN in row 1 stays in row 1.
     if (rows > 1) {
         if (f32input) hb.slice(u32, rows * H)[H] = nan32 else hb.slice(u16, rows * H)[H] = nan16;
-        try g.run("ik_rdn", fused, &rdnBinds(.{ .buf = hb }, .{ .buf = blocks_d }, nrdBind(nr_d, blocks_d, boundary, K, 0), query, norms, q, .{ .buf = xin_d }), grid, one, true);
+        try g.run(kernel, fused, &rdnBinds(.{ .buf = hb }, .{ .buf = blocks_d }, nrdBind(nr_d, blocks_d, boundary, K, 0), query, norms, q, .{ .buf = xin_d }), grid, one, true);
         const nb = nrdBytes(nr_b, blocks_b, boundary, K, rows);
         const nd = nrdBytes(nr_d, blocks_d, boundary, K, rows);
         for (0..rows) |t| if (t != 1) {

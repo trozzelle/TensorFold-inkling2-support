@@ -17,6 +17,8 @@ const usage =
     \\tf-inkling-run <model> taps <index.txt> <out_dir> <steps>   each prompt, then steps greedy tokens: taps, picks, MoE inputs
     \\tf-inkling-run <model> profile <layers> <pos> <rows> <steps> [repeat]   per-class GPU time of decode steps
     \\                                                         (the layers run repeat times a step, default 48/layers)
+    \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat]   decode steps each followed by the greedy draw: median
+    \\                                                         wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw)
     \\
 ;
 
@@ -35,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[2], "exact")) return exactMode(init, args);
     if (std.mem.eql(u8, args[2], "greedy")) return greedyMode(init, args);
     if (std.mem.eql(u8, args[2], "profile")) return profileMode(init, args);
+    if (std.mem.eql(u8, args[2], "wall")) return wallMode(init, args);
     std.debug.print("{s}", .{usage});
     return error.UnknownMode;
 }
@@ -424,4 +427,67 @@ fn profileMode(init: std.process.Init, args: []const [:0]const u8) !void {
     }
     const ms = 1e3 / @as(f64, @floatFromInt(measured));
     std.debug.print("{{\"steps\": {d}, \"rows\": {d}, \"pos\": {d}, \"repeat\": {d}, \"gpu_ms_per_step\": {d:.3}, \"wall_gpu_ms_plain\": {d:.3}, \"class_sum_ms_per_step\": {d:.3}}}\n", .{ measured, rows, pos, repeat, gpu * ms, plain * ms, sum * ms });
+}
+
+fn median(v: []f64) f64 {
+    std.mem.sort(f64, v, {}, std.sort.asc(f64));
+    return v[v.len / 2];
+}
+
+/// Plain decode steps of `rows` rows at `pos` through the first `layers` layers (each step's layers repeated `repeat`
+/// times), the greedy draw after each as the serving path takes it: the median over the steps after the warm-up of a
+/// step's wall time and of its parts, host entry to commit, commit to the GPU's start, the GPU's run, its end to the
+/// host's wake-up, and the rest to the draw's end. A partial model draws from a row of noise.
+fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
+    if (args.len < 7 or args.len > 8) return error.ExpectedLayersPosRowsSteps;
+    const L = try std.fmt.parseInt(u32, args[3], 10);
+    const pos = try std.fmt.parseInt(usize, args[4], 10);
+    const rows = try std.fmt.parseInt(usize, args[5], 10);
+    const steps = try std.fmt.parseInt(usize, args[6], 10);
+    const repeat: u32 = if (args.len > 7) try std.fmt.parseInt(u32, args[7], 10) else @max(1, 48 / L);
+    if (L == 0 or rows == 0 or rows > ik.state.window_rows or repeat == 0) return error.ExpectedPositiveLayersRowsRepeat;
+    if (steps <= profile_warmup) return error.StepsMustExceedWarmup;
+    const m = try ik.Model.load(init.gpa, init.io, args[1], .{ .layers = L });
+    defer m.deinit();
+    const c = &m.config.text;
+    const full = m.layers == c.layers;
+    const capacity = pos + rows * steps + 1;
+    var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers);
+    defer cache.deinit();
+    var s = try ik.state.Scratch.init(m.device, c, capacity);
+    defer s.deinit();
+    const zeros = try init.gpa.alloc(u32, @max(pos, rows));
+    defer init.gpa.free(zeros);
+    @memset(zeros, 0);
+    try feed(m, &s, &cache, zeros[0..pos], null, false);
+    var prng = std.Random.DefaultPrng.init(0x57ee);
+    for (s.logits.slice(u16, c.vocab)) |*w| w.* = prng.random().int(u16);
+    const parts = [_][]const u8{ "wall", "encode", "commit_to_start", "gpu", "end_to_wake", "draw" };
+    var samples: [parts.len][]f64 = undefined;
+    for (&samples) |*v| v.* = try init.gpa.alloc(f64, steps - profile_warmup);
+    defer for (samples) |v| init.gpa.free(v);
+    for (0..steps) |step| {
+        var tm: ik.forward.Timing = .{};
+        const t0 = ik.forward.seconds();
+        try ik.forward.run(m, &s, &cache, zeros[0..rows], .{ .logits = if (full) .last else .none, .timing = &tm, .repeat = repeat });
+        const pick = ik.greedy.argmax(s.logits.slice(u16, c.vocab));
+        const t1 = ik.forward.seconds();
+        std.mem.doNotOptimizeAway(pick);
+        cache.len += rows;
+        if (step < profile_warmup) continue;
+        const k = step - profile_warmup;
+        const at = [_]f64{ t1 - t0, tm.committed - t0, tm.started - tm.committed, tm.ended - tm.started, tm.woke - tm.ended, t1 - tm.woke };
+        for (&samples, at) |v, x| v[k] = x * 1e3;
+    }
+    var med: [parts.len]f64 = undefined;
+    for (&med, samples) |*o, v| o.* = median(v);
+    var mean: f64 = 0;
+    for (samples[0]) |x| mean += x;
+    mean /= @floatFromInt(samples[0].len);
+    std.debug.print("{{\"steps\": {d}, \"rows\": {d}, \"pos\": {d}, \"repeat\": {d}", .{ steps - profile_warmup, rows, pos, repeat });
+    for (parts, med) |p, x| std.debug.print(", \"{s}_ms\": {d:.3}", .{ p, x });
+    const tenth = samples[0].len / 10;
+    // the last step's hidden rows, so two configurations of the same steps can be compared bit for bit
+    const digest = std.hash.Wyhash.hash(0, s.h.slice(u8, rows * c.hidden * 2));
+    std.debug.print(", \"wall_mean_ms\": {d:.3}, \"wall_min_ms\": {d:.3}, \"wall_p10_ms\": {d:.3}, \"gpu_min_ms\": {d:.3}, \"gpu_p10_ms\": {d:.3}, \"tok_s\": {d:.2}, \"h_digest\": \"{x}\"}}\n", .{ mean, samples[0][0], samples[0][tenth], samples[3][0], samples[3][tenth], 1e3 / med[0], digest });
 }

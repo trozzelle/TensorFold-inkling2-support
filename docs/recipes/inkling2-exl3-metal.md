@@ -43,6 +43,19 @@ checks that each row's result is independent of the rows beside it, and that a N
   - At 236 GB, about 27 GiB is left for caches.
 - Caches take 192 KiB a token, because every layer keeps its whole context, plus 33 MiB of convolution rings a
   stream.
+- `INKLING_ROUND_TIMING=1` logs, when each reply ends, what an average round spent: GPU and encode time, the rest of
+  the forward call (commit and wake), the draw, and the time between rounds. Use it to find where a slow reply
+  loses its time; it adds a few clock reads to each round.
+- A decode step's host side has two switches, both on by default and both bit-neutral. `INKLING_WARM_WAIT=0` makes
+  the step wait for its command buffer by blocking, as before: by default it sleeps through all but the last 15 ms of
+  the GPU time that steps of the same row count recently took and spins on the command buffer from there, because a core
+  that blocked for the whole step runs the draw after it several times slower. `INKLING_FIRST_CHUNK=N` sets how many
+  layers the step commits in a command buffer of their own before the rest is encoded (default 4; 0 is one command
+  buffer), so the GPU starts while the host is still encoding.
+- `tf-inkling-run MODEL wall LAYERS POS ROWS STEPS [REPEAT]` runs decode steps each followed by the greedy draw and
+  prints the median wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw), with a digest
+  of the last hidden rows to compare two configurations bit for bit. `tf-inkling-kernels time` times the fused norm
+  kernels at the block and query counts of the real layers.
 
 Measured on an M5 Ultra (256 GB):
 

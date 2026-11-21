@@ -36,7 +36,9 @@ fn t(x: wts.Tensor) B {
 /// `spans` records each stage group's GPU time by class (the `profile` mode); `repeat` runs the loaded layers that many
 /// times in the one command buffer (profile only: the cache's position stays, so the repeats re-read the same rows).
 pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1 };
-pub const Timing = struct { encode: f64 = 0, gpu: f64 = 0 };
+/// `encode` and `gpu` add up over forwards; `committed`, `started`, `ended` and `woke` are the last forward's clocks in
+/// `seconds()`'s timebase: the host's commit, the GPU's start and end, and the host's return from the wait.
+pub const Timing = struct { encode: f64 = 0, gpu: f64 = 0, committed: f64 = 0, started: f64 = 0, ended: f64 = 0, woke: f64 = 0 };
 /// Most spans one layer opens (a global layer with dynamic convolutions is the most), so a recorder's capacity is
 /// `spans_per_layer * layers * repeat` plus the final's.
 pub const spans_per_layer = 32;
@@ -208,7 +210,9 @@ const Enc = struct {
     }
 };
 
-/// `ids` at positions cache.len.. through the loaded layers (cache.len unmoved): one command buffer, waited.
+/// `ids` at positions cache.len.. through the loaded layers (cache.len unmoved): the command buffer waited. A decode step
+/// commits its first `m.first_chunk` layers in a command buffer of their own and encodes the rest meanwhile, so the GPU
+/// starts while the host is still encoding; the queue runs the two in order, the one's results the other's inputs.
 pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, out: Out) !void {
     const c = &m.config.text;
     const n = ids.len;
@@ -223,7 +227,9 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const t0 = if (out.timing != null) seconds() else 0;
-    const cb = m.queue.commandBuffer();
+    var cb = m.queue.commandBuffer();
+    var head: ?mtl.CommandBuffer = null; // the step's first command buffer, when it is committed before the rest is encoded
+    var head_commit: f64 = 0;
     var enc = cb.compute(.serial);
     const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .spans = out.spans };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
@@ -235,7 +241,9 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     const H: usize = c.hidden;
     const nr: u32 = @intCast(n);
     x.glue(.embed, .{ .rows = nr, .width = c.hidden, .eps = c.eps }, &.{ b(s.ids), t(m.weights.embed.t), t(m.weights.embed_norm), b(s.h) }, .{ n, 1, 1 }, .{ 1024, 1, 1 }, true);
-    for (0..@as(usize, m.layers) * out.repeat) |li| {
+    const total = @as(usize, m.layers) * out.repeat;
+    const split: usize = if (decode and out.spans == null and m.first_chunk < total) m.first_chunk else 0;
+    for (0..total) |li| {
         const i = li % m.layers;
         if (out.taps) |tp| for (tap_layers, 0..) |l, k| if (l == i) {
             x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(tp.h, k * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
@@ -249,6 +257,15 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
             };
         }
         if (out.dump) |d| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(d, i * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+        if (li + 1 == split) {
+            enc.end();
+            head_commit = seconds();
+            cb.commit();
+            head = cb;
+            cb = m.queue.commandBuffer();
+            enc = cb.compute(.serial);
+            x.resources();
+        }
     }
     if (out.finals or out.logits != .none) try final(x);
     if (out.logits != .none) {
@@ -262,14 +279,55 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
         try x.end();
     }
     if (out.spans) |sp| try sp.finishEncoding(&enc) else enc.end();
-    if (out.timing) |tm| tm.encode += seconds() - t0;
+    if (out.timing) |tm| {
+        tm.committed = if (head != null) head_commit else seconds();
+        tm.encode += seconds() - t0;
+    }
+    const warm = decode and m.warm_wait and out.spans == null;
+    if (head == null) head_commit = if (warm) seconds() else 0;
     cb.commit();
-    cb.wait();
-    if (cb.failure()) |msg| {
+    // spans are a profile's: its steps are waited for as before
+    if (warm) waitWarm(cb, s.expected[n], head_commit) else cb.wait();
+    if (out.timing) |tm| tm.woke = seconds();
+    for ([_]?mtl.CommandBuffer{ head, cb }) |one| if (one) |f| if (f.failure()) |msg| {
         std.log.err("inkling2 forward: {s}", .{msg});
         return error.GpuFailed;
+    };
+    const began = (head orelse cb).gpuStart();
+    if (out.timing) |tm| {
+        tm.gpu += cb.gpuSeconds() + if (head) |f| f.gpuSeconds() else 0;
+        tm.started = began;
+        tm.ended = cb.gpuEnd();
     }
-    if (out.timing) |tm| tm.gpu += cb.gpuSeconds();
+    if (warm) {
+        // a shorter step is believed at once and a longer one by a quarter: one slow step (another process on the GPU, a
+        // page-in) must not make the next sleep run past the GPU's end, while a lasting slowdown is followed in a few steps
+        const span = cb.gpuEnd() - began;
+        const old = s.expected[n];
+        s.expected[n] = if (old == 0 or span < old) span else old + (span - old) / 4;
+    }
+}
+
+/// A host core that blocked through a whole GPU step runs the work after it (the draw) at a fraction of its speed until it
+/// has been busy for about 15 ms. A decode step therefore sleeps through the start of its GPU time and spins on the
+/// command buffer's status for the last `warm_spin` seconds, with `warm_slack` more for the sleep's wake-up and the step's
+/// own variation. `expected` is the GPU time this row count's recent steps took (0: none yet, so the wait is all spin).
+const warm_spin = 0.015;
+const warm_slack = 0.0015;
+
+fn waitWarm(cb: mtl.CommandBuffer, expected: f64, committed: f64) void {
+    const nap = committed + expected - warm_spin - warm_slack - seconds();
+    if (expected > 0 and nap > 0) {
+        const ts: std.c.timespec = .{ .sec = @intFromFloat(nap), .nsec = @intFromFloat((nap - @floor(nap)) * 1e9) };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    // a step far past its expected time stops burning the core: the blocking wait below takes over
+    const give_up = seconds() + 2 * (warm_spin + warm_slack);
+    while (seconds() < give_up) switch (cb.status()) {
+        .completed, .@"error" => break,
+        else => std.atomic.spinLoopHint(),
+    };
+    cb.wait(); // returns at once after the spin saw the end; it also orders the GPU's writes before the host's reads
 }
 
 fn layer(x: Enc, i: u32) !void {
@@ -304,7 +362,8 @@ fn layer(x: Enc, i: u32) !void {
     if (x.decode) {
         const nm = w.in_norm;
         const norms = [3]B{ t(nm[0].?), t(nm[1] orelse nm[0].?), t(nm[2] orelse nm[0].?) };
-        x.glue(.rdn, .{ .rows = nr, .width = c.hidden, .queries = if (w.attn_query != null) Q else 0, .blocks = K, .stride = stride, .eps = c.eps, .scale = scale_h }, &.{ b(s.h), b(s.blocks), nrd, if (w.attn_query) |q| t(q) else b(s.nr), norms[0], norms[1], norms[2], xq }, .{ n, 1, 1 }, one, true);
+        // the global layers' three queries take the wider instance of the kernel
+        x.glue(if (w.attn_query != null and Q > 1) .rdn3 else .rdn, .{ .rows = nr, .width = c.hidden, .queries = if (w.attn_query != null) Q else 0, .blocks = K, .stride = stride, .eps = c.eps, .scale = scale_h }, &.{ b(s.h), b(s.blocks), nrd, if (w.attn_query) |q| t(q) else b(s.nr), norms[0], norms[1], norms[2], xq }, .{ n, 1, 1 }, one, true);
     } else x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
     if (w.attn_query) |q| {
         if (!x.decode) {
@@ -331,7 +390,8 @@ fn layer(x: Enc, i: u32) !void {
     const values = bo(cache.kv, cache.values(i));
     try x.begin(.attention_prepare);
     x.glue(.prep, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .flags = if (glob) global else 0, .eps = c.eps, .cap = c.qk_clip, .thr = c.rel_clip, .alpha = c.log_alpha, .floor_n = @floatFromInt(c.log_floor) }, &.{ b(s.q), b(s.kc), b(s.vc), b(s.r), t(w.q_scale), t(w.rel_scale), b(s.qn), keys, values, b(s.reln) }, .{ 2 * hd.q + 2 * hd.kv, n, 1 }, .{ 32, 1, 1 }, true);
-    x.glue(.relbias, .{ .rows = nr, .heads = hd.q, .extent = p.extent, .dim = c.d_rel }, &.{ b(s.reln), t(w.rel_proj), b(s.pb) }, .{ p.extent, hd.q, n }, .{ 256, 1, 1 }, false);
+    // the decode path's attention forms the bias itself from reln and the projection
+    if (!x.decode) x.glue(.relbias, .{ .rows = nr, .heads = hd.q, .extent = p.extent, .dim = c.d_rel }, &.{ b(s.reln), t(w.rel_proj), b(s.pb) }, .{ p.extent, hd.q, n }, .{ 256, 1, 1 }, false);
     try x.end();
     try x.begin(.attention);
     const window: u32 = if (glob) 0 else c.window;
@@ -344,7 +404,7 @@ fn layer(x: Enc, i: u32) !void {
         const f0 = first / st.key_block;
         const blocks = (pos + nr - 1) / st.key_block - f0 + 1;
         const a: Args = .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .blocks = blocks, .queries = f0, .scale = scale };
-        x.glue(.attn_part, a, &.{ b(s.qn), keys, values, b(s.pb), b(s.part) }, .{ hd.kv, n, blocks }, part_group, true);
+        x.glue(.attn_part, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, n, blocks }, part_group, true);
         x.glue(.attn_merge, a, &.{ b(s.part), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
     } else {
         x.glue(.attn, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .scale = scale }, &.{ b(s.qn), keys, values, b(s.pb), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
@@ -410,8 +470,9 @@ fn final(x: Enc) !void {
     try x.end();
 }
 
-fn seconds() f64 {
+/// Host seconds on the clock the command buffers' GPU start and end times use (mach absolute time).
+pub fn seconds() f64 {
     var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    _ = std.c.clock_gettime(.UPTIME_RAW, &ts);
     return @as(f64, @floatFromInt(ts.sec)) + @as(f64, @floatFromInt(ts.nsec)) * 1e-9;
 }

@@ -19,7 +19,7 @@ pub const Gpu = struct {
     pub fn init() !Gpu {
         const device = try mtl.Device.init();
         const queue = try device.queue();
-        const lib = try mtl.Library.fromSource(device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
+        const lib = try mtl.Library.fromSource(device, ks.inkling2_glue ++ @embedFile("ref_part.metal"), .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
         return .{ .device = device, .queue = queue, .lib = lib };
     }
 

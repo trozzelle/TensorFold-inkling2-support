@@ -10,8 +10,8 @@ const pack = @import("expert_pack.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 
-pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rrdn", "ik_attn_part", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out" };
-pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rrdn, attn_part, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out };
+pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out" };
+pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out };
 
 comptime {
     // `pipe` indexes the pipelines by the enum's order: each member is its kernel's name without the ik_ prefix
@@ -34,6 +34,11 @@ pub const Model = struct {
     weights: wts.Weights,
     glue: [glue_names.len]mtl.Pipeline,
     exl3: exl3.Pipelines,
+    /// Whether decode steps wait warm (forward.zig's `waitWarm`); INKLING_WARM_WAIT=0 turns it off.
+    warm_wait: bool,
+    /// Layers a decode step commits in a command buffer of their own, before the rest are encoded (0: the step is one
+    /// command buffer); INKLING_FIRST_CHUNK.
+    first_chunk: u32,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Options) !*Model {
         const pool = mtl.objc.Pool.push();
@@ -41,6 +46,8 @@ pub const Model = struct {
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.gpa = gpa;
+        m.warm_wait = if (std.c.getenv("INKLING_WARM_WAIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        m.first_chunk = if (std.c.getenv("INKLING_FIRST_CHUNK")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4 else 4;
         const cpath = try std.fs.path.join(gpa, &.{ dir, "config.json" });
         defer gpa.free(cpath);
         const json = try std.Io.Dir.cwd().readFileAlloc(io, cpath, gpa, .limited(1 << 22));

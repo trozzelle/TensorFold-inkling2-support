@@ -32,20 +32,38 @@ inline float ik_as_scatter(thread float* v, uint lane) {
   return v[0];
 }
 
-// One (kv head, row, block) a threadgroup of 24 simdgroups (768 threads; dispatch (kv heads, rows, a.blocks)
-// threadgroups): simdgroup s takes 32 consecutive keys of the block (s % 8) for two of the kv group's 6 q heads (2 (s / 8)
-// and the next), four dims a lane. a.queries is the first block's index and a.blocks the blocks per row: block
-// a.queries + tg.z covers keys [256 b, 256 b + 256) clipped to the row's visible range [lo, p]. A simdgroup scores its
-// keys one lane a key by a transposed sum over the dims, the threadgroup takes the block's maximum, each lane weights
-// its key by exp(score - maximum), and the weighted values and weight sums of the 8 key groups fold in group order into
-// the partial (m, l, acc). An empty block writes m = -inf, l = 0.
-[[kernel, max_total_threads_per_threadgroup(768)]] void ik_attn_part(constant ik_args& a [[buffer(0)]],
-    const device bfloat* qn [[buffer(1)]], const device bfloat* keys [[buffer(2)]], const device bfloat* values [[buffer(3)]],
-    const device bfloat* pb [[buffer(4)]], device float* part [[buffer(5)]], uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float tmax[8][6], tsum[8][6];
-  threadgroup float4 tacc[8][6][32]; // [key group][head][lane]: the lane's four dims
+// A simdgroup's relative biases, from the row's relative state and the projection: for each of its two q heads, the bias at
+// the distance of a lane's key behind the row, bf16(rel . proj) summed over the 16 dims in index order, the value
+// ik_relbias writes. `two` fills out[0], out[1] for heads `head` and `head + 1` of row t at `dist` < extent.
+struct IkRelFold {
+  const device bfloat* reln; // [rows][heads][16]
+  const device bfloat* proj; // [16][extent]
+  inline void two(uint t, uint heads, uint head, uint extent, uint dist, thread float* out) const {
+    float pv[IK_DREL];
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < IK_DREL; ++i) pv[i] = float(proj[ulong(i) * extent + dist]);
+    _Pragma("clang loop unroll(full)")
+    for (uint j = 0; j < 2; ++j) {
+      const device bfloat4* r = (const device bfloat4*)(reln + (ulong(t) * heads + head + j) * IK_DREL);
+      float s = 0.0f;
+      _Pragma("clang loop unroll(full)")
+      for (uint c = 0; c < IK_DREL / 4; ++c) {
+        const float4 v = float4(r[c]);
+        s += v.x * pv[4 * c];
+        s += v.y * pv[4 * c + 1];
+        s += v.z * pv[4 * c + 2];
+        s += v.w * pv[4 * c + 3];
+      }
+      out[j] = float(bfloat(s));
+    }
+  }
+};
+
+// The partial kernel's body, for any source of the relative bias (`Bias::two`): the threadgroup's three arrays come from the kernel.
+template <typename Bias>
+inline void ik_attn_part_run(constant ik_args& a, const device bfloat* qn, const device bfloat* keys, const device bfloat* values,
+    Bias bias, device float* part, threadgroup float (&tmax)[8][6], threadgroup float (&tsum)[8][6],
+    threadgroup float4 (&tacc)[8][6][32], uint3 tg, uint tid, uint sg, uint lane) {
   const uint D = a.dim, g = tg.x, t = tg.y, p = a.pos + t;
   const uint lo = (a.window > 0 && p + 1 > a.window) ? p + 1 - a.window : 0;
   const uint base = (a.queries + tg.z) * IK_AS_KEYS;
@@ -59,16 +77,18 @@ inline float ik_as_scatter(thread float* v, uint lane) {
   }
   const uint kg = sg & 7, h0 = 2 * (sg >> 3);
   const uint k0 = base + 32 * kg, key = k0 + lane;
+  const bool reads_bias = key >= from && key < to && p - key < a.extent;
   float4 q[2];
   for (uint j = 0; j < 2; ++j)
     q[j] = float4(*(const device bfloat4*)(qn + (ulong(t) * a.heads + g * 6 + h0 + j) * D + 4 * lane));
-  float s[2];
+  float s[2], bz[2] = {0.0f, 0.0f};
   {
     // the group's 32 key rows, clamped into the visible range (a clamped row is read and given weight zero)
     bfloat4 kr[32];
     _Pragma("clang loop unroll(full)")
     for (uint i = 0; i < 32; ++i)
       kr[i] = *(const device bfloat4*)(keys + (ulong(min(max(k0 + i, from), to - 1)) * a.kv + g) * D + 4 * lane);
+    if (reads_bias) bias.two(t, a.heads, g * 6 + h0, a.extent, p - key, bz);
     _Pragma("clang loop unroll(full)")
     for (uint j = 0; j < 2; ++j) {
       float pd[32];
@@ -83,8 +103,7 @@ inline float ik_as_scatter(thread float* v, uint lane) {
       float x = ik_as_scatter(pd, lane);
       if (key >= from && key < to) {
         x = x * a.scale;
-        const uint dist = p - key;
-        if (dist < a.extent) x += float(pb[(ulong(t) * a.heads + g * 6 + h0 + j) * a.extent + dist]);
+        if (p - key < a.extent) x += bz[j];
       } else {
         x = -INFINITY;
       }
@@ -135,6 +154,24 @@ inline float ik_as_scatter(thread float* v, uint lane) {
     slots[tid * head_step] = m;
     slots[tid * head_step + 1] = l;
   }
+}
+
+// One (kv head, row, block) a threadgroup of 24 simdgroups (768 threads; dispatch (kv heads, rows, a.blocks)
+// threadgroups): simdgroup s takes 32 consecutive keys of the block (s % 8) for two of the kv group's 6 q heads (2 (s / 8)
+// and the next), four dims a lane. a.queries is the first block's index and a.blocks the blocks per row: block
+// a.queries + tg.z covers keys [256 b, 256 b + 256) clipped to the row's visible range [lo, p]. A simdgroup scores its
+// keys one lane a key by a transposed sum over the dims, plus the relative bias at the key's distance when that is below
+// a.extent (formed here from reln and proj, as ik_relbias does for the prompt path), the threadgroup takes the block's
+// maximum, each lane weights its key by exp(score - maximum), and the weighted values and weight sums of the 8 key
+// groups fold in group order into the partial (m, l, acc). An empty block writes m = -inf, l = 0.
+[[kernel, max_total_threads_per_threadgroup(768)]] void ik_attn_part(constant ik_args& a [[buffer(0)]],
+    const device bfloat* qn [[buffer(1)]], const device bfloat* keys [[buffer(2)]], const device bfloat* values [[buffer(3)]],
+    const device bfloat* reln [[buffer(4)]], const device bfloat* proj [[buffer(5)]], device float* part [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float tmax[8][6], tsum[8][6];
+  threadgroup float4 tacc[8][6][32]; // [key group][head][lane]: the lane's four dims
+  ik_attn_part_run(a, qn, keys, values, IkRelFold{reln, proj}, part, tmax, tsum, tacc, tg, tid, sg, lane);
 }
 
 // One (head, row) a simdgroup (dispatch (heads, rows) threadgroups of 32 threads), four dims a lane. Starts from the sink
