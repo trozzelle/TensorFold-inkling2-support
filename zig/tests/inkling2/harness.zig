@@ -48,11 +48,22 @@ pub const Gpu = struct {
         }
     }
 
+    /// A second library from `source`, compiled as the first is (MLX's language version, precise math functions): the
+    /// drafter's kernels are their own library.
+    pub fn library(g: *const Gpu, source: []const u8) !mtl.Library {
+        return mtl.Library.fromSource(g.device, source, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
+    }
+
     /// One kernel with its own buffer layout: `slots` bind from buffer 0 in order (a `.bytes` slot is a small constant
     /// copied into the command). `uses` are declared on the encoder (useResource) for buffers the kernel reaches only
     /// through GPU addresses. Dispatches `groups` threadgroups of `threads`.
     pub fn dispatch(g: *const Gpu, name: [:0]const u8, slots: []const Slot, uses: []const Use, groups: [3]usize, threads: [3]usize) !void {
-        const p = try mtl.Pipeline.init(g.device, g.lib, name, false);
+        return g.dispatchIn(g.lib, name, slots, uses, groups, threads);
+    }
+
+    /// `dispatch` for a kernel of library `lib`.
+    pub fn dispatchIn(g: *const Gpu, lib: mtl.Library, name: [:0]const u8, slots: []const Slot, uses: []const Use, groups: [3]usize, threads: [3]usize) !void {
+        const p = try mtl.Pipeline.init(g.device, lib, name, false);
         defer p.deinit();
         const cb = g.queue.commandBuffer();
         const e = cb.compute(.serial);
