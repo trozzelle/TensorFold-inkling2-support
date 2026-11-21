@@ -27,16 +27,39 @@ pub fn caches(ram: u64, working_set: u64, limit_gb: ?f64, resident: u64) error{B
     return if (limit > resident + margin) limit - resident - margin else 0;
 }
 
-/// The longest context one stream's caches fit in `bytes`, at most `most`.
+/// Bytes a context of `capacity` positions takes besides the weights: a stream's caches, and the scratch that grows with
+/// it (the split attention's partials, sized for a cache a position past the window).
+fn contextBytes(c: *const cfg.Text, layers: usize, capacity: usize) u64 {
+    return st.cacheBytes(c, capacity, layers) + st.partBytes(c, capacity + 1);
+}
+
+/// The longest context one stream's caches and the scratch that grows with it fit in `bytes`, at most `most`.
 pub fn longest(c: *const cfg.Text, layers: usize, bytes: u64, most: usize) usize {
-    if (st.cacheBytes(c, 1, layers) > bytes) return 0;
+    if (contextBytes(c, layers, 1) > bytes) return 0;
     var lo: usize = 1;
     var hi: usize = most;
     while (lo < hi) {
         const mid = lo + (hi - lo + 1) / 2;
-        if (st.cacheBytes(c, mid, layers) <= bytes) lo = mid else hi = mid - 1;
+        if (contextBytes(c, layers, mid) <= bytes) lo = mid else hi = mid - 1;
     }
     return lo;
+}
+
+test "inkling2 budget: the longest context counts the partials that grow with it" {
+    var c = std.mem.zeroes(cfg.Text);
+    c.hidden = 4608;
+    c.vocab = 201024;
+    c.local = .{ .q = 48, .kv = 8, .dim = 128 };
+    const layers = 48;
+    const room: u64 = 40 << 30;
+    const n = longest(&c, layers, room, 1 << 20);
+    // it fits with its partials and one position more does not; the caches alone would have fit more
+    try std.testing.expect(contextBytes(&c, layers, n) <= room);
+    try std.testing.expect(contextBytes(&c, layers, n + 1) > room);
+    const caches_only = (room - layers * st.convBytes(&c) - @as(u64, c.vocab) * 2) / (layers * st.kvBytes(&c));
+    try std.testing.expect(n < caches_only);
+    try std.testing.expectEqual(@as(usize, 0), longest(&c, layers, 0, 1000));
+    try std.testing.expectEqual(@as(usize, 1000), longest(&c, layers, 1 << 40, 1000));
 }
 
 test "inkling2 budget: a share of RAM less the weights, a set limit capped at the working set, bad limits refused" {

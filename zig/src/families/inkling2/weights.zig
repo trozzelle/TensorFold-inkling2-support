@@ -39,6 +39,9 @@ pub const Layer = struct {
     bias: Tensor,
     w13: exl3.Experts,
     w2: exl3.Experts,
+    /// Whether every expert of w13 and w2 can take the decode chain (`xdOk`); otherwise the decode path keeps
+    /// `exl3.encodeIndexed` for the experts.
+    xd_ok: bool,
 };
 
 pub const Weights = struct {
@@ -125,6 +128,23 @@ pub fn expertTable(gpa: std.mem.Allocator, device: mtl.Device, c: *ck.Checkpoint
     return table;
 }
 
+/// Whether a layer's descriptor table (`count` w13 descriptors, then `count` w2 ones) can take the decode chain
+/// (`ik_xd_*` in kernels/metal/inkling2/xd.metal, written for a hidden width of 4608 and an expert width of 2304): every
+/// expert at 2 or 3 bits, the mul1 codebook, f16 scales, no bias, and tiles stored back to back at 4-byte alignment,
+/// which is how the chain's kernels address them.
+pub fn xdOk(table: []const exl3.ExpertDescriptor, count: usize, hidden: usize, inner: usize) bool {
+    if (hidden != 4608 or inner != 2304 or table.len != 2 * count) return false;
+    for (table, 0..) |d, i| {
+        const n: u64 = if (i < count) 2 * inner else hidden;
+        const tile: u64 = 16 * @as(u64, d.halves); // bytes: 8 * halves int16 words
+        if (d.halves != 4 and d.halves != 6) return false;
+        if (d.codebook != @backingInt(exl3.format.Codebook.mul1)) return false;
+        if (d.suh_signs != 0 or d.svh_signs != 0 or d.has_bias != 0) return false;
+        if (d.tile_n_stride != tile or d.tile_k_stride != n / 16 * tile or d.trellis % 4 != 0) return false;
+    }
+    return true;
+}
+
 /// The dense file and the first `layers` layers' expert files into `c`, then every view the forward reads.
 pub fn load(gpa: std.mem.Allocator, device: mtl.Device, c: *ck.Checkpoint, t: *const config.Text, p: *const plan.Plan, ex: *const pack.Pack, dir: []const u8, layers: u32) !Weights {
     const path = try std.fs.path.joinZ(gpa, &.{ dir, "model-dense.safetensors" });
@@ -198,6 +218,7 @@ pub fn load(gpa: std.mem.Allocator, device: mtl.Device, c: *ck.Checkpoint, t: *c
         tables_made += 1;
         l.w13 = .{ .descriptors = .{ .buffer = table }, .count = E, .k = H, .n = 2 * I };
         l.w2 = .{ .descriptors = .{ .buffer = table, .offset = E * @sizeOf(exl3.ExpertDescriptor) }, .count = E, .k = I, .n = H };
+        l.xd_ok = xdOk(table.slice(exl3.ExpertDescriptor, 2 * E), E, H, I);
     }
     const bufs = try gpa.alloc(mtl.Buffer, c.shards.items.len - first);
     for (c.shards.items[first..], bufs) |sh, *dst| dst.* = sh.buffer;

@@ -65,19 +65,22 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     };
     const c = &model.config.text;
     const weights: u64 = model.checkpoint.residentBytes();
-    const scratch: u64 = try fl.state.scratchBytes(c);
-    const budget = fl.budget.caches(ram, model.device.maxWorkingSet(), limit_gb, weights + scratch) catch {
+    // the scratch but for the partials that grow with the context, which `longest` counts beside the caches
+    const scratch: u64 = try fl.state.scratchBytes(c, 0);
+    const room = fl.budget.caches(ram, model.device.maxWorkingSet(), limit_gb, weights + scratch) catch {
         model.deinit();
         problem.* = "--load-limit-gb is not a load limit: give a number of GB above 0, or leave it out for 75% of RAM";
         return null;
     };
-    const fits = fl.budget.longest(c, c.layers, budget, c.max_context);
+    const fits = fl.budget.longest(c, c.layers, room, c.max_context);
     const window: i64 = o.context orelse @intCast(fits);
     if (window < 1 or window > fits) {
         problem.* = try std.fmt.allocPrint(a, "--context {d}: this Mac's Inkling 2 caches fit {d} tokens under its load limit (75% of RAM, or --load-limit-gb, or INKLING_LOAD_LIMIT_GB)", .{ window, fits });
         model.deinit(); // after the message, so a failed allocation leaves the model to the errdefer
         return null;
     }
+    // the partials of this window come off what the caches may hold
+    const budget = room - fl.state.partBytes(c, @as(usize, @intCast(window)) + 1);
     std.log.info("inkling2: {d:.1} GiB of weights, {d:.1} GiB for caches, context up to {d} tokens", .{ @as(f64, @floatFromInt(weights)) / (1 << 30), @as(f64, @floatFromInt(budget)) / (1 << 30), window });
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
@@ -96,7 +99,9 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = 1, .context_window = @intCast(window), .prefill_step = fl.state.prompt_rows, .structures = true, .logprobs = true });
     try fl.residency.hold(h);
     errdefer fl.residency.drop(h);
-    h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
+    // Where the weights exceed the residency set's cap they stay outside it; the busy probe then keeps only the scratch
+    // and the tables in use while a request runs, and does nothing for the weights.
+    h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick, .probe = mtl.keepalive.Target.busy };
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

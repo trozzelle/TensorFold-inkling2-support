@@ -12,6 +12,11 @@ pub const prompt_rows = 512;
 /// Positions each convolution's input ring holds: three taps back plus a window's rows, so a rejected window rolls
 /// back by moving the cache length alone.
 pub const ring = 32;
+/// Keys in one block of the decode path's split attention; blocks are anchored at absolute positions.
+pub const key_block = 256;
+/// Floats one (row, q head, block) partial of the split attention holds: the block's maximum and weight sum, then its
+/// 128 values.
+pub const part_slot = 130;
 
 /// Rows of the grouped expert tiles for `slots` picks: each expert's picks padded to whole 8-row tiles.
 pub fn tileRows(slots: usize, experts: usize) usize {
@@ -100,10 +105,20 @@ pub const Cache = struct {
     }
 };
 
-pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits" };
+/// Bytes of the split attention's partials for a decode window over caches of up to `capacity` positions: one slot a
+/// row, q head and 256-key block.
+pub fn partBytes(c: *const cfg.Text, capacity: usize) usize {
+    return window_rows * @as(usize, c.local.q) * ((capacity + key_block - 1) / key_block) * part_slot * 4;
+}
 
-/// Bytes of each Scratch buffer, in `fields` order, for prompt_rows rows.
-fn sizes(c: *const cfg.Text) ![fields.len]usize {
+pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums" };
+
+/// The segment tables of the stacked attention-input matvecs: one `seg_slot` bytes of up to `max_segs` entries a layer.
+pub const max_segs = 6;
+pub const seg_slot = 256;
+
+/// Bytes of each Scratch buffer, in `fields` order, for prompt_rows rows and caches of up to `capacity` positions.
+fn sizes(c: *const cfg.Text, capacity: usize) ![fields.len]usize {
     const R: usize = prompt_rows;
     const H: usize = c.hidden;
     const qh: usize = c.local.q;
@@ -120,13 +135,18 @@ fn sizes(c: *const cfg.Text) ![fields.len]usize {
         R * qh * c.d_rel * 2, R * qh * c.window * 2,     R * qw * 2,             R * H * 2,                R * H * 2,            R * H * 4,
         R * H * 4,            R * H * 4,                 R * H * 2,              R * c.experts * 4,        S * 4,                S * 4,
         T * 4,                T * 4,                     T * 4,                  S * 2 * I * 2,            S * I * 2,            S * H * 2,
-        R * H * 2,            R * H * 2,                 ex,                     R * H * 4,                R * H * 2,            window_rows * @as(usize, c.vocab) * 2,
+        R * H * 2,            R * H * 2,                 ex,                     R * H * 4,                (R + 7) * H * 2,      window_rows * @as(usize, c.vocab) * 2,
+        @as(usize, c.layers) * seg_slot,
+        partBytes(c, capacity),
+        window_rows * c.topk * 2 * H * 4, // planes: the decode chain's w13 output per slot as two f32 K halves
+        window_rows * c.topk * H * 4, // sums: its w2 output per slot before the output rotation, f32
     };
 }
 
-pub fn scratchBytes(c: *const cfg.Text) !usize {
+/// Bytes of a Scratch for caches of up to `capacity` positions; capacity 0 counts what does not grow with the context.
+pub fn scratchBytes(c: *const cfg.Text, capacity: usize) !usize {
     var total: usize = 0;
-    for (try sizes(c)) |n| total += n;
+    for (try sizes(c, capacity)) |n| total += n;
     return total;
 }
 
@@ -173,11 +193,18 @@ pub const Scratch = struct {
     fin: mtl.Buffer,
     finals: mtl.Buffer,
     logits: mtl.Buffer,
+    segs: mtl.Buffer,
+    part: mtl.Buffer,
+    planes: mtl.Buffer,
+    sums: mtl.Buffer,
+    /// Positions of the longest cache this scratch serves: the split attention's partials hold that many keys' blocks.
+    capacity: usize,
 
-    pub fn init(device: mtl.Device, c: *const cfg.Text) !Scratch {
+    pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize) !Scratch {
         @setEvalBranchQuota(10000);
-        const sz = try sizes(c);
+        const sz = try sizes(c, capacity);
         var s: Scratch = undefined;
+        s.capacity = capacity;
         var made: [fields.len]bool = @splat(false);
         errdefer inline for (fields, 0..) |f, i| if (made[i]) @field(s, f).deinit();
         inline for (fields, 0..) |f, i| {
@@ -192,10 +219,15 @@ pub const Scratch = struct {
     }
 };
 
-test "inkling2 state: tiles pad each expert to 8 rows; a cache's bytes" {
+test "inkling2 state: tiles pad each expert to 8 rows; a cache's bytes; the split attention's partials" {
     try std.testing.expectEqual(@as(usize, 64), tileRows(8, 384));
     try std.testing.expectEqual(@as(usize, 4096 + 7 * 384), tileRows(4096, 384));
     const c = cfg.Text{ .hidden = 4608, .layers = 48, .vocab = 201024, .unpadded_vocab = 200058, .local = .{ .q = 48, .kv = 8, .dim = 128 }, .global = .{ .q = 48, .kv = 8, .dim = 128 }, .window = 1024, .d_rel = 16, .rel_extent = 1024, .log_floor = 8192, .log_alpha = 0.1, .eps = 1e-6, .qk_clip = 22.627, .rel_clip = 8, .block = 6, .experts = 384, .topk = 8, .expert_inter = 2304, .route_scale = 8, .gate_cap = 4, .up_cap = 25, .logit_cap = 30, .max_context = 1048576 };
     try std.testing.expectEqual(@as(usize, 8), maxBlocks(&c));
     try std.testing.expectEqual(@as(usize, 48 * (100 * 4096 + 32 * 11264 * 2) + 201024 * 2), cacheBytes(&c, 100, 48));
+    // 16 rows x 48 heads x one slot a 256-key block: 32k positions are 128 blocks, 51 MB
+    try std.testing.expectEqual(@as(usize, 51_118_080), partBytes(&c, 32768));
+    try std.testing.expectEqual(partBytes(&c, 256), partBytes(&c, 1));
+    try std.testing.expectEqual(2 * partBytes(&c, 256), partBytes(&c, 257));
+    try std.testing.expectEqual(@as(usize, 0), partBytes(&c, 0));
 }

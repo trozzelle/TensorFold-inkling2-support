@@ -10,8 +10,15 @@ const pack = @import("expert_pack.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 
-pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32" };
-pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32 };
+pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rrdn", "ik_attn_part", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish" };
+pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rrdn, attn_part, attn_merge, xd_pair, xd_mid, xd_down, xd_finish };
+
+comptime {
+    // `pipe` indexes the pipelines by the enum's order: each member is its kernel's name without the ik_ prefix
+    const members = @typeInfo(Glue).@"enum".field_names;
+    std.debug.assert(members.len == glue_names.len);
+    for (members, glue_names) |member, name| std.debug.assert(std.mem.eql(u8, "ik_" ++ member, name));
+}
 
 /// `layers`: load only the first layers (the per-layer checks on a Mac that cannot hold the model).
 pub const Options = struct { layers: ?u32 = null };
@@ -90,11 +97,11 @@ pub const Model = struct {
     }
 };
 
-/// The shapes the kernels are written for: both layer kinds 48 x 128 queries over 8 x 128 keys, d_rel 16, top-8,
-/// one relative extent for both kinds.
+/// The shapes the kernels are written for: both layer kinds 48 x 128 queries over 8 x 128 keys (six query heads to a key
+/// head), d_rel 16, top-8, one relative extent for both kinds.
 fn geometry(t: *const cfg.Text) !void {
-    const ok = t.local.q == t.global.q and t.local.kv == t.global.kv and t.local.dim == 128 and t.global.dim == 128 and
-        t.d_rel == 16 and t.topk == 8 and t.experts <= 384 and t.window == t.rel_extent and t.hidden % 128 == 0 and
-        t.expert_inter % 128 == 0 and st.maxBlocks(t) <= 9;
+    const ok = t.local.q == t.global.q and t.local.kv == t.global.kv and t.local.q == 6 * t.local.kv and
+        t.local.dim == 128 and t.global.dim == 128 and t.d_rel == 16 and t.topk == 8 and t.experts <= 384 and
+        t.window == t.rel_extent and t.hidden % 128 == 0 and t.expert_inter % 128 == 0 and st.maxBlocks(t) <= 9;
     if (!ok) return error.UnsupportedInkling2Geometry;
 }

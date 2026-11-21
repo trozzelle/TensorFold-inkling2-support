@@ -6,13 +6,17 @@ const ik = tf.inkling2;
 
 const usage =
     \\tf-inkling-run <model> check [layers]                    load the model (or its first layers) and report it
-    \\tf-inkling-run <model> layers <ids.json> <out.bin> <L>   the first L layers on ids (at most 512): bf16 [L, T, H]
-    \\tf-inkling-run <model> finals <index.txt> <out_dir>      each listed ids file in 512-row chunks: seq-NNNNN.bin
+    \\tf-inkling-run <model> layers <ids.json> <out.bin> <L> [--window]   the first L layers on ids (at most 512): bf16 [L, T, H]
+    \\tf-inkling-run <model> finals <index.txt> <out_dir> [--window]   each listed ids file in 512-row chunks: seq-NNNNN.bin
     \\                                                         with bf16 finals [T, H] (out_dir must exist)
-    \\tf-inkling-run <model> exact <ids.json> <at> [layers]    ids[at..] (ids at most 512) as one-row steps, 16-row
-    \\                                                         windows and inside one chunk: outputs bit for bit
+    \\                                                         --window: the first 16 rows as a prompt chunk, the rest in
+    \\                                                         16-row windows through the decode path
+    \\tf-inkling-run <model> exact <ids.json> <at> [layers]    ids[at..] (ids at most 512) after ids[..at]: one-row steps
+    \\                                                         against 16-row windows, bit for bit
     \\tf-inkling-run <model> greedy <ids.json> <n>             the prompt, then n one-row greedy steps; tokens, tok/s
     \\tf-inkling-run <model> taps <index.txt> <out_dir> <steps>   each prompt, then steps greedy tokens: taps, picks, MoE inputs
+    \\tf-inkling-run <model> profile <layers> <pos> <rows> <steps> [repeat]   per-class GPU time of decode steps
+    \\                                                         (the layers run repeat times a step, default 48/layers)
     \\
 ;
 
@@ -30,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[2], "finals")) return finalsMode(init, args);
     if (std.mem.eql(u8, args[2], "exact")) return exactMode(init, args);
     if (std.mem.eql(u8, args[2], "greedy")) return greedyMode(init, args);
+    if (std.mem.eql(u8, args[2], "profile")) return profileMode(init, args);
     std.debug.print("{s}", .{usage});
     return error.UnknownMode;
 }
@@ -58,15 +63,39 @@ fn feed(m: *const ik.Model, s: *ik.state.Scratch, cache: *ik.state.Cache, ids: [
     while (at < ids.len) {
         const n = @min(ids.len - at, ik.state.prompt_rows);
         const last = at + n == ids.len;
-        try ik.forward.run(m, s, cache, ids[at..][0..n], .{ .finals = finals != null, .logits = if (logits and last) .last else .none });
+        try ik.forward.run(m, s, cache, ids[at..][0..n], .{ .finals = finals != null, .logits = if (logits and last) .last else .none, .prompt = true });
         if (finals) |f| @memcpy(f[at * H ..][0 .. n * H], s.finals.slice(u16, n * H));
         cache.len += n;
         at += n;
     }
 }
 
+/// Where a window-mode run keeps what it records: finals rows into `finals` (T rows), and each loaded layer's output
+/// rows into `layers` ([L][T][H]), the latter through `scratch`, a dump buffer of one window.
+const Record = struct { finals: ?[]u16 = null, layers: ?[]u16 = null, scratch: ?mtl.Buffer = null };
+
+/// ids at the cache's end the way a decode-time client sends them: the first window_rows rows as a prompt chunk, every
+/// later row in windows of window_rows through the decode path (the last one possibly shorter).
+fn feedWindows(m: *const ik.Model, s: *ik.state.Scratch, cache: *ik.state.Cache, ids: []const u32, rec: Record) !void {
+    const H: usize = m.config.text.hidden;
+    const T = ids.len;
+    var at: usize = 0;
+    while (at < T) {
+        const n = @min(T - at, ik.state.window_rows);
+        try ik.forward.run(m, s, cache, ids[at..][0..n], .{ .finals = rec.finals != null, .logits = .none, .dump = rec.scratch, .prompt = at == 0 });
+        if (rec.finals) |f| @memcpy(f[at * H ..][0 .. n * H], s.finals.slice(u16, n * H));
+        if (rec.layers) |d| {
+            const w = rec.scratch.?.slice(u16, m.layers * n * H);
+            for (0..m.layers) |l| @memcpy(d[(l * T + at) * H ..][0 .. n * H], w[l * n * H ..][0 .. n * H]);
+        }
+        cache.len += n;
+        at += n;
+    }
+}
+
 fn layersMode(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (args.len != 6) return error.ExpectedIdsOutLayers;
+    if (args.len != 6 and !(args.len == 7 and std.mem.eql(u8, args[6], "--window"))) return error.ExpectedIdsOutLayers;
+    const window = args.len == 7;
     const L = try std.fmt.parseInt(u32, args[5], 10);
     const ids = try readIds(init, args[3]);
     defer ids.deinit();
@@ -74,21 +103,34 @@ fn layersMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const m = try ik.Model.load(init.gpa, init.io, args[1], .{ .layers = L });
     defer m.deinit();
     const c = &m.config.text;
-    var cache = try ik.state.Cache.init(m.device, c, ids.value.len + 1, L);
+    const capacity = ids.value.len + 1;
+    var cache = try ik.state.Cache.init(m.device, c, capacity, L);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c);
+    var s = try ik.state.Scratch.init(m.device, c, capacity);
     defer s.deinit();
     const n = ids.value.len;
+    if (window) {
+        const out = try init.gpa.alloc(u16, @as(usize, L) * n * c.hidden);
+        defer init.gpa.free(out);
+        const scratch = try m.device.buffer(@as(usize, L) * ik.state.window_rows * c.hidden * 2, mtl.ResourceOptions.shared);
+        defer scratch.deinit();
+        const t0 = now();
+        try feedWindows(m, &s, &cache, ids.value, .{ .layers = out, .scratch = scratch });
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[4], .data = std.mem.sliceAsBytes(out) });
+        std.debug.print("{{\"layers\": {d}, \"tokens\": {d}, \"seconds\": {d:.2}, \"window\": true}}\n", .{ L, n, @as(f64, @floatFromInt(now() - t0)) / 1e9 });
+        return;
+    }
     const dump = try m.device.buffer(@as(usize, L) * n * c.hidden * 2, mtl.ResourceOptions.shared);
     defer dump.deinit();
     const t0 = now();
-    try ik.forward.run(m, &s, &cache, ids.value, .{ .logits = .none, .dump = dump });
+    try ik.forward.run(m, &s, &cache, ids.value, .{ .logits = .none, .dump = dump, .prompt = true });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[4], .data = dump.slice(u8, @as(usize, L) * n * c.hidden * 2) });
     std.debug.print("{{\"layers\": {d}, \"tokens\": {d}, \"seconds\": {d:.2}}}\n", .{ L, n, @as(f64, @floatFromInt(now() - t0)) / 1e9 });
 }
 
 fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (args.len != 5) return error.ExpectedIndexOutDir;
+    if (args.len != 5 and !(args.len == 6 and std.mem.eql(u8, args[5], "--window"))) return error.ExpectedIndexOutDir;
+    const window = args.len == 6;
     const index = try std.Io.Dir.cwd().readFileAlloc(init.io, args[3], init.gpa, .limited(1 << 20));
     defer init.gpa.free(index);
     var paths: std.ArrayList([]const u8) = .empty;
@@ -104,9 +146,10 @@ fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const m = try ik.Model.load(init.gpa, init.io, args[1], .{});
     defer m.deinit();
     const c = &m.config.text;
-    var cache = try ik.state.Cache.init(m.device, c, longest + 1, c.layers);
+    const capacity = longest + 1;
+    var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c);
+    var s = try ik.state.Scratch.init(m.device, c, capacity);
     defer s.deinit();
     const finals = try init.gpa.alloc(u16, longest * c.hidden);
     defer init.gpa.free(finals);
@@ -115,7 +158,7 @@ fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
         defer ids.deinit();
         const t0 = now();
         cache.len = 0;
-        try feed(m, &s, &cache, ids.value, finals, false);
+        if (window) try feedWindows(m, &s, &cache, ids.value, .{ .finals = finals }) else try feed(m, &s, &cache, ids.value, finals, false);
         const out = try std.fmt.allocPrint(init.gpa, "{s}/seq-{d:0>5}.bin", .{ args[4], i });
         defer init.gpa.free(out);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out, .data = std.mem.sliceAsBytes(finals[0 .. ids.value.len * c.hidden]) });
@@ -123,8 +166,8 @@ fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     }
 }
 
-/// ids[at..] three ways after ids[..at]: one-row steps, 16-row windows, and inside one chunk with the prompt. The last
-/// loaded layer's output rows (and the finals, on the whole model) must agree bit for bit.
+/// ids[at..] two ways after the prompt ids[..at]: one-row steps and 16-row windows. The last loaded layer's output rows
+/// (and the finals, on the whole model) must agree bit for bit.
 fn exactMode(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len < 5) return error.ExpectedIdsAt;
     const at = try std.fmt.parseInt(usize, args[4], 10);
@@ -139,47 +182,42 @@ fn exactMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const H: usize = c.hidden;
     const full = m.layers == c.layers;
     const cont = all.len - at;
-    var s = try ik.state.Scratch.init(m.device, c);
+    const capacity = all.len + 1;
+    var s = try ik.state.Scratch.init(m.device, c, capacity);
     defer s.deinit();
-    var outs: [3][]u16 = undefined;
+    var outs: [2][]u16 = undefined;
     for (&outs) |*o| o.* = try init.gpa.alloc(u16, cont * H * 2);
     defer for (outs) |o| init.gpa.free(o);
-    for (0..3) |way| {
-        var cache = try ik.state.Cache.init(m.device, c, all.len + 1, m.layers);
+    for (0..2) |way| {
+        var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers);
         defer cache.deinit();
-        const rows: usize = switch (way) {
-            0 => 1,
-            1 => ik.state.window_rows,
-            else => all.len,
-        };
-        if (way < 2) {
-            try ik.forward.run(m, &s, &cache, all[0..at], .{ .finals = full, .logits = .none });
-            cache.len = at;
-        }
-        var i: usize = if (way < 2) at else 0;
+        const rows: usize = if (way == 0) 1 else ik.state.window_rows;
+        try ik.forward.run(m, &s, &cache, all[0..at], .{ .finals = full, .logits = .none, .prompt = true });
+        cache.len = at;
+        var i: usize = at;
         while (i < all.len) {
             const n = @min(all.len - i, rows);
             try ik.forward.run(m, &s, &cache, all[i..][0..n], .{ .finals = full, .logits = .none });
-            for (0..n) |r| if (i + r >= at) {
+            for (0..n) |r| {
                 const k = i + r - at;
                 @memcpy(outs[way][k * H ..][0..H], s.h.slice(u16, n * H)[r * H ..][0..H]);
                 if (full) @memcpy(outs[way][(cont + k) * H ..][0..H], s.finals.slice(u16, n * H)[r * H ..][0..H]);
-            };
+            }
             cache.len += n;
             i += n;
         }
     }
     var differ: usize = 0;
-    for (0..cont) |k| for (1..3) |way| {
+    for (0..cont) |k| {
         const span: usize = if (full) 2 else 1;
         for (0..span) |part| {
             const off = (part * cont + k) * H;
-            if (!std.mem.eql(u16, outs[0][off..][0..H], outs[way][off..][0..H])) {
+            if (!std.mem.eql(u16, outs[0][off..][0..H], outs[1][off..][0..H])) {
                 differ += 1;
-                if (differ <= 4) std.debug.print("row {d} ({s}) differs between steps and {s}\n", .{ at + k, if (part == 0) "layer output" else "finals", if (way == 1) "windows" else "the chunk" });
+                if (differ <= 4) std.debug.print("row {d} ({s}) differs between steps and windows\n", .{ at + k, if (part == 0) "layer output" else "finals" });
             }
         }
-    };
+    }
     std.debug.print("{{\"exact_rows\": {d}, \"differ\": {d}, \"layers\": {d}}}\n", .{ cont, differ, m.layers });
     if (differ != 0) return error.Inkling2NotRowExact;
 }
@@ -192,9 +230,10 @@ fn greedyMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const m = try ik.Model.load(init.gpa, init.io, args[1], .{});
     defer m.deinit();
     const c = &m.config.text;
-    var cache = try ik.state.Cache.init(m.device, c, ids.value.len + steps + 1, c.layers);
+    const capacity = ids.value.len + steps + 1;
+    var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c);
+    var s = try ik.state.Scratch.init(m.device, c, capacity);
     defer s.deinit();
     var t0 = now();
     try feed(m, &s, &cache, ids.value, null, true);
@@ -247,7 +286,15 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const H: usize = c.hidden;
     const L: usize = c.layers;
     const R: usize = ik.state.prompt_rows;
-    var s = try ik.state.Scratch.init(m.device, c);
+    // the longest cache a prompt and its steps fill
+    var longest: usize = 0;
+    var scan = std.mem.tokenizeAny(u8, index, "\r\n");
+    while (scan.next()) |path| {
+        const ids = try readIds(init, path);
+        defer ids.deinit();
+        longest = @max(longest, ids.value.len + steps);
+    }
+    var s = try ik.state.Scratch.init(m.device, c, longest);
     defer s.deinit();
     const tp: ik.forward.Taps = .{
         .h = try m.device.buffer(ik.forward.tap_layers.len * R * H * 2, mtl.ResourceOptions.shared),
@@ -280,7 +327,7 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
         var at: usize = 0;
         while (at < P) {
             const n = @min(P - at, R);
-            try ik.forward.run(m, &s, &cache, ids.value[at..][0..n], .{ .finals = true, .logits = if (at + n == P) .last else .none, .taps = tp });
+            try ik.forward.run(m, &s, &cache, ids.value[at..][0..n], .{ .finals = true, .logits = if (at + n == P) .last else .none, .taps = tp, .prompt = true });
             gather(&s, tp, n, row, H, L, taps, eids, xm);
             cache.len += n;
             row += n;
@@ -326,4 +373,67 @@ fn writeSeq(init: std.process.Init, dir: []const u8, seq: usize, suffix: []const
     const path = try std.fmt.allocPrint(init.gpa, "{s}/seq-{d:0>5}.{s}", .{ dir, seq, suffix });
     defer init.gpa.free(path);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = data });
+}
+
+const profile_classes = [_]ik.forward.counters.Class{ .dense, .norm, .attention_prepare, .attention, .route, .experts, .activation };
+const profile_warmup = 4;
+
+/// Decode steps of `rows` rows at `pos` through the first `layers` layers, each step's layers repeated `repeat` times in
+/// one command buffer: the mean per-class GPU time after the warm-up steps, and the same steps without spans.
+fn profileMode(init: std.process.Init, args: []const [:0]const u8) !void {
+    if (args.len < 7 or args.len > 8) return error.ExpectedLayersPosRowsSteps;
+    const L = try std.fmt.parseInt(u32, args[3], 10);
+    const pos = try std.fmt.parseInt(usize, args[4], 10);
+    const rows = try std.fmt.parseInt(usize, args[5], 10);
+    const steps = try std.fmt.parseInt(usize, args[6], 10);
+    const repeat: u32 = if (args.len > 7) try std.fmt.parseInt(u32, args[7], 10) else @max(1, 48 / L);
+    if (L == 0 or rows == 0 or rows > ik.state.prompt_rows or repeat == 0) return error.ExpectedPositiveLayersRowsRepeat;
+    if (steps <= profile_warmup) return error.StepsMustExceedWarmup;
+    const m = try ik.Model.load(init.gpa, init.io, args[1], .{ .layers = L });
+    defer m.deinit();
+    const c = &m.config.text;
+    const full = m.layers == c.layers;
+    const capacity = pos + rows * steps + 1;
+    var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers);
+    defer cache.deinit();
+    var s = try ik.state.Scratch.init(m.device, c, capacity);
+    defer s.deinit();
+    const zeros = try init.gpa.alloc(u32, @max(pos, rows));
+    defer init.gpa.free(zeros);
+    @memset(zeros, 0);
+    try feed(m, &s, &cache, zeros[0..pos], null, false);
+    const max_spans = ik.forward.spans_per_layer * @as(usize, m.layers) * repeat + 16;
+    var rec = try ik.forward.counters.Recorder.init(init.gpa, m.device, .{ .enabled = true, .max_spans = max_spans });
+    defer rec.deinit() catch {};
+    const measured = steps - profile_warmup;
+    var secs: [ik.forward.counters.class_count]f64 = @splat(0);
+    var gpu: f64 = 0;
+    for (0..steps) |step| {
+        var tm: ik.forward.Timing = .{};
+        try ik.forward.run(m, &s, &cache, zeros[0..rows], .{ .logits = if (full) .last else .none, .timing = &tm, .spans = &rec, .repeat = repeat });
+        _ = try rec.readAfterCompletion();
+        if (step >= profile_warmup) {
+            gpu += tm.gpu;
+            for (rec.aggregates(), 0..) |a, i| secs[i] += a.gpu_seconds;
+        }
+        cache.len += rows;
+    }
+    cache.len = pos;
+    var plain: f64 = 0;
+    for (0..steps) |step| {
+        var tm: ik.forward.Timing = .{};
+        try ik.forward.run(m, &s, &cache, zeros[0..rows], .{ .logits = if (full) .last else .none, .timing = &tm, .repeat = repeat });
+        if (step >= profile_warmup) plain += tm.gpu;
+        cache.len += rows;
+    }
+    const per_step = 1e6 / @as(f64, @floatFromInt(measured));
+    const per_layer = per_step / @as(f64, @floatFromInt(@as(usize, m.layers) * repeat));
+    var sum: f64 = 0;
+    for (profile_classes) |k| {
+        const t = secs[@backingInt(k)];
+        sum += t;
+        std.debug.print("{{\"class\": \"{s}\", \"us_per_layer\": {d:.1}, \"us_per_step\": {d:.1}}}\n", .{ @tagName(k), t * per_layer, t * per_step });
+    }
+    const ms = 1e3 / @as(f64, @floatFromInt(measured));
+    std.debug.print("{{\"steps\": {d}, \"rows\": {d}, \"pos\": {d}, \"repeat\": {d}, \"gpu_ms_per_step\": {d:.3}, \"wall_gpu_ms_plain\": {d:.3}, \"class_sum_ms_per_step\": {d:.3}}}\n", .{ measured, rows, pos, repeat, gpu * ms, plain * ms, sum * ms });
 }

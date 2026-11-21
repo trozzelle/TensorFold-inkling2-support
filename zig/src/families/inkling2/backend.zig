@@ -28,7 +28,8 @@ pub const Metal = struct {
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         const out = try gpa.create(Metal);
         errdefer gpa.destroy(out);
-        var scratch = try st.Scratch.init(model.device, &model.config.text);
+        // a stream's cache holds one position past the context window; the warm-up window runs a window's rows at least
+        var scratch = try st.Scratch.init(model.device, &model.config.text, @max(options.capacity + 1, st.window_rows));
         errdefer scratch.deinit();
         const tokens = try gpa.alloc(u32, ring);
         errdefer gpa.free(tokens);
@@ -128,7 +129,7 @@ pub const Metal = struct {
             if (stream.isCancelled()) return error.Cancelled;
             const n = @min(ids.len - at, st.prompt_rows);
             const last = at + n == ids.len;
-            try fwd.run(self.model, &self.scratch, cache, ids[at..][0..n], .{ .logits = if (last) .last else .none });
+            try fwd.run(self.model, &self.scratch, cache, ids[at..][0..n], .{ .logits = if (last) .last else .none, .prompt = true });
             if (last) @memcpy(cache.logits.slice(u16, self.model.config.text.vocab), self.scratch.logits.slice(u16, self.model.config.text.vocab));
             cache.len += n;
             lanes.prefill_widths.completed(self.gpa, stream, n);
