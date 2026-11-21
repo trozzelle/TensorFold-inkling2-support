@@ -10,7 +10,7 @@ const exl3 = @import("tensorfold").exl3_projection;
 const usage =
     \\tf-inkling-bench gemm                                         tensor-unit GEMM at the dense shapes, M 512/2048/4096
     \\tf-inkling-bench draft                                        the DSpark hold block as bf16 matvecs
-    \\tf-inkling-bench dense                                        48 layers' dense matvecs at 1-16 rows, unembed at 1 row
+    \\tf-inkling-bench dense [rows...]                              48 layers' dense matvecs (default rows 1 2 4 6 8 16), per shape at 1 and 8 rows, unembed at 1 row
     \\tf-inkling-bench experts <model> <layer> <xm.bin> <eids.bin> <rows> <row0> <act.bin> <out>
     \\                                                              w13 and w2 on recorded MoE inputs, bf16 out
     \\
@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     defer pool.pop();
     if (args.len >= 2 and std.mem.eql(u8, args[1], "gemm")) return gemm(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "draft")) return draft(init);
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "dense")) return dense(init);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "dense")) return dense(init, args[2..]);
     if (args.len == 10 and std.mem.eql(u8, args[1], "experts")) return experts(init, args);
     std.debug.print("{s}", .{usage});
     return error.UnknownMode;
@@ -141,8 +141,9 @@ fn mvSetup(device: mtl.Device) !struct { mv: Mv, lib: mtl.Library } {
 }
 
 /// The decode step's dense matvecs: every layer's q, gate, k, v, r, sink, o and router with its own weights (9.55 GB,
-/// so nothing stays in cache), at the window widths, and the unembed for one row.
-fn dense(init: std.process.Init) !void {
+/// so nothing stays in cache), at the given window widths in the given order; then each shape alone at 1 and 8 rows,
+/// and the unembed for one row.
+fn dense(init: std.process.Init, widths: []const [:0]const u8) !void {
     const device = try mtl.Device.init();
     const q = try device.queue();
     const s = try mvSetup(device);
@@ -163,11 +164,32 @@ fn dense(init: std.process.Init) !void {
         ops[l * shapes.len + j] = .{ .w = b, .rows = 1, .n = @intCast(sh[0]), .k = @intCast(sh[1]) };
         bytes += @floatFromInt(sh[0] * sh[1] * 2);
     };
-    for ([_]u32{ 1, 2, 4, 6, 8, 16 }) |rows| {
+    var list: [16]u32 = undefined;
+    var nw: usize = 0;
+    for (widths) |w| {
+        list[nw] = try std.fmt.parseInt(u32, w, 10);
+        nw += 1;
+    }
+    if (nw == 0) for ([_]u32{ 1, 2, 4, 6, 8, 16 }) |r| {
+        list[nw] = r;
+        nw += 1;
+    };
+    for (list[0..nw]) |rows| {
         for (&ops) |*op| op.rows = rows;
         const ms = try timed(q, 2, Phase{ .mv = &mv, .ops = &ops }, phaseBody);
         std.debug.print("{{\"dense_rows\": {d}, \"ms\": {d:.3}, \"gb\": {d:.2}, \"gbps\": {d:.0}}}\n", .{ rows, ms, bytes / 1e9, bytes / 1e6 / ms });
     }
+    const names = [_][]const u8{ "q", "gate", "k", "v", "r", "sink", "o", "router" };
+    for (shapes, names, 0..) |sh, name, j| for ([_]u32{ 1, 8 }) |rows| {
+        var one: [48]MvOp = undefined;
+        for (&one, 0..) |*op, l| {
+            op.* = ops[l * shapes.len + j];
+            op.rows = rows;
+        }
+        const ms = try timed(q, 2, Phase{ .mv = &mv, .ops = &one }, phaseBody);
+        const b: f64 = @floatFromInt(48 * sh[0] * sh[1] * 2);
+        std.debug.print("{{\"shape\": \"{s}\", \"n\": {d}, \"k\": {d}, \"rows\": {d}, \"ms48\": {d:.3}, \"gbps\": {d:.0}}}\n", .{ name, sh[0], sh[1], rows, ms, b / 1e6 / ms });
+    };
     const unembed = [_]MvOp{.{ .w = try device.buffer(201024 * 4608 * 2, mtl.ResourceOptions.shared), .rows = 1, .n = 201024, .k = 4608 }};
     try bufs.append(init.gpa, unembed[0].w);
     fill(unembed[0].w, 201024 * 4608, 300);
