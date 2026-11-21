@@ -85,8 +85,8 @@ Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a b
 | Decode with drafts (default) | 61.4 tok/s (65.2 on the bench prompt) |
 | Decode with drafts, every draft verified at depth 4 | 57.1 tok/s |
 | Decode, `--no-drafts` | 39.4 tok/s; 37.9 tok/s after an 8,202-token prompt |
-| Decode with drafts, sampled (temperature 0.7) | 56.8 tok/s |
-| Decode, sampled, `--no-drafts` | about 32 tok/s |
+| Decode with drafts, sampled (temperature 0.7, no truncation) | 56.8 tok/s |
+| Decode, sampled (temperature 0.7; four short prompts with top_p 0.95, top_p 0.95 and top_k 20, min_p 0.05, none) | 44.7 tok/s with drafts; 38.7 tok/s with `--no-drafts` |
 
 Decode steps of up to 16 rows take a decode path: the experts run a rate-grouped EXL3 chain (adapted from Sushi), and
 attention, norms and the attention-input matvecs have their own kernels. A step takes about 25 ms of GPU time. Prompt
