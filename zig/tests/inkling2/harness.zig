@@ -8,6 +8,8 @@ pub const Args = tf.inkling2.forward.Args;
 pub const state = tf.inkling2.state;
 
 pub const Bind = struct { buf: mtl.Buffer, off: usize = 0 };
+pub const Slot = union(enum) { buf: Bind, bytes: []const u8 };
+pub const Use = struct { buf: mtl.Buffer, write: bool = false };
 
 pub const Gpu = struct {
     device: mtl.Device,
@@ -37,6 +39,30 @@ pub const Gpu = struct {
         const g3 = mtl.Size.of(grid[0], grid[1], grid[2]);
         const t3 = mtl.Size.of(group[0], group[1], group[2]);
         if (groups) e.dispatchGroups(g3, t3) else e.dispatchThreads(g3, t3);
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.err("{s}: {s}", .{ name, msg });
+            return error.GpuFailed;
+        }
+    }
+
+    /// One kernel with its own buffer layout: `slots` bind from buffer 0 in order (a `.bytes` slot is a small constant
+    /// copied into the command). `uses` are declared on the encoder (useResource) for buffers the kernel reaches only
+    /// through GPU addresses. Dispatches `groups` threadgroups of `threads`.
+    pub fn dispatch(g: *const Gpu, name: [:0]const u8, slots: []const Slot, uses: []const Use, groups: [3]usize, threads: [3]usize) !void {
+        const p = try mtl.Pipeline.init(g.device, g.lib, name, false);
+        defer p.deinit();
+        const cb = g.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        e.setPipeline(p);
+        for (slots, 0..) |s, i| switch (s) {
+            .buf => |b| e.setBuffer(b.buf, b.off, i),
+            .bytes => |v| e.setBytes(v, i),
+        };
+        for (uses) |u| e.useResource(u.buf, if (u.write) mtl.ResourceUsage.write else mtl.ResourceUsage.read);
+        e.dispatchGroups(mtl.Size.of(groups[0], groups[1], groups[2]), mtl.Size.of(threads[0], threads[1], threads[2]));
         e.end();
         cb.commit();
         cb.wait();

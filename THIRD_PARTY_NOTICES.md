@@ -553,3 +553,18 @@ those files. `tiny_config.json` and the tensor tables
 `tiny_model_header.txt` and `tiny_mtp_header.txt` describe `tiny-random/inkling-2` at revision
 `0a57c72e4e5b68aafe1d983dbb62980344a5fcd7`, a randomly initialised model whose model card names that release as its base
 model and states no licence; no weights are included. `tools/zig/inkling2_fixtures.py` rebuilds all of these files.
+
+## Inkling 2 EXL3 decode kernels
+
+`zig/kernels/metal/inkling2/xd.metal` (the `ik_xd_*` kernels) adapts the decode kernels of
+[Sushi](https://github.com/beamivalice/sushi) v1.3.0 (commit `8e4c0af1`) as carried in
+[mlx-serve](https://github.com/ddalcu/mlx-serve)'s `src/sdk/quant/exl3/sushi/`, MIT License, Copyright (c) 2026
+Theinruj Toranavikrai and Copyright (c) 2026 David Dalcu. The ported text is `kernels/pair_gemv.metal` (the input
+Hadamard and the tile loop), `kernels/down_fused.metal` (the down projection's input and tile loop),
+`kernels/reduce.metal` (the output Hadamard's geometry) and `kernels/helpers_tail.metal` (the lane bit windows) of that
+tree, with the mul1 codeword helper that `expert_exl3_kernels.zig` builds. TensorFold's changes are the one-projection
+w13 pass, the interleaved gate and up pairs, the descriptor addressing and the rounding points of the Inkling 2
+reference. The complete original MIT notice and permission text is retained in
+[Sushi-MIT.txt](LICENSES/Sushi-MIT.txt); its last paragraph names Sushi's own NOTICE and Apache license files, which
+this repository does not ship. Sushi re-implements [ExLlamaV3](https://github.com/turboderp-org/exllamav3)'s EXL3
+format (MIT License, Copyright (c) 2025 Turboderp) from that reference and ships no ExLlamaV3 code.

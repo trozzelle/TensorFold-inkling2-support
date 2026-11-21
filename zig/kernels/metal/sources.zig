@@ -233,8 +233,9 @@ pub const minimax_m3_dspark = @embedFile("minimax_m3/dspark.metal");
 pub const minimax_m3_experts = @embedFile("minimax_m3/experts.metal");
 /// incoai's DFlash2 drafter for MiniMax-M3: Qwen3 norms, full RoPE, the block convolution, top-k and the selector.
 pub const minimax_m3_dflash2 = @embedFile("minimax_m3/dflash2.metal");
-/// Inkling 2's glue at mlx-lm's rounding points: norms, depth attention, convolutions, attention, routing, tiles.
-pub const inkling2_glue = @embedFile("core/bf16_matvec.metal") ++ @embedFile("inkling2/glue.metal") ++ @embedFile("inkling2/conv.metal") ++ @embedFile("inkling2/attention.metal") ++ @embedFile("inkling2/moe.metal");
+/// Inkling 2's glue at mlx-lm's rounding points: norms, depth attention, convolutions, attention, routing, tiles, and
+/// the decode path's segmented matvec, fused norm chains, split-K attention and EXL3 decode chain.
+pub const inkling2_glue = @embedFile("core/bf16_matvec.metal") ++ @embedFile("inkling2/glue.metal") ++ @embedFile("inkling2/conv.metal") ++ @embedFile("inkling2/attention.metal") ++ @embedFile("inkling2/moe.metal") ++ @embedFile("inkling2/stack.metal") ++ @embedFile("inkling2/fused.metal") ++ @embedFile("inkling2/attn_split.metal") ++ @embedFile("inkling2/xd.metal");
 /// MiniMax-M3's indexer block scores on the tensor units (a prompt chunk's).
 pub const minimax_m3_index_nax = @embedFile("minimax_m3/index_nax.metal");
 /// Flint's glue at the reference's rounding points: embed, norms, q/k rotation, SwiGLU, residual and MoE adds.

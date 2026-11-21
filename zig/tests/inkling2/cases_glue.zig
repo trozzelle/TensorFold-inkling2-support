@@ -11,6 +11,7 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseNormF32(g, r);
     try caseDepth(g, r);
     try caseResidSoftcap(g, r);
+    try caseMatvecWidths(g, r);
 }
 
 /// A bf16 output within `steps` of its f64 reference, counting the outputs that are not equal to it: an f32 product and an
@@ -199,5 +200,67 @@ fn caseResidSoftcap(g: *const h.Gpu, r: std.Random) !void {
             if (got != 0xff80) c.bad += 1; // -inf
         } else c.b16(got, 30 * std.math.tanh(h.fb(before[t * V + i]) / 30));
     };
+    try c.done();
+}
+
+/// core/bf16_matvec.metal's tf_bf16_mv_args.
+const MvArgs = extern struct { rows: u32, n: u32, k: u32, ldy: u32 };
+
+/// Y (from byte `y_off`) = X W^T through the matvec kernel `name` for `rows` rows, X read from `x` at byte `x_off`.
+fn matvec(g: *const h.Gpu, name: [:0]const u8, x: mtl.Buffer, x_off: usize, w: mtl.Buffer, y: mtl.Buffer, y_off: usize, rows: u32, n: u32, k: u32) !void {
+    const p = try mtl.Pipeline.init(g.device, g.lib, name, false);
+    defer p.deinit();
+    const cb = g.queue.commandBuffer();
+    const e = cb.compute(.serial);
+    e.setPipeline(p);
+    e.setBuffer(x, x_off, 0);
+    e.setBuffer(w, 0, 1);
+    e.setValue(MvArgs{ .rows = rows, .n = n, .k = k, .ldy = n }, 2);
+    e.setBuffer(y, y_off, 3);
+    e.dispatchGroups(mtl.Size.of((n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+    e.end();
+    cb.commit();
+    cb.wait();
+    if (cb.failure()) |msg| {
+        std.log.err("{s}: {s}", .{ name, msg });
+        return error.GpuFailed;
+    }
+}
+
+/// Every row of an eight-row window through `ik_matvec_8` with 1..8 rows gives the bits of that row through
+/// `ik_matvec_1`; the eight-row kernel on one row ahead of seven pad rows (which may hold anything) does too.
+fn caseMatvecWidths(g: *const h.Gpu, r: std.Random) !void {
+    const n = 1000;
+    const k = 4608;
+    const R = 8;
+    const w = try g.buf(n * k * 2);
+    const x = try g.buf(R * k * 2);
+    const one = try g.buf((1 + 7) * k * 2);
+    const y1 = try g.buf(R * n * 2);
+    const y8 = try g.buf(R * n * 2);
+    defer for ([_]mtl.Buffer{ w, x, one, y1, y8 }) |b| b.deinit();
+    _ = h.fill16(w, n * k, r, 0.2);
+    const xs = h.fill16(x, R * k, r, 3.0);
+    var c: h.Check = .{ .name = "matvec widths" };
+    const ybytes = R * n * 2;
+    for (0..R) |t| try matvec(g, "ik_matvec_1", x, t * k * 2, w, y1, t * n * 2, 1, n, k);
+    for (1..R + 1) |m| {
+        @memset(y8.slice(u8, ybytes), 0xaa);
+        try matvec(g, "ik_matvec_8", x, 0, w, y8, 0, @intCast(m), n, k);
+        c.same(y8.slice(u8, ybytes)[0 .. m * n * 2], y1.slice(u8, ybytes)[0 .. m * n * 2]);
+        // rows past `rows` are not written
+        c.n += 1;
+        for (y8.slice(u8, ybytes)[m * n * 2 ..]) |byte| if (byte != 0xaa) {
+            c.bad += 1;
+            break;
+        };
+    }
+    // row 3 alone ahead of seven NaN pad rows
+    const os = one.slice(u16, 8 * k);
+    @memcpy(os[0..k], xs[3 * k ..][0..k]);
+    @memset(os[k..], 0x7fc0);
+    @memset(y8.slice(u8, ybytes), 0xaa);
+    try matvec(g, "ik_matvec_8", one, 0, w, y8, 0, 1, n, k);
+    c.same(y8.slice(u8, n * 2), y1.slice(u8, ybytes)[3 * n * 2 ..][0 .. n * 2]);
     try c.done();
 }
