@@ -50,9 +50,10 @@ checks that each row's result is independent of the rows beside it, and that a N
   - `ProcessType` `Interactive` in the job's plist. Without it, launchd clamps the job and its children to
     background priority, a decode step's wait wakes tens of milliseconds late, and drafted decode drops to about
     15 tok/s from 61.
-  - The model directory's files on a disk the job may read. macOS refuses launchd jobs reads on external volumes
-    unless they are granted access, so copy `mtp.safetensors` rather than linking it to such a volume. A refused
-    draft head can leave the server silent, never listening.
+  - The model directory's files on a disk the job may read. macOS guards external volumes from launchd jobs that
+    were not granted access: under a LaunchDaemon, opening a file there blocks without an error, so the server
+    loads the rest and then waits, silent and never listening. Copy `mtp.safetensors` rather than linking it to such
+    a volume.
 - `INKLING_ROUND_TIMING=1` logs, when each reply ends, what an average round spent: GPU and encode time, the rest of
   the forward call (commit and wake), the draw, and the time between rounds. Use it to find where a slow reply
   loses its time; it adds a few clock reads to each round.
