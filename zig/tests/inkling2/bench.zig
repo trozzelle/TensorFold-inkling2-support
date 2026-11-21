@@ -10,8 +10,9 @@ const exl3 = @import("tensorfold").exl3_projection;
 const usage =
     \\tf-inkling-bench gemm                                         tensor-unit GEMM at the dense shapes, M 512/2048/4096
     \\tf-inkling-bench draft                                        the DSpark hold block as bf16 matvecs
-    \\tf-inkling-bench dspark <model>                               the DSpark draft head's hold at depth 5 and 7 and an absorb of one row on <model>'s real weights
-    \\                                                              (the embedding, the unembedding and mtp.safetensors; no layers): median of 9 runs each
+    \\tf-inkling-bench dspark <model> [--bits 8|16]                 the DSpark draft head's hold at depth 4, 5 and 7, an absorb of one row and a drafted round at depth 4 and 5 on <model>'s
+    \\                                                              real weights (the embedding, the unembedding and mtp.safetensors; no layers): median of 9 runs each;
+    \\                                                              --bits picks the draft layers' weights, quantized to 8 bits at load (the default) or bf16
     \\tf-inkling-bench dense [rows...]                              48 layers' dense matvecs (default rows 1 2 4 6 8 16), per shape at 1 and 8 rows, unembed at 1 row
     \\tf-inkling-bench experts <model> <layer> <xm.bin> <eids.bin> <rows> <row0> <act.bin> <out>
     \\                                                              w13 and w2 on recorded MoE inputs, bf16 out
@@ -37,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "gemm")) return gemm(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "draft")) return draft(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "dense")) return dense(init, args[2..]);
-    if (args.len == 3 and std.mem.eql(u8, args[1], "dspark")) return @import("bench_dspark.zig").run(init, args);
+    if ((args.len == 3 or args.len == 5) and std.mem.eql(u8, args[1], "dspark")) return @import("bench_dspark.zig").run(init, args);
     if (args.len == 10 and std.mem.eql(u8, args[1], "experts")) return experts(init, args);
     if (args.len == 10 and std.mem.eql(u8, args[1], "xd-dump")) return xdDumpLeg(init, args);
     if (args.len >= 7 and std.mem.eql(u8, args[1], "xd")) return xdLeg(init, args);

@@ -48,6 +48,7 @@ const Fixture = struct {
     pipes: [glue_names.len]mtl.Pipeline,
     buffers: std.ArrayList(mtl.Buffer) = .empty,
     seed: u64 = 1,
+    bits: dw.Bits = .sixteen, // the width of the layers' projections
 
     /// A tensor of `dims` at 8 bytes into its own buffer (as a checkpoint's tensors sit), random in ±scale.
     fn tensor(f: *Fixture, dims: []const usize, scale: f32) !wts.Tensor {
@@ -72,12 +73,26 @@ const Fixture = struct {
         return .{ .t = try f.tensor(&.{ n, k }, scale), .n = @intCast(n), .k = @intCast(k) };
     }
 
+    /// A draft layer's projection: the random bf16 matrix, or at 8 bits its quantization (the buffer joins `buffers`).
+    fn proj(f: *Fixture, n: usize, k: usize, scale: f32) !dw.Proj {
+        const d = try f.dense(n, k, scale);
+        if (f.bits == .sixteen) return .{ .bf16 = d };
+        const q = try dw.quantize(gpa, f.device, d.t.host(u16), n, k);
+        errdefer q.buf.deinit();
+        try f.buffers.append(gpa, q.buf);
+        return .{ .q8 = q };
+    }
+
     fn init(a: std.mem.Allocator) !*Fixture {
+        return make(a, .sixteen);
+    }
+
+    fn make(a: std.mem.Allocator, bits: dw.Bits) !*Fixture {
         const device = try mtl.Device.init();
         errdefer device.deinit();
         const f = try gpa.create(Fixture);
         errdefer gpa.destroy(f);
-        f.* = .{ .device = device, .model = try gpa.create(Model), .pipes = undefined };
+        f.* = .{ .device = device, .model = try gpa.create(Model), .pipes = undefined, .bits = bits };
         errdefer gpa.destroy(f.model);
         errdefer f.free();
         var why: config.Why = .{};
@@ -103,15 +118,15 @@ const Fixture = struct {
             .q_norm = try f.norm(m.head_dim),
             .k_norm = try f.norm(m.head_dim),
             .k_norm_ctx = try f.norm(m.head_dim),
-            .q = try f.dense(qw, hidden, 0.02),
-            .k = try f.dense(kvw, hidden, 0.02),
-            .v = try f.dense(kvw, hidden, 0.02),
-            .k_ctx = try f.dense(kvw, hidden, 0.02),
-            .v_ctx = try f.dense(kvw, hidden, 0.02),
-            .o = try f.dense(hidden, qw, 0.02),
-            .gate = try f.dense(m.inter, hidden, 0.02),
-            .up = try f.dense(m.inter, hidden, 0.02),
-            .down = try f.dense(hidden, m.inter, 0.02),
+            .q = try f.proj(qw, hidden, 0.02),
+            .k = try f.proj(kvw, hidden, 0.02),
+            .v = try f.proj(kvw, hidden, 0.02),
+            .k_ctx = try f.proj(kvw, hidden, 0.02),
+            .v_ctx = try f.proj(kvw, hidden, 0.02),
+            .o = try f.proj(hidden, qw, 0.02),
+            .gate = try f.proj(m.inter, hidden, 0.02),
+            .up = try f.proj(m.inter, hidden, 0.02),
+            .down = try f.proj(hidden, m.inter, 0.02),
         };
         const layers = try gpa.alloc(dw.Layer, m.layers);
         errdefer gpa.free(layers);
@@ -123,6 +138,7 @@ const Fixture = struct {
         }
         var w: dw.Weights = .{
             .layers = layers,
+            .bits = bits,
             .alpha = std.mem.zeroes([mix.max_rows][mix.max_taps]u16),
             .alpha_buffer = try device.buffer((m.layers + 1) * m.taps_n * 2, mtl.ResourceOptions.shared),
             .rows = m.layers + 1,
@@ -273,10 +289,12 @@ fn held(d: *dspark.Drafter, s: *lanes.Stream, taps: mtl.Buffer, n: usize, chunk:
     @memcpy(logits, d.captured());
 }
 
-test "inkling2 dspark: a context absorbed in any chunking, or with a long prompt's old rows skipped, holds the same block" {
+/// A context absorbed in any chunking, or with a long prompt's old rows skipped, holds the same block, over a fixture whose layers
+/// are `bits` wide: a row's bits through the projections do not depend on the rows beside it.
+fn chunkingHolds(bits: dw.Bits) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+    const f = Fixture.make(arena.allocator(), bits) catch |err| switch (err) {
         error.NoDevice => return error.SkipZigTest,
         else => return err,
     };
@@ -307,6 +325,61 @@ test "inkling2 dspark: a context absorbed in any chunking, or with a long prompt
         try t.expectEqualSlices(u32, &a_props, &b_props);
         try t.expectEqualSlices(u16, a_logits, b_logits);
     }
+}
+
+test "inkling2 dspark: a context absorbed in any chunking, or with a long prompt's old rows skipped, holds the same block" {
+    try chunkingHolds(.sixteen);
+}
+
+test "inkling2 dspark: with 8-bit layers a context absorbed in any chunking, or with a long prompt's old rows skipped, holds the same block" {
+    try chunkingHolds(.eight);
+}
+
+/// The relative RMS difference of two bf16 tables of the seven steps' logits over the ids the vocabulary keeps (the padded ids are
+/// -inf in both).
+fn logitsDiff(a: []const u16, b: []const u16) f64 {
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (0..7) |step| for (0..valid) |v| {
+        const x = mix.f32Of(a[step * vocab + v]);
+        const y = mix.f32Of(b[step * vocab + v]);
+        num += (x - y) * (x - y);
+        den += y * y;
+    };
+    return @sqrt(num / den);
+}
+
+test "inkling2 dspark: 8-bit layers hold logits close to the bf16 layers' on the same weights and taps" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var logits: [2]?[]u16 = .{ null, null };
+    defer for (logits) |l| if (l) |x| gpa.free(x);
+    for ([_]dw.Bits{ .sixteen, .eight }, 0..) |bits, i| {
+        // the same seeds a fixture, so the 8-bit layers are the quantization of the bf16 ones
+        const f = Fixture.make(arena.allocator(), bits) catch |err| switch (err) {
+            error.NoDevice => return error.SkipZigTest,
+            else => return err,
+        };
+        defer f.deinit();
+        const d = try f.drafter(7);
+        defer d.deinit();
+        try d.captureLogits();
+        const n = 300;
+        const taps = try tapsBuffer(f.device, n + 1, 7);
+        defer taps.deinit();
+        var prompt: [n]u32 = undefined;
+        for (&prompt, 0..) |*x, j| x.* = tokenAt(j);
+        var s = try lanes.Stream.init(gpa, .{ .id = "bits", .prompt = &prompt, .max_new = 8 });
+        defer s.deinit(gpa);
+        const out = try gpa.alloc(u16, 7 * vocab);
+        logits[i] = out;
+        var props: [7]u32 = undefined;
+        try held(d, &s, taps, n, 64, true, 7, &props, out);
+    }
+    const diff = logitsDiff(logits[1].?, logits[0].?);
+    // a kernel that misapplies a scale or a bias is off by the logits' size; the quantization's own noise is under 2% of their RMS
+    // here (1.7% measured on this fixture), and not zero
+    try t.expect(diff > 0 and diff < 0.05);
 }
 
 /// Core's depth sweep over the drafter, a second one held at the deepest as its reference.
@@ -352,10 +425,11 @@ const Sweep = struct {
     }
 };
 
-test "inkling2 dspark: a hold at every depth 1 to 7 holds exactly the asked drafts, the first of the deepest block's" {
+/// A hold at every depth 1 to 7 holds exactly the asked drafts, the first of the deepest block's, over a fixture of `bits`.
+fn depthSweep(bits: dw.Bits) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+    const f = Fixture.make(arena.allocator(), bits) catch |err| switch (err) {
         error.NoDevice => return error.SkipZigTest,
         else => return err,
     };
@@ -370,6 +444,14 @@ test "inkling2 dspark: a hold at every depth 1 to 7 holds exactly the asked draf
     const r = try sweep.sweep(gpa, h.harness(), .{ .block = 7, .prompts = &.{ 6, 40 }, .rounds = 12 });
     // two prompts x (depths 1..7 + one zig-zag run) x 12 rounds; drafts 12 x 28 fixed + 48 zig-zag a prompt
     try t.expectEqual(sweep.Report{ .runs = 16, .rounds = 192, .drafts = 2 * (12 * 28 + 48) }, r);
+}
+
+test "inkling2 dspark: a hold at every depth 1 to 7 holds exactly the asked drafts, the first of the deepest block's" {
+    try depthSweep(.sixteen);
+}
+
+test "inkling2 dspark: with 8-bit layers a hold at every depth 1 to 7 holds exactly the asked drafts, the first of the deepest block's" {
+    try depthSweep(.eight);
 }
 
 test "inkling2 dspark: facts offer the asked depth, a fixed block, the lane's bytes and the taps the target writes" {
@@ -416,10 +498,11 @@ test "inkling2 dspark: facts offer the asked depth, a fixed block, the lane's by
     try t.expectError(error.DraftHeldFewer, dv.held(&.{&s}, &.{out[0..1]}));
 }
 
-test "inkling2 dspark: two streams absorbed and held in one round each hold what they hold alone" {
+/// Two streams absorbed and held in one round each hold what they hold alone, over a fixture of `bits`.
+fn twoStreams(bits: dw.Bits) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+    const f = Fixture.make(arena.allocator(), bits) catch |err| switch (err) {
         error.NoDevice => return error.SkipZigTest,
         else => return err,
     };
@@ -466,6 +549,14 @@ test "inkling2 dspark: two streams absorbed and held in one round each hold what
     try t.expectEqualSlices(u32, alone[1][0..4], both[1][0..4]);
     // the logits kept are the last hold's of the round, its four steps
     try t.expectEqualSlices(u16, last[0 .. 4 * vocab], d.captured()[0 .. 4 * vocab]);
+}
+
+test "inkling2 dspark: two streams absorbed and held in one round each hold what they hold alone" {
+    try twoStreams(.sixteen);
+}
+
+test "inkling2 dspark: with 8-bit layers two streams absorbed and held in one round each hold what they hold alone" {
+    try twoStreams(.eight);
 }
 
 /// A residency hook that counts the buffers joined and left, and their bytes.

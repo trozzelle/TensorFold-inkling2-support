@@ -49,17 +49,24 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = "--parallel: the Inkling 2 EXL3 engine serves one stream; give --parallel 1";
         return null;
     }
-    // how deep a round drafts: only a load with drafts reads it
+    // how deep a round drafts and how wide the draft layers' weights are: only a load with drafts reads them, once
     var depth: fl.dspark.Depth = .default;
-    if (o.drafts) depth = fl.dspark.Depth.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null) catch {
-        problem.* = "INKLING_DRAFT_DEPTH is not a draft depth: give a whole number from 1 to 7, or auto; unset it for 5";
-        return null;
-    };
+    var bits: fl.dspark_weights.Bits = .default;
+    if (o.drafts) {
+        depth = fl.dspark.Depth.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null) catch {
+            problem.* = "INKLING_DRAFT_DEPTH is not a draft depth: give a whole number from 1 to 7, or auto; unset it for 4";
+            return null;
+        };
+        bits = fl.dspark_weights.Bits.parse(if (std.c.getenv("INKLING_DRAFT_BITS")) |v| std.mem.span(v) else null) catch {
+            problem.* = "INKLING_DRAFT_BITS is not a draft weight width: give 8 (quantized at load) or 16 (bf16); unset it for 8";
+            return null;
+        };
+    }
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     // with drafts, the model also loads the draft head's weights (mtp.safetensors) when the folder has them: they are among the
     // checkpoint's shards, so the budget below counts them
-    const model = fl.Model.load(gpa, io, o.dir, .{ .drafts = o.drafts }) catch |err| {
+    const model = fl.Model.load(gpa, io, o.dir, .{ .drafts = o.drafts, .draft_bits = bits }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 EXL3 engine cannot load this checkpoint ({s}){s}", .{ @errorName(err), if (o.drafts) "; with drafts on it also loads mtp.safetensors, which --no-drafts skips" else "" });
         return null;
     };
@@ -75,8 +82,8 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     } else if (o.drafts) std.log.info("inkling2: no draft head loaded; serving plain and copy-drafted rounds", .{});
     errdefer if (draft) |d| d.deinit();
     if (draft) |d| switch (depth) {
-        .fixed => |n| std.log.info("inkling2: DSpark draft head, {d} drafts a round, {d:.2} GiB resident", .{ n, gib(d.residentBytes(1)) }),
-        .auto => std.log.info("inkling2: DSpark draft head, 1 to {d} drafts a round chosen by the cost rule, {d:.2} GiB resident", .{ depth.most(), gib(d.residentBytes(1)) }),
+        .fixed => |n| std.log.info("inkling2: DSpark draft head, {s} layers, {d} drafts a round, {d:.2} GiB resident", .{ d.w.bits.label(), n, gib(d.residentBytes(1)) }),
+        .auto => std.log.info("inkling2: DSpark draft head, {s} layers, 1 to {d} drafts a round chosen by the cost rule, {d:.2} GiB resident", .{ d.w.bits.label(), depth.most(), gib(d.residentBytes(1)) }),
     };
     // refusals that return null free what they hold themselves: errdefer runs only for errors
     var ram: u64 = 0;

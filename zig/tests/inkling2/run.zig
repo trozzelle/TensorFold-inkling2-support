@@ -15,17 +15,20 @@ const usage =
     \\                                                         against 16-row windows, bit for bit
     \\tf-inkling-run <model> greedy <ids.json> <n> [--drafts]   the prompt, then n one-row greedy steps; tokens, tok/s
     \\                                                         --drafts: the same n tokens through the lane engine with the draft head in
-    \\                                                         front of the target, as served (INKLING_DRAFT_DEPTH: 1 to 7 or auto, 5 when
-    \\                                                         unset); needs mtp.safetensors in the folder; also prints rounds, drafts, accepted
+    \\                                                         front of the target, as served (INKLING_DRAFT_DEPTH: 1 to 7 or auto, 4 when
+    \\                                                         unset; INKLING_DRAFT_BITS: 8 or 16, 8 when unset); needs mtp.safetensors in
+    \\                                                         the folder; also prints rounds, drafts, accepted
     \\tf-inkling-run <model> taps <index.txt> <out_dir> <steps>   each prompt, then steps greedy tokens: taps, picks, MoE inputs
     \\tf-inkling-run <model> ftaps <ids.json> <out.bin> [at [window]]   every row's serving taps: bf16 [T, 8, H], the inputs of layers
     \\                                                         5, 11, .. 41, then the finals. ids[..at] (default: all) go through in
     \\                                                         prompt chunks, the rest in decode windows of at most `window` rows (16)
-    \\tf-inkling-run <model> dspark <taps_dir> <seqs> <out_dir> [--depth d]   the draft head over recorded taps (taps mode's files), from the
+    \\tf-inkling-run <model> dspark <taps_dir> <seqs> <out_dir> [--depth d] [--bits 8|16]   the draft head over recorded taps (taps mode's files), from the
     \\                                                         embedding, the unembedding and mtp.safetensors alone: <seqs> is N, A..B (inclusive)
     \\                                                         or a comma list; per sequence out_dir gets seq-NNNNN.props.bin (int32 [T][7],
     \\                                                         -1 where no hold ran) and seq-NNNNN.logits.bin (bf16 [16][7][vocab]: the first 16
-    \\                                                         holds' step logits after the softcap and the padded vocabulary's mask)
+    \\                                                         holds' step logits after the softcap and the padded vocabulary's mask);
+    \\                                                         --depth: drafts a hold makes (7 when not given); --bits: the draft layers' weights,
+    \\                                                         quantized to 8 bits at load (8 when not given) or bf16
     \\tf-inkling-run <model> profile <layers> <pos> <rows> <steps> [repeat]   per-class GPU time of decode steps
     \\                                                         (the layers run repeat times a step, default 48/layers)
     \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat]   decode steps each followed by the greedy draw: median

@@ -24,7 +24,8 @@ comptime {
 /// `layers`: load only the first layers (the per-layer checks on a Mac that cannot hold the model); 0 loads none, and no
 /// experts: the embedding, the final norm and the unembedding alone, enough to run the draft head over recorded taps.
 /// `drafts`: also load the DSpark draft head from the folder's mtp.safetensors, when the config has one and the file is there.
-pub const Options = struct { layers: ?u32 = null, drafts: bool = false };
+/// `draft_bits`: the width of the draft layers' projections (INKLING_DRAFT_BITS): quantized to 8 bits at load, or the file's bf16.
+pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -94,7 +95,7 @@ pub const Model = struct {
         errdefer m.exl3.deinit();
         m.draft = null;
         if (opts.drafts) {
-            if (m.config.mtp) |mtp| m.draft = try dspark_weights.load(gpa, io, m.device, &m.checkpoint, dir, mtp) else std.log.info("inkling2: the config has no mtp_config; the draft head stays off", .{});
+            if (m.config.mtp) |mtp| m.draft = try dspark_weights.load(gpa, io, m.device, &m.checkpoint, dir, mtp, opts.draft_bits) else std.log.info("inkling2: the config has no mtp_config; the draft head stays off", .{});
         }
         return m;
     }

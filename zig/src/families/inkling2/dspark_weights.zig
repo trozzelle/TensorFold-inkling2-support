@@ -1,11 +1,14 @@
 //! The DSpark draft head's tensors (mtp.safetensors: 84 bf16 tensors under unprefixed names) as views into the
-//! checkpoint's buffers, and the mix weights derived from fuse_weight.
+//! checkpoint's buffers, and the mix weights derived from fuse_weight. The draft layers' nine projections are either those views
+//! (bf16) or, by default, quantized at load to MLX's affine 8-bit form (dspark_quant.zig): they then stay in the file, are read
+//! through a host buffer one at a time, and only their codes, scales and biases reach the GPU.
 const std = @import("std");
 const mtl = @import("metal");
 const ck = @import("../../core/checkpoint_metal.zig");
 const config = @import("config.zig");
 const wts = @import("weights.zig");
 const mix = @import("dspark_alpha.zig");
+const quant = @import("dspark_quant.zig");
 const fwd = @import("forward.zig");
 const Model = @import("model.zig").Model;
 
@@ -15,7 +18,76 @@ pub const Dense = wts.Dense;
 /// The draft head's file in a model folder (tfpack links it from the source checkpoint).
 pub const file_name = "mtp.safetensors";
 
-/// Most draft layers (each has a mix row, and the Markov head one more) and most taps a mix row spans.
+/// The width of the draft layers' projection weights: oMLX's affine 8-bit form (the default), or the file's bf16.
+pub const Bits = enum(u8) {
+    eight = 8,
+    sixteen = 16,
+
+    /// What an unset or blank INKLING_DRAFT_BITS means.
+    pub const default: Bits = .eight;
+
+    /// The setting's text: null or blank is the default, else `8` or `16`.
+    pub fn parse(text: ?[]const u8) error{BadDraftBits}!Bits {
+        const t = std.mem.trim(u8, text orelse "", " \t");
+        if (t.len == 0) return default;
+        if (std.mem.eql(u8, t, "8")) return .eight;
+        if (std.mem.eql(u8, t, "16")) return .sixteen;
+        return error.BadDraftBits;
+    }
+
+    /// How a log names the layers' weights.
+    pub fn label(b: Bits) []const u8 {
+        return switch (b) {
+            .eight => "8-bit",
+            .sixteen => "bf16",
+        };
+    }
+};
+
+/// Bytes the parts of a quantized projection start at, so every kernel reads its codes and tables aligned.
+const part_alignment = 256;
+
+/// A projection [n, k] quantized to MLX's affine 8-bit form, in one buffer: codes u8 [n][k], then bf16 scales [n][k / 64], then
+/// bf16 biases [n][k / 64], each part at a multiple of `part_alignment` bytes (the codes at 0).
+pub const Quant = struct {
+    buf: mtl.Buffer,
+    scales: usize, // byte offsets
+    biases: usize,
+    n: u32,
+    k: u32,
+
+    /// Bytes of the buffer for an [n, k] projection.
+    pub fn bytes(n: usize, k: usize) usize {
+        return layout(n, k)[2];
+    }
+
+    /// The scale part's offset, the bias part's, and the buffer's size.
+    fn layout(n: usize, k: usize) [3]usize {
+        const table = n * (k / quant.group) * 2;
+        const scales = std.mem.alignForward(usize, n * k, part_alignment);
+        const biases = scales + std.mem.alignForward(usize, table, part_alignment);
+        return .{ scales, biases, biases + table };
+    }
+};
+
+/// One projection of a draft layer, as the drafter's kernels take it: bf16 views into the checkpoint, or quantized.
+pub const Proj = union(enum) {
+    bf16: Dense,
+    q8: Quant,
+
+    pub fn n(p: Proj) u32 {
+        return switch (p) {
+            inline else => |x| x.n,
+        };
+    }
+
+    pub fn k(p: Proj) u32 {
+        return switch (p) {
+            inline else => |x| x.k,
+        };
+    }
+};
+
 /// One draft layer. Norms are [hidden] (`dflare` the tap mix's) or [head_dim] (`q_norm`, `k_norm` for block rows,
 /// `k_norm_ctx` for context rows); `k` and `v` project block rows, `k_ctx` and `v_ctx` context rows.
 pub const Layer = struct {
@@ -25,15 +97,15 @@ pub const Layer = struct {
     q_norm: Tensor,
     k_norm: Tensor,
     k_norm_ctx: Tensor,
-    q: Dense, // [q_heads * head_dim, hidden]
-    k: Dense, // [kv_heads * head_dim, hidden]
-    v: Dense,
-    k_ctx: Dense,
-    v_ctx: Dense,
-    o: Dense, // [hidden, q_heads * head_dim]
-    gate: Dense, // [inter, hidden]
-    up: Dense,
-    down: Dense, // [hidden, inter]
+    q: Proj, // [q_heads * head_dim, hidden]
+    k: Proj, // [kv_heads * head_dim, hidden]
+    v: Proj,
+    k_ctx: Proj,
+    v_ctx: Proj,
+    o: Proj, // [hidden, q_heads * head_dim]
+    gate: Proj, // [inter, hidden]
+    up: Proj,
+    down: Proj, // [hidden, inter]
 };
 
 /// The Markov head: a GRU over [state, w1 row of the previous token, draft hidden, f_rnn] whose latent is folded into
@@ -49,6 +121,8 @@ pub const Markov = struct {
 
 pub const Weights = struct {
     layers: []Layer,
+    /// The width of the layers' projections: the file's bf16, or quantized at load.
+    bits: Bits,
     /// softmax(fuse_weight, -1) rounded to bf16 (bits), row `i` for draft layer `i` and row `layers.len` for the
     /// Markov head, over the first `taps` columns.
     alpha: [mix.max_rows][mix.max_taps]u16,
@@ -62,7 +136,8 @@ pub const Weights = struct {
     /// unembed . hidden_out: fold_w [vocab, rank] and fold_b [vocab] (bf16), filled by the fold pass after load.
     fold_w: ?Dense = null,
     fold_b: ?Tensor = null,
-    /// Bytes the draft file takes among the checkpoint's shards (the fold's are counted apart: `foldBytes`).
+    /// Bytes the draft file takes among the checkpoint's shards, the layers' quantized buffers among them (the fold's are
+    /// counted apart: `foldBytes`).
     bytes: usize = 0,
 
     pub fn deinit(w: *Weights, gpa: std.mem.Allocator) void {
@@ -71,7 +146,102 @@ pub const Weights = struct {
     }
 };
 
-fn layerTensors(c: *const ck.Checkpoint, m: config.Mtp, i: usize) !Layer {
+/// The tensors a quantizing load leaves in the file: the draft layers' projection weights (rank 2 under `layers.`; the norms
+/// are rank 1).
+fn isProjection(name: []const u8, rank: usize) bool {
+    return rank == 2 and std.mem.startsWith(u8, name, "layers.");
+}
+
+/// One slice of rows `quantize` hands a core.
+const Job = struct {
+    src: []const u16,
+    k: usize,
+    codes: []u8,
+    scales: []u16,
+    biases: []u16,
+    bad: ?usize = null, // the first group quantizeRows refused
+
+    fn run(j: *Job) void {
+        j.bad = quant.quantizeRows(j.src, j.k, j.codes, j.scales, j.biases);
+    }
+};
+
+/// MLX's affine 8-bit quantization (dspark_quant.zig) of the bf16 values `src`, [n][k] row-major with k a multiple of 64, into a
+/// new buffer: the rows go to every core. The caller owns the buffer (the checkpoint, through `own`).
+pub fn quantize(gpa: std.mem.Allocator, device: mtl.Device, src: []const u16, n: usize, k: usize) !Quant {
+    if (k == 0 or k % quant.group != 0 or src.len != n * k or n == 0 or n > std.math.maxInt(u32) or k > std.math.maxInt(u32)) return error.UnexpectedInkling2Tensor;
+    const at = Quant.layout(n, k);
+    const groups = k / quant.group;
+    const buf = try device.buffer(at[2], mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+    errdefer buf.deinit();
+    const mem = buf.contents();
+    const codes = mem[0 .. n * k];
+    const scales = @as([*]u16, @ptrCast(@alignCast(mem + at[0])))[0 .. n * groups];
+    const biases = @as([*]u16, @ptrCast(@alignCast(mem + at[1])))[0 .. n * groups];
+    // one slice of rows a core; a small projection stays on this thread
+    const cpus = std.Thread.getCpuCount() catch 4;
+    const parts: usize = @max(1, @min(@min(cpus, 32), n * k / (1 << 20), n));
+    const jobs = try gpa.alloc(Job, parts);
+    defer gpa.free(jobs);
+    const threads = try gpa.alloc(?std.Thread, parts);
+    defer gpa.free(threads);
+    const per = (n + parts - 1) / parts;
+    for (jobs, threads, 0..) |*j, *t, i| {
+        const r0 = @min(i * per, n);
+        const r1 = @min(r0 + per, n);
+        j.* = .{ .src = src[r0 * k .. r1 * k], .k = k, .codes = codes[r0 * k .. r1 * k], .scales = scales[r0 * groups .. r1 * groups], .biases = biases[r0 * groups .. r1 * groups] };
+        t.* = if (i + 1 == parts) null else std.Thread.spawn(.{}, Job.run, .{j}) catch null;
+        if (t.* == null) j.run();
+    }
+    for (threads) |t| if (t) |th| th.join();
+    for (jobs, 0..) |j, i| if (j.bad) |g| {
+        std.log.warn("inkling2: a draft weight is not finite (row {d}, group {d})", .{ i * per + g / groups, g % groups });
+        return error.NonFiniteDraftWeight;
+    };
+    return .{ .buf = buf, .scales = at[0], .biases = at[1], .n = @intCast(n), .k = @intCast(k) };
+}
+
+/// Where a layer's projections come from: the checkpoint's bf16 views, or each one read from the file into `scratch`, quantized,
+/// and its buffer handed to the checkpoint.
+const Projections = struct {
+    gpa: std.mem.Allocator,
+    device: mtl.Device,
+    c: *ck.Checkpoint,
+    bits: Bits,
+    scratch: []u16 = &.{}, // a deferred projection's bf16 values as read, room for the largest so far
+
+    fn deinit(p: *Projections) void {
+        p.gpa.free(p.scratch);
+    }
+
+    /// The [n, k] projection `name`.
+    fn at(p: *Projections, name: []const u8, n: usize, k: usize) !Proj {
+        if (p.bits == .sixteen) return .{ .bf16 = try wts.dense(p.c, name, n, k) };
+        const d = p.c.deferred.get(name) orelse {
+            std.log.err("inkling2: {s} is not a tensor of {s}", .{ name, file_name });
+            return error.UnexpectedInkling2Tensor;
+        };
+        if (d.dtype != .bf16 or d.rank != 2 or d.shape[0] != n or d.shape[1] != k or d.bytes != n * k * 2) {
+            std.log.err("inkling2: {s} is not bf16[{d}, {d}]", .{ name, n, k });
+            return error.UnexpectedInkling2Tensor;
+        }
+        if (p.scratch.len < n * k) {
+            p.gpa.free(p.scratch);
+            p.scratch = &.{};
+            p.scratch = try p.gpa.alloc(u16, n * k);
+        }
+        const src = p.scratch[0 .. n * k];
+        try p.c.read(name, 0, std.mem.sliceAsBytes(src));
+        const q = try quantize(p.gpa, p.device, src, n, k);
+        p.c.own(q.buf, Quant.bytes(n, k)) catch |err| {
+            q.buf.deinit();
+            return err;
+        };
+        return .{ .q8 = q };
+    }
+};
+
+fn layerTensors(c: *const ck.Checkpoint, p: *Projections, m: config.Mtp, i: usize) !Layer {
     const h: usize = m.hidden;
     const d: usize = m.head_dim;
     const qw: usize = @as(usize, m.q_heads) * d;
@@ -90,22 +260,24 @@ fn layerTensors(c: *const ck.Checkpoint, m: config.Mtp, i: usize) !Layer {
         .q_norm = try wts.tensor(c, try N.at(&b, i, "self_attn.q_norm.weight"), .bf16, &.{d}),
         .k_norm = try wts.tensor(c, try N.at(&b, i, "self_attn.k_norm.weight"), .bf16, &.{d}),
         .k_norm_ctx = try wts.tensor(c, try N.at(&b, i, "self_attn.k_norm_ctx.weight"), .bf16, &.{d}),
-        .q = try wts.dense(c, try N.at(&b, i, "self_attn.q_proj.weight"), qw, h),
-        .k = try wts.dense(c, try N.at(&b, i, "self_attn.k_proj.weight"), kvw, h),
-        .v = try wts.dense(c, try N.at(&b, i, "self_attn.v_proj.weight"), kvw, h),
-        .k_ctx = try wts.dense(c, try N.at(&b, i, "self_attn.k_proj_ctx.weight"), kvw, h),
-        .v_ctx = try wts.dense(c, try N.at(&b, i, "self_attn.v_proj_ctx.weight"), kvw, h),
-        .o = try wts.dense(c, try N.at(&b, i, "self_attn.o_proj.weight"), h, qw),
-        .gate = try wts.dense(c, try N.at(&b, i, "mlp.gate_proj.weight"), inter, h),
-        .up = try wts.dense(c, try N.at(&b, i, "mlp.up_proj.weight"), inter, h),
-        .down = try wts.dense(c, try N.at(&b, i, "mlp.down_proj.weight"), h, inter),
+        .q = try p.at(try N.at(&b, i, "self_attn.q_proj.weight"), qw, h),
+        .k = try p.at(try N.at(&b, i, "self_attn.k_proj.weight"), kvw, h),
+        .v = try p.at(try N.at(&b, i, "self_attn.v_proj.weight"), kvw, h),
+        .k_ctx = try p.at(try N.at(&b, i, "self_attn.k_proj_ctx.weight"), kvw, h),
+        .v_ctx = try p.at(try N.at(&b, i, "self_attn.v_proj_ctx.weight"), kvw, h),
+        .o = try p.at(try N.at(&b, i, "self_attn.o_proj.weight"), h, qw),
+        .gate = try p.at(try N.at(&b, i, "mlp.gate_proj.weight"), inter, h),
+        .up = try p.at(try N.at(&b, i, "mlp.up_proj.weight"), inter, h),
+        .down = try p.at(try N.at(&b, i, "mlp.down_proj.weight"), h, inter),
     };
 }
 
 /// The draft head in `dir`'s mtp.safetensors, added to `c` (names unprefixed, so the draft's `layers.N.` and `norm.weight`
 /// stay apart from the backbone's `model.llm.` ones). Null when the folder has no such file (the draft stays off).
-/// Every tensor is checked for its name, bf16 and shape against `m`; the mix rows are fuse_weight's.
-pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Checkpoint, dir: []const u8, m: config.Mtp) !?Weights {
+/// Every tensor is checked for its name, bf16 and shape against `m`; the mix rows are fuse_weight's. With `bits` eight, the
+/// layers' nine projections each stay in the file until they are read, quantized (quantize) and given to `c` as buffers of their
+/// own, so the bf16 values are never resident; the file's other tensors are one shard, as at bf16.
+pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Checkpoint, dir: []const u8, m: config.Mtp, bits: Bits) !?Weights {
     const path = try std.fs.path.joinZ(gpa, &.{ dir, file_name });
     defer gpa.free(path);
     std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
@@ -120,7 +292,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Check
     const h: usize = m.hidden;
     const rank: usize = m.rank;
     const before = c.residentBytes();
-    try c.addFile(device, path, "");
+    if (bits == .eight) try c.addFileSplit(device, path, "", null, isProjection) else try c.addFile(device, path, "");
     const fuse = try wts.tensor(c, "fuse_weight", .bf16, &.{ rows, taps });
     const markov: Markov = .{
         .dflare = try wts.tensor(c, "markov_head.dflare_norm.weight", .bf16, &.{h}),
@@ -134,9 +306,13 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Check
     const norm = try wts.tensor(c, "norm.weight", .bf16, &.{h});
     const layers = try gpa.alloc(Layer, m.layers);
     errdefer gpa.free(layers);
-    for (layers, 0..) |*l, i| l.* = try layerTensors(c, m, i);
+    var projections: Projections = .{ .gpa = gpa, .device = device, .c = c, .bits = bits };
+    defer projections.deinit();
+    for (layers, 0..) |*l, i| l.* = try layerTensors(c, &projections, m, i);
+    if (bits == .eight) c.closeFiles();
     var w: Weights = .{
         .layers = layers,
+        .bits = bits,
         .alpha = std.mem.zeroes([mix.max_rows][mix.max_taps]u16),
         .alpha_buffer = try device.buffer(rows * taps * @sizeOf(u16), mtl.ResourceOptions.shared),
         .rows = @intCast(rows),

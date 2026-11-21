@@ -6,6 +6,9 @@ const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
 const h = @import("harness.zig");
+const tf = @import("tensorfold");
+const dws = tf.inkling2.dspark_weights;
+const Qmv = tf.inkling2.dspark_qmv.Qmv;
 
 const H = 4608;
 const D = 128;
@@ -100,6 +103,7 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseGru(c, r);
     try caseFold(c, r);
     try caseFoldT(c, r);
+    try caseQmv(c, r);
     try timeAttn(c, r);
 }
 
@@ -978,4 +982,153 @@ fn caseFoldT(c: Ctx, r: std.Random) !void {
         if (vocab == V) try c.time("ikd_fold_t, 257 x 201024", "ikd_fold_t", &.{ bytes(&a), bs(y), bs(fw), bs(fb) }, .{ (vocab + 31) / 32, 1, 1 }, .{ 256, 1, 1 }, 10);
     }
     try ch.done();
+}
+
+// ---- the 8-bit projections' tiles ----
+
+/// What `Qmv` encodes for the draft layers' quantized projections (core's row-exact tiles) against FP64 over the dequantized weights
+/// `scale * code + bias` of the host quantizer, at the five shapes of a draft layer and 1 to 33 rows: f32 sums and one rounding to
+/// bf16, so an output is within a bf16 step of its reference (or within f32's error of the terms' size, where the sum cancels toward
+/// zero); and a row's bits are the same alone, among 3 rows, 8, 17 and 33. A zero, an all-positive and an all-negative group of the
+/// weights are in the first rows. Then each shape's time at 8 rows, against the bf16 matvec of the same shape.
+fn caseQmv(c: Ctx, r: std.Random) !void {
+    const g = c.g;
+    const gpa = std.heap.page_allocator;
+    var qmv = try Qmv.init(g.device);
+    defer qmv.deinit();
+    const shapes = [_][2]usize{ .{ 6144, H }, .{ 1024, H }, .{ H, 6144 }, .{ 18432, H }, .{ H, 18432 } };
+    const variants = [_]usize{ 33, 8, 1, 3, 9, 16, 17 };
+    const most = variants[0];
+    var ch: h.Check = .{ .name = "qmv (8-bit tiles)" };
+    var off: usize = 0;
+    var outputs: usize = 0;
+    for (shapes) |shape| {
+        const n, const k = shape;
+        const groups = k / 64;
+        const w = try g.buf(n * k * 2);
+        const x = try g.buf(most * k * 2);
+        const y = try g.buf(most * n * 2);
+        defer for ([_]mtl.Buffer{ w, x, y }) |b| b.deinit();
+        const wv = h.fill16(w, n * k, r, 0.1);
+        for (0..64) |i| {
+            wv[0 * k + 0 * 64 + i] = 0;
+            wv[1 * k + 1 * 64 + i] = h.bf(0.01 + @as(f64, @floatFromInt(i)) * 0.001);
+            wv[2 * k + 2 * 64 + i] = h.bf(-0.01 - @as(f64, @floatFromInt(i)) * 0.001);
+        }
+        const xv = h.fill16(x, most * k, r, 2.0);
+        const q = try dws.quantize(gpa, g.device, wv, n, k);
+        defer q.buf.deinit();
+        const mem = q.buf.contents();
+        const codes = mem[0 .. n * k];
+        const scales = @as([*]const u16, @ptrCast(@alignCast(mem + q.scales)))[0 .. n * groups];
+        const biases = @as([*]const u16, @ptrCast(@alignCast(mem + q.biases)))[0 .. n * groups];
+        // the reference over a spread of columns, every row
+        const step = @max(1, n / 400);
+        var cols: std.ArrayList(usize) = .empty;
+        defer cols.deinit(gpa);
+        for (0..n) |j| if (j % step == 0 or j == n - 1) try cols.append(gpa, j);
+        const want = try gpa.alloc(f64, most * cols.items.len);
+        defer gpa.free(want);
+        const mag = try gpa.alloc(f64, most * cols.items.len);
+        defer gpa.free(mag);
+        for (cols.items, 0..) |j, ci| for (0..most) |row| {
+            var sum: f64 = 0;
+            var size: f64 = 0;
+            for (0..k) |kk| {
+                const gi = j * groups + kk / 64;
+                const dq = h.fb(scales[gi]) * @as(f64, @floatFromInt(codes[j * k + kk])) + h.fb(biases[gi]);
+                const term = h.fb(xv[row * k + kk]) * dq;
+                sum += term;
+                size += @abs(term);
+            }
+            want[row * cols.items.len + ci] = sum;
+            mag[row * cols.items.len + ci] = size;
+        };
+        const batch = try gpa.alloc(u16, most * n);
+        defer gpa.free(batch);
+        for (variants) |rows| {
+            @memset(y.slice(u16, most * n), NAN16);
+            const cb = g.queue.commandBuffer();
+            const e = cb.compute(.serial);
+            try qmv.encode(e, q, .{ .buf = x }, .{ .buf = y }, rows);
+            e.end();
+            cb.commit();
+            cb.wait();
+            if (cb.failure()) |msg| {
+                std.log.err("qmv: {s}", .{msg});
+                return error.GpuFailed;
+            }
+            const got = y.slice(u16, most * n);
+            if (rows == most) {
+                @memcpy(batch, got);
+                for (cols.items, 0..) |j, ci| for (0..rows) |row| {
+                    pinnedAbs(&ch, &off, got[row * n + j], want[row * cols.items.len + ci], mag[row * cols.items.len + ci] * 4e-6);
+                    outputs += 1;
+                };
+            }
+            // every row's bits are the batch's, and the rows past the call are untouched
+            ch.same(std.mem.sliceAsBytes(got[0 .. rows * n]), std.mem.sliceAsBytes(batch[0 .. rows * n]));
+            for (got[rows * n ..]) |v| ch.same(std.mem.asBytes(&v), std.mem.asBytes(&NAN16));
+        }
+    }
+    pin(&ch, off, outputs);
+    try ch.done();
+    for (shapes) |shape| try timeQmv(c, &qmv, shape[0], shape[1], r);
+}
+
+/// One matvec of 8 rows at [n, k], the least GPU time of a few trials of dependent dispatches over six copies of the weights (so
+/// the weights come from memory, not cache): the 8-bit tiles, and the bf16 `ik_matvec_8` the layer runs without them.
+fn timeQmv(c: Ctx, qmv: *Qmv, n: usize, k: usize, r: std.Random) !void {
+    const g = c.g;
+    const gpa = std.heap.page_allocator;
+    const copies = 6;
+    const reps = 36;
+    const rows = 8;
+    const x = try g.buf(rows * k * 2);
+    const y = try g.buf(rows * n * 2);
+    defer for ([_]mtl.Buffer{ x, y }) |b| b.deinit();
+    _ = h.fill16(x, rows * k, r, 2.0);
+    var wb: [copies]mtl.Buffer = undefined;
+    var wq: [copies]dws.Quant = undefined;
+    for (0..copies) |i| {
+        wb[i] = try g.buf(n * k * 2);
+        const wv = h.fill16(wb[i], n * k, r, 0.1);
+        wq[i] = try dws.quantize(gpa, g.device, wv, n, k);
+    }
+    defer for (0..copies) |i| {
+        wb[i].deinit();
+        wq[i].buf.deinit();
+    };
+    var q8: f64 = 1e9;
+    var bf: f64 = 1e9;
+    const p = try mtl.Pipeline.init(g.device, g.lib, "ik_matvec_8", false);
+    defer p.deinit();
+    const MvArgs = extern struct { rows: u32, n: u32, k: u32, ldy: u32 };
+    for (0..5) |_| {
+        for ([_]bool{ true, false }) |quant| {
+            const cb = g.queue.commandBuffer();
+            const e = cb.compute(.serial);
+            for (0..reps) |i| {
+                if (quant) {
+                    try qmv.encode(e, wq[i % copies], .{ .buf = x }, .{ .buf = y }, rows);
+                } else {
+                    e.setPipeline(p);
+                    e.setBuffer(x, 0, 0);
+                    e.setBuffer(wb[i % copies], 0, 1);
+                    e.setValue(MvArgs{ .rows = rows, .n = @intCast(n), .k = @intCast(k), .ldy = @intCast(n) }, 2);
+                    e.setBuffer(y, 0, 3);
+                    e.dispatchGroups(mtl.Size.of((n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+                }
+            }
+            e.end();
+            cb.commit();
+            cb.wait();
+            if (cb.failure()) |msg| {
+                std.log.err("qmv timing: {s}", .{msg});
+                return error.GpuFailed;
+            }
+            if (quant) q8 = @min(q8, cb.gpuSeconds()) else bf = @min(bf, cb.gpuSeconds());
+        }
+    }
+    std.debug.print("time qmv {d} x {d}, 8 rows: 8-bit {d:.2} us, bf16 matvec {d:.2} us\n", .{ n, k, q8 / reps * 1e6, bf / reps * 1e6 });
 }

@@ -6,7 +6,8 @@
 //! logits before the softcap, the padded vocabulary's mask and the argmax.
 //!
 //! The arithmetic is the reference's (omlx/patches/inkling2/dspark.py on mlx 0.32): kernels/metal/inkling2/dspark.metal holds the
-//! rounding points; the dense projections are the target's bf16 matvec kernels and its embedding and unembedding serve the block.
+//! rounding points; the layers' projections are the target's bf16 matvec kernels or, with the weights quantized at load (the
+//! default, as the reference runs them), core's 8-bit tiles (dspark_qmv.zig); the target's embedding and unembedding serve the block.
 //! An absorb commits its command buffer without waiting; the hold behind it runs after it on the same queue and is the round's one
 //! host wait. The hold's proposals do not depend on its depth: a depth takes the first proposals of the same block pass.
 const std = @import("std");
@@ -16,6 +17,7 @@ const mix = @import("dspark_alpha.zig");
 const ks = @import("kernel_sources");
 const cfg = @import("config.zig");
 const dw = @import("dspark_weights.zig");
+const Qmv = @import("dspark_qmv.zig").Qmv;
 const fwd = @import("forward.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
@@ -58,6 +60,9 @@ const pick_group = 256;
 /// The prior the depth rule starts from: how likely draft j is kept when drafts 1 to j - 1 were, over recorded greedy runs of
 /// the reference head.
 const prior = [max_depth]f64{ 0.857, 0.859, 0.861, 0.875, 0.901, 0.902, 0.905 };
+
+/// The fields of a draft layer that are projections (dw.Proj).
+const proj_fields = [_][]const u8{ "q", "k", "v", "k_ctx", "v_ctx", "o", "gate", "up", "down" };
 
 const kernel_names = [_][:0]const u8{ "ikd_mix", "ikd_ctx_prep", "ikd_block_prep", "ikd_attn_part", "ikd_attn_merge", "ikd_swiglu", "ikd_add", "ikd_rnn_proj", "ikd_gru", "ikd_fold_pick", "ikd_pick", "ikd_fold_t" };
 const Kernel = enum { mix, ctx_prep, block_prep, attn_part, attn_merge, swiglu, add, rnn_proj, gru, fold_pick, pick, fold_t };
@@ -156,7 +161,7 @@ const Scratch = struct {
     /// Every buffer made, and the block's input rows ready: row 0 is the pending token's embedding, each hold's to write, and
     /// rows 1 to 7 are the mask embedding.
     fn init(device: mtl.Device, vocab: usize, w: *const dw.Weights) !Scratch {
-        const sz = bytes(vocab, w.layers[0].gate.n);
+        const sz = bytes(vocab, w.layers[0].gate.n());
         var s: Scratch = undefined;
         s.capture = null;
         var done: [made.len]bool = @splat(false);
@@ -202,7 +207,7 @@ pub const Depth = union(enum) {
     auto,
 
     /// What an unset or blank setting means.
-    pub const default: Depth = .{ .fixed = 5 };
+    pub const default: Depth = .{ .fixed = 4 };
 
     /// The setting's text: null or blank is the default, `auto` (any case) or a whole number from 1 to `max_depth`.
     pub fn parse(text: ?[]const u8) error{BadDraftDepth}!Depth {
@@ -249,7 +254,7 @@ pub fn wrap(gpa: std.mem.Allocator, target: lanes.backend.Backend, d: *Drafter) 
 
 pub const Options = struct {
     /// Drafts a round at most (1 to 7): what `facts` offers the depth rule, and the cost of a draft is priced against.
-    depth: u32 = 5,
+    depth: u32 = 4,
 };
 
 pub const Drafter = struct {
@@ -261,6 +266,8 @@ pub const Drafter = struct {
     options: Options,
     pipes: [kernel_names.len]mtl.Pipeline,
     s: Scratch,
+    /// The tiles of the 8-bit projections, when the layers are quantized.
+    qmv: ?Qmv = null,
     lanes: std.AutoHashMapUnmanaged(*Stream, *Lane) = .empty,
     follow: ?mtl.ResidencySet.Follow = null,
     /// The last absorb's command buffer while it may still run (committed, not waited for).
@@ -297,6 +304,9 @@ pub const Drafter = struct {
             }
         }
         errdefer for (d.pipes) |p| p.deinit();
+        if (anyQuantized(weights)) d.qmv = try Qmv.init(device);
+        errdefer if (d.qmv) |*q| q.deinit();
+        try d.checkQuantized();
         try dw.fold(weights, &model.checkpoint, device, model.queue, model, d.pipe(.fold_t));
         d.s = try Scratch.init(device, model.config.text.vocab, weights);
         errdefer d.s.deinit();
@@ -311,6 +321,7 @@ pub const Drafter = struct {
         while (it.next()) |l| d.dropLane(l.*);
         d.lanes.deinit(d.gpa);
         d.s.deinit();
+        if (d.qmv) |*q| q.deinit();
         for (d.pipes) |p| p.deinit();
         d.gpa.destroy(d);
     }
@@ -326,6 +337,22 @@ pub const Drafter = struct {
             m.vocab == text.vocab and m.inter % 256 == 0;
         if (!ok) return false;
         return std.mem.eql(u32, m.taps[0 .. taps - 1], &fwd.tap_layers) and m.taps[taps - 1] == text.layers;
+    }
+
+    /// Whether any projection of the draft layers is quantized.
+    fn anyQuantized(w: *const dw.Weights) bool {
+        for (w.layers) |layer| inline for (proj_fields) |f| if (@field(layer, f) == .q8) return true;
+        return false;
+    }
+
+    /// Builds the tiles' variants the layers' quantized shapes ask for, at a row, a block and a window of rows: a shape they
+    /// cannot take is refused at the load, not in a round.
+    fn checkQuantized(d: *Drafter) !void {
+        const q: *Qmv = if (d.qmv) |*x| x else return;
+        for (d.w.layers) |layer| inline for (proj_fields) |f| switch (@field(layer, f)) {
+            .q8 => |x| for ([_]usize{ 1, block, absorb_rows }) |rows| try q.check(x, rows),
+            .bf16 => {},
+        };
     }
 
     /// Joins (or, with null, leaves) a residency set: the scratch and every lane's buffers, as lanes open and close.
@@ -487,6 +514,15 @@ pub const Drafter = struct {
         d.glue(e, .norm, .{ .rows = @intCast(rows), .width = hidden, .stride = hidden, .eps = d.mtp.eps }, &.{ in, t(w), out }, .{ rows, 1, 1 }, .{ 1024, 1, 1 }, true);
     }
 
+    /// `rows` rows of `in` through the projection `p` into `out`: the target's bf16 matvec kernels, or core's tiles for a
+    /// quantized one.
+    fn mv(d: *Drafter, e: mtl.ComputeEncoder, p: dw.Proj, in: B, out: B, rows: usize) !void {
+        switch (p) {
+            .bf16 => |x| fwd.matvec(e, d.model, x, in, out, rows),
+            .q8 => |x| try d.qmv.?.encode(e, x, in, out, rows),
+        }
+    }
+
     /// log2 of the rotary base, as mlx's rope takes it (the angle is the position times 2^(-(i / 64) * this)).
     fn rope(d: *const Drafter) f32 {
         return @floatCast(std.math.log2(@as(f64, d.mtp.rope_theta)));
@@ -494,15 +530,15 @@ pub const Drafter = struct {
 
     /// The context rows [p0, p0 + n) from `src` (rows of eight taps) into every layer's ring; `newest`: the last of them is the
     /// stream's newest committed row, whose Markov feature the hold reads.
-    fn encodeAbsorb(d: *const Drafter, e: mtl.ComputeEncoder, l: *const Lane, src: B, p0: u64, n: usize, newest: bool) void {
+    fn encodeAbsorb(d: *Drafter, e: mtl.ComputeEncoder, l: *const Lane, src: B, p0: u64, n: usize, newest: bool) !void {
         const s = &d.s;
         const ls = d.w.layers;
         const rows: u32 = @intCast(n);
         d.launch(e, .mix, MixArgs{ .rows = rows, .width = hidden, .tap_stride = taps * hidden, .mix_stride = rows * hidden, .eps = d.mtp.eps }, &.{ src, b(d.w.alpha_buffer), t(ls[0].dflare), t(ls[1].dflare), t(ls[2].dflare), t(ls[3].dflare), t(ls[4].dflare), t(d.w.markov.dflare), b(s.mixed) }, .{ n, mixes, 1 }, .{ 288, 1, 1 });
         for (ls, 0..) |*layer, i| {
             const mixed = bo(s.mixed, i * n * hidden * 2);
-            fwd.matvec(e, d.model, layer.k_ctx, mixed, b(s.kc), n);
-            fwd.matvec(e, d.model, layer.v_ctx, mixed, b(s.vc), n);
+            try d.mv(e, layer.k_ctx, mixed, b(s.kc), n);
+            try d.mv(e, layer.v_ctx, mixed, b(s.vc), n);
             const a = PrepArgs{ .rows = rows, .heads = heads, .kv = kv_heads, .pos = @intCast(p0), .ring = ring, .eps = d.mtp.eps, .base_log2 = d.rope() };
             d.launch(e, .ctx_prep, a, &.{ b(s.kc), b(s.vc), t(layer.k_norm_ctx), b(l.k[i]), b(l.v[i]) }, .{ n, 1, 1 }, .{ 256, 1, 1 });
         }
@@ -511,7 +547,7 @@ pub const Drafter = struct {
 
     /// The block for `it`: the pending token at the lane's end and seven mask rows through the five layers, the unembedding of
     /// rows 1 to 7, and `it.depth` Markov steps; the proposals land in the lane's token row after the pending token.
-    fn encodeHold(d: *const Drafter, e: mtl.ComputeEncoder, l: *const Lane, it: dr.Hold) void {
+    fn encodeHold(d: *Drafter, e: mtl.ComputeEncoder, l: *const Lane, it: dr.Hold) !void {
         const m = d.model;
         const s = &d.s;
         const text = &m.config.text;
@@ -524,22 +560,22 @@ pub const Drafter = struct {
         var prev = b(s.h0);
         for (d.w.layers, 0..) |*layer, i| {
             d.norm(e, layer.input, prev, b(s.x), block);
-            fwd.matvec(e, m, layer.q, b(s.x), b(s.q), block);
-            fwd.matvec(e, m, layer.k, b(s.x), b(s.k), block);
-            fwd.matvec(e, m, layer.v, b(s.x), b(s.v), block);
+            try d.mv(e, layer.q, b(s.x), b(s.q), block);
+            try d.mv(e, layer.k, b(s.x), b(s.k), block);
+            try d.mv(e, layer.v, b(s.x), b(s.v), block);
             const pa = PrepArgs{ .rows = block, .heads = heads, .kv = kv_heads, .pos = end, .ring = ring, .eps = eps, .base_log2 = d.rope() };
             d.launch(e, .block_prep, pa, &.{ b(s.q), b(s.k), b(s.v), t(layer.q_norm), t(layer.k_norm), b(s.qn), b(s.kb), b(s.vb) }, .{ (heads + kv_heads + 7) / 8, block, 1 }, .{ 256, 1, 1 });
             const aa = AttnArgs{ .heads = heads, .kv = kv_heads, .end = end, .window = win, .ring = ring, .blocks = blocks, .scale = @floatCast(1.0 / @sqrt(@as(f64, head_dim))) };
             d.launch(e, .attn_part, aa, &.{ b(s.qn), b(l.k[i]), b(l.v[i]), b(s.kb), b(s.vb), b(s.part) }, .{ kv_heads, 1, blocks }, .{ 192, 1, 1 });
             d.launch(e, .attn_merge, aa, &.{ b(s.part), b(s.att) }, .{ heads, block, 1 }, .{ 32, 1, 1 });
-            fwd.matvec(e, m, layer.o, b(s.att), b(s.y), block);
+            try d.mv(e, layer.o, b(s.att), b(s.y), block);
             const row_add = EwArgs{ .rows = block, .width = hidden };
             d.launch(e, .add, row_add, &.{ prev, b(s.y), b(s.h) }, .{ hidden / 256, block, 1 }, .{ 256, 1, 1 });
             d.norm(e, layer.post, b(s.h), b(s.x), block);
-            fwd.matvec(e, m, layer.gate, b(s.x), b(s.gate), block);
-            fwd.matvec(e, m, layer.up, b(s.x), b(s.up), block);
+            try d.mv(e, layer.gate, b(s.x), b(s.gate), block);
+            try d.mv(e, layer.up, b(s.x), b(s.up), block);
             d.launch(e, .swiglu, EwArgs{ .rows = block, .width = @intCast(inter) }, &.{ b(s.gate), b(s.up), b(s.act) }, .{ (inter + 255) / 256, block, 1 }, .{ 256, 1, 1 });
-            fwd.matvec(e, m, layer.down, b(s.act), b(s.y), block);
+            try d.mv(e, layer.down, b(s.act), b(s.y), block);
             d.launch(e, .add, row_add, &.{ b(s.h), b(s.y), b(s.h) }, .{ hidden / 256, block, 1 }, .{ 256, 1, 1 });
             prev = b(s.h);
         }
@@ -603,7 +639,10 @@ pub const Drafter = struct {
                     enc = cb.?.compute(.serial);
                 }
                 const n: usize = @intCast(@min(@as(u64, absorb_rows), end - at));
-                d.encodeAbsorb(enc, l, bo(src, @intCast(f.offset + (at - it.start) * tap_row_bytes)), at, n, at + n == end);
+                d.encodeAbsorb(enc, l, bo(src, @intCast(f.offset + (at - it.start) * tap_row_bytes)), at, n, at + n == end) catch |err| {
+                    enc.end(); // an open encoder may not be dropped
+                    return err;
+                };
                 at += n;
             }
             l.end = end;
@@ -636,7 +675,10 @@ pub const Drafter = struct {
             const l = d.lanes.get(it.stream).?;
             l.seq.slice(u32, block)[0] = it.pending;
             @memset(l.state.slice(u8, rank * 2), 0);
-            d.encodeHold(e, l, it);
+            d.encodeHold(e, l, it) catch |err| {
+                e.end();
+                return err;
+            };
         }
         e.end();
         const committed = fwd.seconds();
@@ -736,9 +778,12 @@ test "inkling2 dspark: the attention's blocks are the 256-key blocks that meet t
     }
 }
 
-test "inkling2 dspark: the depth setting is a whole number from 1 to 7 that fixes every round's drafts, auto, or 5 when unset" {
+test "inkling2 dspark: the depth setting is a whole number from 1 to 7 that fixes every round's drafts, auto, or 4 when unset" {
     const t = std.testing;
-    for ([_]?[]const u8{ null, "", "  \t" }) |text| try t.expectEqual(Depth{ .fixed = 5 }, try Depth.parse(text));
+    for ([_]?[]const u8{ null, "", "  \t" }) |text| try t.expectEqual(Depth{ .fixed = 4 }, try Depth.parse(text));
+    // the drafter's own default is the setting's, and what the load asks of the depth rule when nothing is set
+    try t.expectEqual(@as(u32, 4), (Options{}).depth);
+    try t.expectEqual(Depth.default.most(), (Options{}).depth);
     for (1..max_depth + 1) |n| {
         var buf: [4]u8 = undefined;
         const want: u8 = @intCast(n);

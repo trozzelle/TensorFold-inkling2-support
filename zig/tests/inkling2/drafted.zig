@@ -1,7 +1,7 @@
 //! tf-inkling-run's `greedy --drafts`: greedy decoding through the lane engine with the DSpark draft head in front of the target,
-//! as the server runs it (the same wrapper, facts, window costs and depth setting), so a drafted run's tokens can be set beside
-//! the plain `greedy` run's. The depth is INKLING_DRAFT_DEPTH's: 1 to 7 holds every round at it, `auto` lets the cost rule
-//! choose, and unset is 5.
+//! as the server runs it (the same wrapper, facts, window costs, depth setting and layer weights), so a drafted run's tokens can be
+//! set beside the plain `greedy` run's. The depth is INKLING_DRAFT_DEPTH's: 1 to 7 holds every round at it, `auto` lets the cost rule
+//! choose, and unset is 4; the layers are INKLING_DRAFT_BITS's: 8 (quantized at load, unset too) or 16 (bf16).
 const std = @import("std");
 const tf = @import("tensorfold");
 const ik = tf.inkling2;
@@ -19,7 +19,8 @@ pub fn greedy(init: std.process.Init, model_dir: []const u8, ids: []const u32, s
     if (steps == 0 or ids.len == 0) return error.ExpectedPromptAndSteps;
     const gpa = init.gpa;
     const depth = ik.dspark.Depth.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null) catch return error.DraftDepthIsOneToSevenOrAuto;
-    const m = try ik.Model.load(gpa, init.io, model_dir, .{ .drafts = true });
+    const bits = ik.dspark_weights.Bits.parse(if (std.c.getenv("INKLING_DRAFT_BITS")) |v| std.mem.span(v) else null) catch return error.DraftBitsIsEightOrSixteen;
+    const m = try ik.Model.load(gpa, init.io, model_dir, .{ .drafts = true, .draft_bits = bits });
     defer m.deinit();
     const weights: *ik.dspark_weights.Weights = if (m.draft) |*w| w else return error.NoDraftHead;
     const c = &m.config.text;
