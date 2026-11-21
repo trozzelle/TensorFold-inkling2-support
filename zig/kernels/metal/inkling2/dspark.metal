@@ -388,6 +388,7 @@ inline float ikd_dot8(const device bfloat* w, const device bfloat* x) {
 
 struct ikd_fold_args { uint vocab, valid, flags; float cap; };
 constant uint IKD_LOGITS = 1; // flags: also write every id's logit
+constant uint IKD_MASS = 2;   // flags: also write every group's mass, the sum over its ids of exp(logit - the group's best)
 
 // One step of a transposed sum over the simdgroup: v[0..2N) hold two halves of N slots, lanes with bit N set keep the upper
 // half, and each kept slot adds the partner lane's value for it.
@@ -414,16 +415,19 @@ inline float ikd_scatter(thread float* v, uint lane) {
 // Each id's logit and each group of 256 ids' best. bias = bf16(bf16(latent . fold_w[v]) + fold_b[v]) (the f32 dot rounds to bf16, the
 // bias add rounds again); logit = cap * tanh((base[v] + bias) / cap) in f32, -inf for v >= a.valid (the padded vocabulary); a group's
 // best is its largest logit, ties to the lower id (a NaN never wins). base [vocab] is the step's row of the unembedding output,
-// latent [256], fold_w [vocab][256], fold_b [vocab]; with IKD_LOGITS the logits go to `logits` as bf16. Dispatch ceil(vocab / 256)
-// groups of 256 threads: a simdgroup takes 32 ids, reading each one's row across its lanes (8 columns a lane) and summing the dots
-// by a transposed sum, so the lane l ends with id l's.
+// latent [256], fold_w [vocab][256], fold_b [vocab]; with IKD_LOGITS the logits go to `logits` as bf16. With IKD_MASS a group's mass
+// goes to mass[group]: each simdgroup's sum of exp(logit - its best) over its 32 ids (a masked id adds nothing), then the eight
+// simdgroups' sums, each scaled by exp(its best - the group's best), added in index order. Dispatch ceil(vocab / 256) groups of 256
+// threads: a simdgroup takes 32 ids, reading each one's row across its lanes (8 columns a lane) and summing the dots by a
+// transposed sum, so the lane l ends with id l's.
 [[kernel, max_total_threads_per_threadgroup(256)]] void ikd_fold_pick(constant ikd_fold_args& a [[buffer(0)]],
     const device bfloat* base [[buffer(1)]], const device bfloat* latent [[buffer(2)]], const device bfloat* fw [[buffer(3)]],
     const device bfloat* fb [[buffer(4)]], device float* best [[buffer(5)]], device uint* best_id [[buffer(6)]],
-    device bfloat* logits [[buffer(7)]], uint group [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    device bfloat* logits [[buffer(7)]], device float* mass [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+    uint t [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float vals[8];
   threadgroup uint ids[8];
+  threadgroup float sums[8];
   const uint v0 = group * 256 + sg * 32;
   const float4 l0 = float4(*(const device bfloat4*)(latent + 8 * lane)), l1 = float4(*(const device bfloat4*)(latent + 8 * lane + 4));
   float pd[32];
@@ -449,11 +453,16 @@ inline float ikd_scatter(thread float* v, uint lane) {
     score = v < a.valid ? precise::tanh(z / a.cap) * a.cap : -INFINITY;
     if (a.flags & IKD_LOGITS) logits[v] = bfloat(score);
   }
+  const float mine = score;
   uint at = v;
   for (ushort d = 16; d > 0; d >>= 1) {
     const float o = simd_shuffle_xor(score, d);
     const uint oi = simd_shuffle_xor(at, d);
     if (o > score || (o == score && oi < at)) { score = o; at = oi; }
+  }
+  if (a.flags & IKD_MASS) {
+    const float s = simd_sum(mine == -INFINITY ? 0.0f : precise::exp(mine - score)); // every lane holds the simdgroup's best now
+    if (lane == 0) sums[sg] = s;
   }
   if (lane == 0) { vals[sg] = score; ids[sg] = at; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -463,17 +472,28 @@ inline float ikd_scatter(thread float* v, uint lane) {
     for (uint k = 1; k < 8; ++k) if (vals[k] > b || (vals[k] == b && ids[k] < bi)) { b = vals[k]; bi = ids[k]; }
     best[group] = b;
     best_id[group] = bi;
+    if (a.flags & IKD_MASS) {
+      float m = 0.0f;
+      for (uint k = 0; k < 8; ++k) if (vals[k] != -INFINITY) m += sums[k] * precise::exp(vals[k] - b);
+      mass[group] = m;
+    }
   }
 }
 
-struct ikd_pick_args { uint groups, step; };
+struct ikd_pick_args { uint groups, step, flags; };
 
-// The step's proposal: the best of every group's best, ties to the lower id, into seq[a.step + 1]. One threadgroup of 1024 threads.
+// The step's proposal: the best of every group's best, ties to the lower id, into seq[a.step + 1]. With IKD_MASS also its probability
+// under the step's logits, prob[a.step] = 1 / sum over the vocabulary of exp(logit - the best logit), at most 1: each group's mass
+// scaled by exp(its best - the largest best), the 1,024 threads' partial sums added by simd_sum and the 32 simdgroups' by one more
+// (a fixed order, so every run gives the same bits). One threadgroup of 1024 threads.
 [[kernel, max_total_threads_per_threadgroup(1024)]] void ikd_pick(constant ikd_pick_args& a [[buffer(0)]],
     const device float* best [[buffer(1)]], const device uint* best_id [[buffer(2)]], device uint* seq [[buffer(3)]],
+    const device float* mass [[buffer(4)]], device float* prob [[buffer(5)]],
     uint t [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float vals[32];
   threadgroup uint ids[32];
+  threadgroup float top;
+  threadgroup float part[32];
   float b = -INFINITY;
   uint bi = 0xffffffffu;
   for (uint i = t; i < a.groups; i += 1024) if (best[i] > b || (best[i] == b && best_id[i] < bi)) { b = best[i]; bi = best_id[i]; }
@@ -484,15 +504,34 @@ struct ikd_pick_args { uint groups, step; };
   }
   if (lane == 0) { vals[sg] = b; ids[sg] = bi; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg != 0) return;
-  b = vals[lane];
-  bi = ids[lane];
-  for (ushort d = 16; d > 0; d >>= 1) {
-    const float o = simd_shuffle_xor(b, d);
-    const uint oi = simd_shuffle_xor(bi, d);
-    if (o > b || (o == b && oi < bi)) { b = o; bi = oi; }
+  const bool sum = (a.flags & IKD_MASS) != 0;
+  if (!sum && sg != 0) return;
+  if (sg == 0) {
+    b = vals[lane];
+    bi = ids[lane];
+    for (ushort d = 16; d > 0; d >>= 1) {
+      const float o = simd_shuffle_xor(b, d);
+      const uint oi = simd_shuffle_xor(bi, d);
+      if (o > b || (o == b && oi < bi)) { b = o; bi = oi; }
+    }
+    if (lane == 0) {
+      seq[a.step + 1] = bi;
+      top = b;
+    }
   }
-  if (lane == 0) seq[a.step + 1] = bi;
+  if (!sum) return;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float e = 0.0f;
+  for (uint i = t; i < a.groups; i += 1024) if (best[i] != -INFINITY) e += mass[i] * precise::exp(best[i] - top);
+  e = simd_sum(e);
+  if (lane == 0) part[sg] = e;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0) return;
+  const float total = simd_sum(part[lane]);
+  if (lane == 0) {
+    const float p = 1.0f / total;
+    prob[a.step] = p > 1.0f ? 1.0f : p;
+  }
 }
 
 struct ikd_t_args { uint vocab; };

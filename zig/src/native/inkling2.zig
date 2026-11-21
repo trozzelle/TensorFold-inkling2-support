@@ -49,12 +49,15 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = "--parallel: the Inkling 2 EXL3 engine serves one stream; give --parallel 1";
         return null;
     }
-    // how deep a round drafts and how wide the draft layers' weights are: only a load with drafts reads them, once
-    var depth: fl.dspark.Depth = .default;
+    // how a round drafts and how wide the draft layers' weights are: only a load with drafts reads them, once
+    var drafting: fl.dspark.Drafting = .{ .depth = .default };
     var bits: fl.dspark_weights.Bits = .default;
     if (o.drafts) {
-        depth = fl.dspark.Depth.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null) catch {
-            problem.* = "INKLING_DRAFT_DEPTH is not a draft depth: give a whole number from 1 to 7, or auto; unset it for 4";
+        drafting = fl.dspark.Drafting.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null, if (std.c.getenv("INKLING_DRAFT_CONFIDENCE")) |v| std.mem.span(v) else null) catch |err| {
+            problem.* = switch (err) {
+                error.BadDraftDepth => "INKLING_DRAFT_DEPTH is not a draft depth: give a whole number from 1 to 7, or auto; unset it for 7 (4 with INKLING_DRAFT_CONFIDENCE=off)",
+                error.BadDraftConfidence => "INKLING_DRAFT_CONFIDENCE is not a draft confidence: give a probability above 0 and below 1, or off to verify every draft a round holds; unset for 0.7",
+            };
             return null;
         };
         bits = fl.dspark_weights.Bits.parse(if (std.c.getenv("INKLING_DRAFT_BITS")) |v| std.mem.span(v) else null) catch {
@@ -74,17 +77,14 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     // the head before the budget: its fold joins the checkpoint's shards when it is made, and its scratch is known
     var draft: ?*fl.dspark.Drafter = null;
     if (model.draft) |*head_weights| {
-        draft = fl.dspark.Drafter.init(gpa, model.device, model, head_weights, .{ .depth = depth.most() }) catch |err| {
+        draft = fl.dspark.Drafter.init(gpa, model.device, model, head_weights, drafting.options()) catch |err| {
             problem.* = try std.fmt.allocPrint(a, "the Inkling 2 draft head cannot start ({s}); --no-drafts serves without it", .{@errorName(err)});
             model.deinit();
             return null;
         };
     } else if (o.drafts) std.log.info("inkling2: no draft head loaded; serving plain and copy-drafted rounds", .{});
     errdefer if (draft) |d| d.deinit();
-    if (draft) |d| switch (depth) {
-        .fixed => |n| std.log.info("inkling2: DSpark draft head, {s} layers, {d} drafts a round, {d:.2} GiB resident", .{ d.w.bits.label(), n, gib(d.residentBytes(1)) }),
-        .auto => std.log.info("inkling2: DSpark draft head, {s} layers, 1 to {d} drafts a round chosen by the cost rule, {d:.2} GiB resident", .{ d.w.bits.label(), depth.most(), gib(d.residentBytes(1)) }),
-    };
+    if (draft) |d| std.log.info("inkling2: DSpark draft head, {s} layers, {s}, {d:.2} GiB resident", .{ d.w.bits.label(), try drafting.describe(a), gib(d.residentBytes(1)) });
     // refusals that return null free what they hold themselves: errdefer runs only for errors
     var ram: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -136,7 +136,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         try h.metal.measure();
         var text: [256]u8 = undefined;
         std.log.info("inkling2: window forwards by rows, ms: {s}", .{costsText(&text, h.metal.facts().window_costs)});
-        facts = fl.dspark.laneFacts(&h.wrap.?, h.metal.facts(), depth);
+        facts = fl.dspark.laneFacts(&h.wrap.?, h.metal.facts(), drafting.depth);
     }
     h.config = try lanes.Config.init(gpa, facts, fl.state.window_rows, fl.state.window_rows - 1);
     errdefer h.config.deinit(gpa);

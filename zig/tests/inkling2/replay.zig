@@ -3,6 +3,8 @@
 //! prompt's rows are absorbed and a block is held after it (the anchor is the token after the prompt's last row); then, one
 //! generated row at a time, the row is absorbed and a block held with the next token as anchor. It writes
 //!   seq-NNNNN.props.bin   int32 [T][7]: the proposals made after committed row p in row p, -1 where no hold ran
+//!   seq-NNNNN.probs.bin   f32 [T][7]: the probability of each of those proposals under its step's logits (the top-1 probability of
+//!                         the softcapped, vocabulary-masked row: 1 / sum_v exp(logit_v - the largest)), -1 where no hold ran
 //!   seq-NNNNN.logits.bin  bf16 [16][7][vocab]: the first 16 holds' steps' logits after the bias, the softcap and the padded
 //!                         vocabulary's mask
 //! The model loads without its layers (the embedding, the unembedding and the draft head: about 8 GB with bf16 draft layers,
@@ -64,7 +66,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     const weights: *ik.dspark_weights.Weights = if (m.draft) |*w| w else return error.NoDraftHead;
     const loaded = now();
-    const drafter = try ik.dspark.Drafter.init(init.gpa, m.device, m, weights, .{ .depth = depth });
+    const drafter = try ik.dspark.Drafter.init(init.gpa, m.device, m, weights, .{ .depth = depth, .probabilities = true });
     defer drafter.deinit();
     try drafter.captureLogits();
     std.debug.print("{{\"load_s\": {d:.1}, \"drafter_s\": {d:.1}, \"depth\": {d}, \"bits\": {d}, \"hold_ms\": {d:.3}, \"step_ms\": {d:.3}, \"resident_gib\": {d:.2}, \"head_gib\": {d:.3}}}\n", .{ loaded - t0, now() - loaded, depth, @backingInt(bits), drafter.hold_ms, drafter.step_ms, @as(f64, @floatFromInt(m.checkpoint.residentBytes() + drafter.scratchBytes())) / (1 << 30), @as(f64, @floatFromInt(drafter.residentBytes(1))) / (1 << 30) });
@@ -75,7 +77,7 @@ fn path(gpa: std.mem.Allocator, dir: []const u8, seq: usize, suffix: []const u8)
     return std.fmt.allocPrint(gpa, "{s}/seq-{d:0>5}.{s}", .{ dir, seq, suffix });
 }
 
-/// One sequence: the prompt, then every generated row, written as `props.bin` and `logits.bin` under `out_dir`.
+/// One sequence: the prompt, then every generated row, written as `props.bin`, `probs.bin` and `logits.bin` under `out_dir`.
 fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, taps_dir: []const u8, out_dir: []const u8, seq: usize, depth: u32) !void {
     const gpa = init.gpa;
     const began = now();
@@ -104,6 +106,9 @@ fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, tap
     const props = try gpa.alloc(i32, T * steps);
     defer gpa.free(props);
     @memset(props, -1);
+    const probs = try gpa.alloc(f32, T * steps);
+    defer gpa.free(probs);
+    @memset(probs, -1);
     const logits = try gpa.alloc(u16, saved_holds * steps * vocab);
     defer gpa.free(logits);
     @memset(logits, 0);
@@ -123,6 +128,9 @@ fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, tap
         var held: [steps]u32 = undefined;
         try dv.held(&.{&stream}, &.{held[0..depth]});
         for (held[0..depth], props[p * steps ..][0..depth]) |x, *y| y.* = @intCast(x);
+        var chances: [steps]f64 = undefined;
+        if (!try dv.chances(&stream, chances[0..depth])) return error.NoDraftProbabilities;
+        for (chances[0..depth], probs[p * steps ..][0..depth]) |x, *y| y.* = @floatCast(x);
         if (holds < saved_holds) @memcpy(logits[holds * steps * vocab ..][0 .. depth * vocab], drafter.captured()[0 .. depth * vocab]);
         holds += 1;
         next = p + 1;
@@ -130,6 +138,9 @@ fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, tap
     const props_path = try path(gpa, out_dir, seq, "props.bin");
     defer gpa.free(props_path);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = props_path, .data = std.mem.sliceAsBytes(props) });
+    const probs_path = try path(gpa, out_dir, seq, "probs.bin");
+    defer gpa.free(probs_path);
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = probs_path, .data = std.mem.sliceAsBytes(probs) });
     const logits_path = try path(gpa, out_dir, seq, "logits.bin");
     defer gpa.free(logits_path);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = logits_path, .data = std.mem.sliceAsBytes(logits) });

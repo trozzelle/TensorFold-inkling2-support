@@ -1,7 +1,10 @@
 //! tf-inkling-run's `greedy --drafts`: greedy decoding through the lane engine with the DSpark draft head in front of the target,
-//! as the server runs it (the same wrapper, facts, window costs, depth setting and layer weights), so a drafted run's tokens can be
-//! set beside the plain `greedy` run's. The depth is INKLING_DRAFT_DEPTH's: 1 to 7 holds every round at it, `auto` lets the cost rule
-//! choose, and unset is 4; the layers are INKLING_DRAFT_BITS's: 8 (quantized at load, unset too) or 16 (bf16).
+//! as the server runs it (the same wrapper, facts, window costs, depth and confidence settings and layer weights), so a drafted run's
+//! tokens can be set beside the plain `greedy` run's. INKLING_DRAFT_CONFIDENCE is a probability above 0 and below 1, 0.7 when unset:
+//! every round holds the deepest chain, 7 drafts when INKLING_DRAFT_DEPTH is unset and at most the number it gives, and verifies the
+//! first draft and each next one while its own probability is at least that. With `off` every draft held is verified, and the depth
+//! is INKLING_DRAFT_DEPTH's: 1 to 7 holds every round at it, `auto` lets the cost rule choose, and unset is 4. The layers are
+//! INKLING_DRAFT_BITS's: 8 (quantized at load, unset too) or 16 (bf16).
 const std = @import("std");
 const tf = @import("tensorfold");
 const ik = tf.inkling2;
@@ -18,13 +21,16 @@ fn now() f64 {
 pub fn greedy(init: std.process.Init, model_dir: []const u8, ids: []const u32, steps: usize) !void {
     if (steps == 0 or ids.len == 0) return error.ExpectedPromptAndSteps;
     const gpa = init.gpa;
-    const depth = ik.dspark.Depth.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null) catch return error.DraftDepthIsOneToSevenOrAuto;
+    const drafting = ik.dspark.Drafting.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null, if (std.c.getenv("INKLING_DRAFT_CONFIDENCE")) |v| std.mem.span(v) else null) catch |err| return switch (err) {
+        error.BadDraftDepth => error.DraftDepthIsOneToSevenOrAuto,
+        error.BadDraftConfidence => error.DraftConfidenceIsAboveZeroAndBelowOneOrOff,
+    };
     const bits = ik.dspark_weights.Bits.parse(if (std.c.getenv("INKLING_DRAFT_BITS")) |v| std.mem.span(v) else null) catch return error.DraftBitsIsEightOrSixteen;
     const m = try ik.Model.load(gpa, init.io, model_dir, .{ .drafts = true, .draft_bits = bits });
     defer m.deinit();
     const weights: *ik.dspark_weights.Weights = if (m.draft) |*w| w else return error.NoDraftHead;
     const c = &m.config.text;
-    const drafter = try ik.dspark.Drafter.init(gpa, m.device, m, weights, .{ .depth = depth.most() });
+    const drafter = try ik.dspark.Drafter.init(gpa, m.device, m, weights, drafting.options());
     defer drafter.deinit();
     // one stream's cache, for the prompt and the tokens after it
     const capacity = ids.len + steps;
@@ -34,7 +40,7 @@ pub fn greedy(init: std.process.Init, model_dir: []const u8, ids: []const u32, s
     var drafted = try ik.dspark.wrap(gpa, metal.backend(), drafter);
     defer drafted.deinit();
     try metal.measure();
-    var cfg = try lanes.Config.init(gpa, ik.dspark.laneFacts(&drafted, metal.facts(), depth), ik.state.window_rows, ik.state.window_rows - 1);
+    var cfg = try lanes.Config.init(gpa, ik.dspark.laneFacts(&drafted, metal.facts(), drafting.depth), ik.state.window_rows, ik.state.window_rows - 1);
     defer cfg.deinit(gpa);
     var clock: lanes.backend.WallClock = .{ .io = init.io };
     var engine = lanes.Engine.init(gpa, &cfg, drafted.backend(), clock.clock());
@@ -54,9 +60,10 @@ pub fn greedy(init: std.process.Init, model_dir: []const u8, ids: []const u32, s
     try std.json.Stringify.value(tokens, .{}, &w.writer);
     const decoded: f64 = @floatFromInt(tokens.len - @min(first, tokens.len));
     std.debug.print("{s}\n{{\"prompt_tokens\": {d}, \"prompt_ms\": {d:.0}, \"steps\": {d}, \"tokens\": {d}, \"tok_s\": {d:.2}, \"rounds\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"drafts\": true, \"depth\": ", .{ w.written(), ids.len, prompt_ms, steps, tokens.len, decoded / secs, stream.rounds, stream.drafted, stream.accepted });
-    switch (depth) {
-        .fixed => |n| std.debug.print("{d}}}\n", .{n}),
-        .auto => std.debug.print("\"auto\"}}\n", .{}),
+    switch (drafting.depth) {
+        .fixed => |n| std.debug.print("{d}", .{n}),
+        .auto => std.debug.print("\"auto\"", .{}),
     }
+    if (drafting.confidence) |floor| std.debug.print(", \"confidence\": {d}}}\n", .{floor}) else std.debug.print(", \"confidence\": null}}\n", .{});
     if (tokens.len != steps) return error.DraftedRunEndedShort;
 }

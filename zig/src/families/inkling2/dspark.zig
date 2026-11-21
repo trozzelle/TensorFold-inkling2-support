@@ -80,9 +80,10 @@ const AttnArgs = extern struct { heads: u32, kv: u32, end: u32, window: u32, rin
 const EwArgs = extern struct { rows: u32, width: u32 };
 const ProjArgs = extern struct { n: u32, at: u32 };
 const FoldArgs = extern struct { vocab: u32, valid: u32, flags: u32, cap: f32 };
-const PickArgs = extern struct { groups: u32, step: u32 };
-/// ikd_fold_pick's flag: also write every id's logit.
+const PickArgs = extern struct { groups: u32, step: u32, flags: u32 };
+/// ikd_fold_pick's flags: also write every id's logit, and (with ikd_pick's) the step's probability of the pick.
 const write_logits: u32 = 1;
+const write_mass: u32 = 2;
 
 /// Blocks a (row, head) of the attention has when the block starts at position `end` and attends the newest `win` positions
 /// before it: the 256-key blocks, anchored at absolute positions, that meet [end - win, end), then the block's own keys; just
@@ -120,11 +121,12 @@ const Scratch = struct {
     latent: mtl.Buffer, // [rank]
     best: mtl.Buffer, // f32 [groups]: each group of ids' best logit and its id
     best_id: mtl.Buffer, // u32 [groups]
+    mass: mtl.Buffer, // f32 [groups]: each group's sum of exp(logit - its best), for the probability of the pick
     /// The steps' logits, when asked for: bf16 [7][vocab].
     capture: ?mtl.Buffer = null,
 
     /// The buffers made up front, in `bytes`' order.
-    const made = [_][]const u8{ "mixed", "kc", "vc", "h0", "h", "x", "y", "q", "qn", "att", "k", "v", "kb", "vb", "gate", "up", "act", "part", "hn", "base", "proj", "latent", "best", "best_id" };
+    const made = [_][]const u8{ "mixed", "kc", "vc", "h0", "h", "x", "y", "q", "qn", "att", "k", "v", "kb", "vb", "gate", "up", "act", "part", "hn", "base", "proj", "latent", "best", "best_id", "mass" };
 
     /// Bytes of each buffer for a vocabulary of `vocab` ids and an MLP of width `inter`.
     fn bytes(vocab: usize, inter: usize) [made.len]usize {
@@ -153,6 +155,7 @@ const Scratch = struct {
             max_depth * vocab * 2,
             3 * rank * 2,
             rank * 2,
+            groups * 4,
             groups * 4,
             groups * 4,
         };
@@ -185,14 +188,15 @@ comptime {
     std.debug.assert(@typeInfo(Scratch).@"struct".field_names.len == Scratch.made.len + 1);
 }
 
-/// One stream's draft state: each layer's context ring, the Markov feature of its newest absorbed row, the GRU's state and
-/// the hold's token row (the pending token, then its proposals).
+/// One stream's draft state: each layer's context ring, the Markov feature of its newest absorbed row, the GRU's state, the
+/// hold's token row (the pending token, then its proposals) and the probability of each proposal under its step's logits.
 const Lane = struct {
     k: [draft_layers]mtl.Buffer,
     v: [draft_layers]mtl.Buffer,
     f_rnn: mtl.Buffer,
     state: mtl.Buffer,
     seq: mtl.Buffer,
+    prob: mtl.Buffer, // f32 [8]: step k's at k, written when the drafter keeps probabilities
     end: u64 = 0, // context rows absorbed: positions [from, end)
     from: u64 = 0, // the first position held (a resumed prompt state's drafter context is not kept)
     held: [max_depth]u32 = @splat(0),
@@ -201,18 +205,25 @@ const Lane = struct {
 
 /// How deep a served round drafts (INKLING_DRAFT_DEPTH): a whole number from 1 to `max_depth` holds every round at that depth,
 /// `auto` leaves it to the lane core's cost rule, which chooses among 1 to `max_depth` by what the drafts and the window
-/// forwards cost.
+/// forwards cost. Unset it is `default` with the confidence floor off, and `max_depth` beside a floor (the served default: see
+/// `Drafting`).
 pub const Depth = union(enum) {
     fixed: u8,
     auto,
 
-    /// What an unset or blank setting means.
+    /// What an unset or blank setting means with no confidence floor.
     pub const default: Depth = .{ .fixed = 4 };
 
     /// The setting's text: null or blank is the default, `auto` (any case) or a whole number from 1 to `max_depth`.
     pub fn parse(text: ?[]const u8) error{BadDraftDepth}!Depth {
+        return parseFor(text, false);
+    }
+
+    /// `parse`, where an unset or blank setting beside a confidence floor (`confident`: the served default) is `max_depth`: the
+    /// floor decides how many of a hold's drafts a round verifies, and a number then caps what is held.
+    pub fn parseFor(text: ?[]const u8, confident: bool) error{BadDraftDepth}!Depth {
         const t = std.mem.trim(u8, text orelse "", " \t");
-        if (t.len == 0) return default;
+        if (t.len == 0) return if (confident) .{ .fixed = max_depth } else default;
         if (std.ascii.eqlIgnoreCase(t, "auto")) return .auto;
         const n = std.fmt.parseInt(u8, t, 10) catch return error.BadDraftDepth;
         if (n == 0 or n > max_depth) return error.BadDraftDepth;
@@ -236,6 +247,53 @@ pub const Depth = union(enum) {
     }
 };
 
+/// The floor for a draft's own probability (INKLING_DRAFT_CONFIDENCE): a round verifies a hold's first draft, then each next one
+/// only while its probability, the top-1 probability of its step's logits, is at least the floor, and stops at the first that is
+/// not. It is each draft's own probability, not the product of the drafts' before it. A served round has the floor `default`
+/// unless the setting names another or says `off`, which verifies every draft a round holds.
+pub const Confidence = struct {
+    /// What an unset or blank setting means.
+    pub const default: f64 = 0.7;
+
+    /// The setting's text: null or blank is `default`, `off` (any case) is no floor (null), else a number above 0 and below 1.
+    pub fn parse(text: ?[]const u8) error{BadDraftConfidence}!?f64 {
+        const t = std.mem.trim(u8, text orelse "", " \t");
+        if (t.len == 0) return default;
+        if (std.ascii.eqlIgnoreCase(t, "off")) return null;
+        const x = std.fmt.parseFloat(f64, t) catch return error.BadDraftConfidence;
+        if (!(x > 0 and x < 1)) return error.BadDraftConfidence;
+        return x;
+    }
+};
+
+/// What a served round drafts: INKLING_DRAFT_DEPTH and INKLING_DRAFT_CONFIDENCE read together. By default, with the floor of
+/// `Confidence.default`, every round holds the deepest chain `depth` allows (7 when INKLING_DRAFT_DEPTH is unset, else the number
+/// it gives, which caps it) and verifies as many of its drafts as the floor lets through; `auto` then holds 7 for a greedy stream.
+/// With the floor `off`, `depth` drafts are held and verified every round (4 when unset).
+pub const Drafting = struct {
+    depth: Depth,
+    confidence: ?f64 = null,
+
+    pub fn parse(depth_text: ?[]const u8, confidence_text: ?[]const u8) error{ BadDraftDepth, BadDraftConfidence }!Drafting {
+        const floor = try Confidence.parse(confidence_text);
+        return .{ .depth = try Depth.parseFor(depth_text, floor != null), .confidence = floor };
+    }
+
+    /// The drafter's options for this setting.
+    pub fn options(s: Drafting) Options {
+        return .{ .depth = s.depth.most(), .confidence = s.confidence };
+    }
+
+    /// The log's words for how a round drafts: the drafts held and the floor that lets some through, or that every one is verified.
+    pub fn describe(s: Drafting, a: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        const floor = s.confidence orelse return switch (s.depth) {
+            .fixed => |n| std.fmt.allocPrint(a, "{d} drafts a round, every draft verified", .{n}),
+            .auto => std.fmt.allocPrint(a, "1 to {d} drafts a round chosen by the cost rule, every draft verified", .{s.depth.most()}),
+        };
+        return std.fmt.allocPrint(a, "up to {d} drafts a round, the first verified and each next one while its own probability is at least {d}", .{ s.depth.most(), floor });
+    }
+};
+
 /// The lane core's facts for a load that drafts: `target`'s through `drafted` (the drafter's depth, step cost and prior among
 /// them) and `depth`'s fixed depth. `target` should carry the window forwards' timed costs, which the cost rule of `auto` reads.
 pub fn laneFacts(drafted: *const lanes.drafted.Drafted, target: lanes.Model, depth: Depth) lanes.Model {
@@ -255,6 +313,12 @@ pub fn wrap(gpa: std.mem.Allocator, target: lanes.backend.Backend, d: *Drafter) 
 pub const Options = struct {
     /// Drafts a round at most (1 to 7): what `facts` offers the depth rule, and the cost of a draft is priced against.
     depth: u32 = 4,
+    /// The floor above 0 and below 1 for a draft's own probability (see `Confidence`): `facts` asks the lane core to verify only
+    /// the drafts it lets through, and the drafter keeps each draft's probability for `chances`. Null (no floor unless the caller
+    /// gives one; `Drafting` is where the served default is) verifies every draft a hold makes.
+    confidence: ?f64 = null,
+    /// Keep each draft's probability for `chances` without a floor (the replay records them); `confidence` implies it.
+    probabilities: bool = false,
 };
 
 pub const Drafter = struct {
@@ -290,6 +354,7 @@ pub const Drafter = struct {
         const mtp = model.config.mtp orelse return error.NoDraftHead;
         if (!supported(&mtp, &model.config.text)) return error.UnsupportedDSpark;
         if (options.depth == 0 or options.depth > max_depth) return error.DraftDepth;
+        if (options.confidence) |c| if (!(c > 0 and c < 1)) return error.DraftConfidence;
         const d = try gpa.create(Drafter);
         errdefer gpa.destroy(d);
         d.* = .{ .gpa = gpa, .device = device, .model = model, .w = weights, .mtp = mtp, .options = options, .pipes = undefined, .s = undefined };
@@ -370,10 +435,10 @@ pub const Drafter = struct {
         }
     }
 
-    /// Device bytes one stream's draft state takes: ten rings, the Markov feature, the state and the token row.
+    /// Device bytes one stream's draft state takes: ten rings, the Markov feature, the state, the token row and the probabilities.
     pub fn laneBytes(d: *const Drafter) usize {
         _ = d;
-        return 2 * draft_layers * ringBytes() + hidden * 2 + rank * 2 + block * 4;
+        return 2 * draft_layers * ringBytes() + hidden * 2 + rank * 2 + block * 4 + block * 4;
     }
 
     /// Device bytes the head holds that no checkpoint shard counts: the scratch and `streams` streams' draft state.
@@ -398,7 +463,12 @@ pub const Drafter = struct {
     }
 
     pub fn drafter(d: *Drafter) dr.Drafter {
-        return .{ .kind = "DSpark draft head", .ptr = d, .vtable = &.{ .taps = tapsFn, .facts = factsFn, .open = openFn, .absorb = absorbFn, .hold = holdFn, .held = heldFn, .release = releaseFn } };
+        return .{ .kind = "DSpark draft head", .ptr = d, .vtable = &.{ .taps = tapsFn, .facts = factsFn, .open = openFn, .absorb = absorbFn, .hold = holdFn, .held = heldFn, .release = releaseFn, .chances = chancesFn } };
+    }
+
+    /// Whether a hold keeps each step's probability of its pick.
+    fn keepsProbabilities(d: *const Drafter) bool {
+        return d.options.probabilities or d.options.confidence != null;
     }
 
     fn cast(ptr: *anyopaque) *Drafter {
@@ -412,7 +482,7 @@ pub const Drafter = struct {
 
     fn factsFn(ptr: *anyopaque) dr.Facts {
         const d = cast(ptr);
-        return .{ .depth = d.options.depth, .step_ms = d.step_ms, .fixed_block = true, .plain_guard = true, .stream_bytes = d.laneBytes(), .prior = &prior };
+        return .{ .depth = d.options.depth, .step_ms = d.step_ms, .fixed_block = true, .plain_guard = true, .stream_bytes = d.laneBytes(), .prior = &prior, .chances = d.options.confidence != null, .confidence_floor = d.options.confidence };
     }
 
     fn ringBytes() usize {
@@ -422,20 +492,20 @@ pub const Drafter = struct {
     fn newLane(d: *Drafter) !*Lane {
         const l = try d.gpa.create(Lane);
         errdefer d.gpa.destroy(l);
-        var bufs: [2 * draft_layers + 3]mtl.Buffer = undefined;
+        var bufs: [2 * draft_layers + 4]mtl.Buffer = undefined;
         var made: usize = 0;
         errdefer for (bufs[0..made]) |x| x.deinit();
-        const small = [3]usize{ hidden * 2, rank * 2, block * 4 };
+        const small = [4]usize{ hidden * 2, rank * 2, block * 4, block * 4 };
         for (&bufs, 0..) |*x, i| {
             x.* = if (i < 2 * draft_layers) try d.device.buffer(ringBytes(), mtl.ResourceOptions.private) else try d.device.buffer(small[i - 2 * draft_layers], mtl.ResourceOptions.shared);
             made += 1;
         }
-        l.* = .{ .k = undefined, .v = undefined, .f_rnn = bufs[2 * draft_layers], .state = bufs[2 * draft_layers + 1], .seq = bufs[2 * draft_layers + 2] };
+        l.* = .{ .k = undefined, .v = undefined, .f_rnn = bufs[2 * draft_layers], .state = bufs[2 * draft_layers + 1], .seq = bufs[2 * draft_layers + 2], .prob = bufs[2 * draft_layers + 3] };
         for (0..draft_layers) |i| {
             l.k[i] = bufs[2 * i];
             l.v[i] = bufs[2 * i + 1];
         }
-        for ([_]mtl.Buffer{ l.f_rnn, l.state, l.seq }) |x| @memset(x.slice(u8, x.length()), 0);
+        for ([_]mtl.Buffer{ l.f_rnn, l.state, l.seq, l.prob }) |x| @memset(x.slice(u8, x.length()), 0);
         if (d.follow) |f| mtl.resident.fields.apply(l, f, true);
         return l;
     }
@@ -447,6 +517,7 @@ pub const Drafter = struct {
         l.f_rnn.deinit();
         l.state.deinit();
         l.seq.deinit();
+        l.prob.deinit();
         d.gpa.destroy(l);
     }
 
@@ -471,6 +542,18 @@ pub const Drafter = struct {
             if (o.len > l.held_len) return error.DraftHeldFewer;
             @memcpy(o, l.held[0..o.len]);
         }
+    }
+
+    /// Each held draft's own probability under its step's logits, for the first `out.len` of the hold's: what a confidence floor is
+    /// compared with (the lane core compares each chance with it from the second on and stops at the first that falls short), so
+    /// not the running product of the drafts' before it. False when this drafter keeps no probabilities.
+    fn chancesFn(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
+        const d = cast(ptr);
+        if (!d.keepsProbabilities()) return false;
+        const l = d.lanes.get(s) orelse return error.DraftStreamUnknown;
+        if (out.len > l.held_len) return error.DraftHeldFewer;
+        try chancesOf(l.prob.slice(f32, max_depth)[0..out.len], out);
+        return true;
     }
 
     // ---- encoding ----
@@ -586,14 +669,15 @@ pub const Drafter = struct {
         const groups = (vocab + pick_group - 1) / pick_group;
         const fold_w = d.w.fold_w.?.t;
         const fold_b = d.w.fold_b.?;
-        const flags: u32 = if (s.capture != null) write_logits else 0;
+        const mass: u32 = if (d.keepsProbabilities()) write_mass else 0;
+        const flags: u32 = if (s.capture != null) write_logits | mass else mass;
         for (0..it.depth) |k| {
             const step: u32 = @intCast(k);
             d.launch(e, .rnn_proj, ProjArgs{ .n = 3 * rank, .at = step }, &.{ b(l.state), t(d.w.markov.w1.t), b(l.seq), bo(s.hn, k * hidden * 2), b(l.f_rnn), t(d.w.markov.rnn.t), t(d.w.markov.rnn_b), b(s.proj) }, .{ 3 * rank / 8, 1, 1 }, .{ 256, 1, 1 });
             d.launch(e, .gru, {}, &.{ b(s.proj), b(l.state), b(l.state), b(s.latent) }, .{ 1, 1, 1 }, .{ rank, 1, 1 });
             const out = if (s.capture) |c| bo(c, k * vocab * 2) else b(s.latent);
-            d.launch(e, .fold_pick, FoldArgs{ .vocab = @intCast(vocab), .valid = text.unpadded_vocab, .flags = flags, .cap = text.logit_cap }, &.{ bo(s.base, k * vocab * 2), b(s.latent), t(fold_w), t(fold_b), b(s.best), b(s.best_id), out }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
-            d.launch(e, .pick, PickArgs{ .groups = @intCast(groups), .step = step }, &.{ b(s.best), b(s.best_id), b(l.seq) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 });
+            d.launch(e, .fold_pick, FoldArgs{ .vocab = @intCast(vocab), .valid = text.unpadded_vocab, .flags = flags, .cap = text.logit_cap }, &.{ bo(s.base, k * vocab * 2), b(s.latent), t(fold_w), t(fold_b), b(s.best), b(s.best_id), out, b(s.mass) }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
+            d.launch(e, .pick, PickArgs{ .groups = @intCast(groups), .step = step, .flags = mass }, &.{ b(s.best), b(s.best_id), b(l.seq), b(s.mass), b(l.prob) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 });
         }
     }
 
@@ -760,6 +844,96 @@ fn now() f64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(f64, @floatFromInt(ts.sec)) * 1e3 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
+}
+
+/// `raw`'s probabilities as the lane core's chances: each is above 0 and at most 1, or the hold went wrong (a NaN among them).
+fn chancesOf(raw: []const f32, out: []f64) error{BadDraftProbability}!void {
+    for (raw, out) |p, *o| {
+        if (!(p > 0 and p <= 1)) return error.BadDraftProbability;
+        o.* = p;
+    }
+}
+
+test "inkling2 dspark: a hold's probabilities are the chances the lane core compares with the floor, each above 0 and at most 1" {
+    const t = std.testing;
+    const raw = [_]f32{ 1, 0.9990234375, 0.5, 0.123456789, 4.9987e-6, 0.7 };
+    var out: [raw.len]f64 = undefined;
+    try chancesOf(&raw, &out);
+    // each is the f32 value itself, as an f64: the draft's own probability, not a running product
+    for (raw, out) |x, y| try t.expectEqual(@as(f64, x), y);
+    try chancesOf(raw[0..0], out[0..0]);
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    for ([_]f32{ 0, -0.5, 1.0000001, 2, nan, inf, -inf }) |bad| {
+        var one = [_]f32{ 0.8, bad, 0.6 };
+        try t.expectError(error.BadDraftProbability, chancesOf(&one, out[0..3]));
+    }
+}
+
+test "inkling2 dspark: the confidence floor is 0.7 when unset, none when off, else a number above 0 and below 1" {
+    const t = std.testing;
+    try t.expectEqual(@as(f64, 0.7), Confidence.default);
+    for ([_]?[]const u8{ null, "", " \t" }) |text| try t.expectEqual(@as(?f64, 0.7), try Confidence.parse(text));
+    for ([_][]const u8{ "off", "OFF", " Off ", "oFf\t" }) |text| try t.expectEqual(@as(?f64, null), try Confidence.parse(text));
+    for ([_][]const u8{ "0.7", " 0.7 ", "7e-1", "0.5", "0.999", "1e-3" }) |text| {
+        const want = try std.fmt.parseFloat(f64, std.mem.trim(u8, text, " "));
+        try t.expectEqual(@as(?f64, want), try Confidence.parse(text));
+    }
+    for ([_][]const u8{ "0", "1", "-0.5", "1.5", "70", "nan", "inf", "-inf", "half", "0.7 0.8", "0,7", "%", "of", "offf", "on", "no", "none", "false" }) |text| try t.expectError(error.BadDraftConfidence, Confidence.parse(text));
+}
+
+test "inkling2 dspark: a served round holds the deepest chain and verifies by a floor of 0.7, or with the floor off every draft of a fixed depth" {
+    const t = std.testing;
+    // nothing set: the floor, and all seven drafts held
+    for ([_]?[]const u8{ null, "", "  " }) |text| {
+        const d = try Drafting.parse(text, null);
+        try t.expectEqual(Depth{ .fixed = max_depth }, d.depth);
+        try t.expectEqual(@as(?f64, Confidence.default), d.confidence);
+        try t.expectEqual(Options{ .depth = max_depth, .confidence = 0.7 }, d.options());
+        try t.expectEqual(d, try Drafting.parse(text, ""));
+    }
+    // a number caps what is held, the floor may be another, and auto holds seven for a greedy stream
+    try t.expectEqual(Options{ .depth = 5, .confidence = 0.7 }, (try Drafting.parse("5", null)).options());
+    try t.expectEqual(Options{ .depth = 5, .confidence = 0.9 }, (try Drafting.parse("5", "0.9")).options());
+    try t.expectEqual(Options{ .depth = max_depth, .confidence = 0.5 }, (try Drafting.parse(null, "0.5")).options());
+    const auto = try Drafting.parse("auto", null);
+    try t.expectEqual(Depth.auto, auto.depth);
+    try t.expectEqual(Options{ .depth = max_depth, .confidence = 0.7 }, auto.options());
+    // off: no floor, the depth setting reads as it always has (4 when unset), and nothing is kept
+    for ([_]?[]const u8{ null, "", "  " }) |text| {
+        const d = try Drafting.parse(text, "off");
+        try t.expectEqual(Depth{ .fixed = 4 }, d.depth);
+        try t.expectEqual(@as(?f64, null), d.confidence);
+        try t.expectEqual(Options{ .depth = 4 }, d.options());
+    }
+    try t.expectEqual(Options{ .depth = 6 }, (try Drafting.parse("6", "OFF")).options());
+    const off_auto = try Drafting.parse("auto", " off ");
+    try t.expectEqual(Depth.auto, off_auto.depth);
+    try t.expectEqual(Options{ .depth = max_depth }, off_auto.options());
+    // each text is refused by its own name
+    try t.expectError(error.BadDraftDepth, Drafting.parse("8", null));
+    try t.expectError(error.BadDraftDepth, Drafting.parse("0", "off"));
+    try t.expectError(error.BadDraftConfidence, Drafting.parse("4", "1"));
+    try t.expectError(error.BadDraftConfidence, Drafting.parse(null, "0"));
+    try t.expectError(error.BadDraftConfidence, Drafting.parse(null, "of"));
+    // the library's own default is no floor: only the settings' reading has one
+    try t.expectEqual(@as(?f64, null), (Options{}).confidence);
+}
+
+test "inkling2 dspark: the startup log names the floor, or says every draft is verified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const floor = "the first verified and each next one while its own probability is at least";
+    const cases = [_]struct { depth: ?[]const u8, confidence: ?[]const u8, text: []const u8 }{
+        .{ .depth = null, .confidence = null, .text = "up to 7 drafts a round, " ++ floor ++ " 0.7" },
+        .{ .depth = "5", .confidence = "0.9", .text = "up to 5 drafts a round, " ++ floor ++ " 0.9" },
+        .{ .depth = "auto", .confidence = null, .text = "up to 7 drafts a round, " ++ floor ++ " 0.7" },
+        .{ .depth = null, .confidence = "off", .text = "4 drafts a round, every draft verified" },
+        .{ .depth = "6", .confidence = "OFF", .text = "6 drafts a round, every draft verified" },
+        .{ .depth = "auto", .confidence = "off", .text = "1 to 7 drafts a round chosen by the cost rule, every draft verified" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c.text, try (try Drafting.parse(c.depth, c.confidence)).describe(a));
 }
 
 test "inkling2 dspark: the attention's blocks are the 256-key blocks that meet the window, then the block's own keys" {

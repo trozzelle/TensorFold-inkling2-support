@@ -205,7 +205,11 @@ const Fixture = struct {
     }
 
     fn drafter(f: *Fixture, depth: u32) !*dspark.Drafter {
-        return dspark.Drafter.init(gpa, f.device, f.model, &f.model.draft.?, .{ .depth = depth });
+        return f.drafterWith(.{ .depth = depth });
+    }
+
+    fn drafterWith(f: *Fixture, options: dspark.Options) !*dspark.Drafter {
+        return dspark.Drafter.init(gpa, f.device, f.model, &f.model.draft.?, options);
     }
 };
 
@@ -468,7 +472,7 @@ test "inkling2 dspark: facts offer the asked depth, a fixed block, the lane's by
     const facts = dv.facts();
     try t.expectEqual(@as(u32, 3), facts.depth);
     try t.expect(facts.fixed_block and facts.plain_guard and facts.step_ms > 0);
-    try t.expectEqual(@as(usize, 2 * 5 * (1031 + 7) * 1024 * 2 + 4608 * 2 + 256 * 2 + 8 * 4), facts.stream_bytes);
+    try t.expectEqual(@as(usize, 2 * 5 * (1031 + 7) * 1024 * 2 + 4608 * 2 + 256 * 2 + 8 * 4 + 8 * 4), facts.stream_bytes);
     try t.expectEqualSlices(u32, &.{ 5, 11, 17, 23, 29, 35, 41, 48 }, dv.taps());
     try t.expectEqual(@as(usize, 7), facts.prior.len);
     // depth 0 and 8 are not drafts of a block of eight rows
@@ -601,11 +605,11 @@ test "inkling2 dspark: a residency hook gets the scratch, each lane's buffers as
     var s = try lanes.Stream.init(gpa, .{ .id = "resident", .prompt = &.{ 5, 6 }, .max_new = 1 });
     defer s.deinit(gpa);
     try dv.open(&s);
-    try t.expectEqual(scratch + 13, c.joined); // ten rings, the Markov feature, the state and the token row
+    try t.expectEqual(scratch + 14, c.joined); // ten rings, the Markov feature, the state, the token row and the probabilities
     try d.captureLogits();
-    try t.expectEqual(scratch + 14, c.joined);
+    try t.expectEqual(scratch + 15, c.joined);
     dv.release(&s);
-    try t.expectEqual(@as(usize, 13), c.left);
+    try t.expectEqual(@as(usize, 14), c.left);
     d.setResident(null);
     try t.expectEqual(c.joined, c.left);
 }
@@ -708,10 +712,205 @@ test "inkling2 dspark: a drafted load's facts fix the depth or leave it to the r
         var cfg = try lanes.Config.init(gpa, facts, state.window_rows, state.window_rows - 1);
         defer cfg.deinit(gpa);
         try t.expect(cfg.family_mtp);
+        // no floor and no chances: the lane core prices by its own rates, as before
+        try t.expect(facts.draft_confidence == null and !facts.draft_probabilities and cfg.draft_confidence == null and !cfg.node_probabilities);
         try t.expectEqual(depth.fixedDepth(), cfg.fixed_depth);
         try t.expectEqual(depth.most(), cfg.most_drafts);
         try t.expectEqual(@as(?f64, 9.0), cfg.family_costs.get(2));
         try t.expectEqual(@as(?f64, 21.0), cfg.family_costs.get(8));
         try t.expectEqual(@as(?f64, null), cfg.family_costs.get(9));
     }
+}
+
+/// A stream opened on `d` with `n` rows of `taps` absorbed and a hold of `depth` after them, left open for the caller to release.
+fn holdOpen(d: *dspark.Drafter, s: *lanes.Stream, taps: mtl.Buffer, n: usize, depth: u32) !void {
+    const dv = d.drafter();
+    try dv.open(s);
+    errdefer dv.release(s);
+    try dv.absorb(&.{.{ .stream = s, .features = features(taps, 0, n), .start = 0, .follow = &.{}, .prompt = true }});
+    try dv.hold(&.{.{ .stream = s, .pending = tokenAt(n), .position = n + 1, .depth = depth }});
+}
+
+/// The top-1 probability of each of a hold's seven steps, summed on the host over `logits` (bf16 [7][vocab], the padded ids -inf).
+fn hostProbs(logits: []const u16, out: *[7]f64) void {
+    for (out, 0..) |*o, k| {
+        const row = logits[k * vocab ..][0..vocab];
+        var top: f64 = -std.math.inf(f64);
+        for (row) |b| top = @max(top, mix.f32Of(b));
+        var sum: f64 = 0;
+        for (row) |b| sum += @exp(@as(f64, mix.f32Of(b)) - top);
+        o.* = 1 / sum;
+    }
+}
+
+test "inkling2 dspark: a hold that keeps probabilities gives each held draft's own, from the same hold as one that keeps none" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const plain = try f.drafter(7);
+    defer plain.deinit();
+    const kept = try f.drafterWith(.{ .depth = 7, .probabilities = true });
+    defer kept.deinit();
+    try plain.captureLogits();
+    try kept.captureLogits();
+    const n = 300;
+    const taps = try tapsBuffer(f.device, n + 1, 31);
+    defer taps.deinit();
+    const prompt = try gpa.alloc(u32, n);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*x, i| x.* = tokenAt(i);
+    var s = try lanes.Stream.init(gpa, .{ .id = "probs", .prompt = prompt, .max_new = 8 });
+    defer s.deinit(gpa);
+    // a drafter that keeps none has none to give
+    var out: [7]f64 = undefined;
+    var plain_props: [7]u32 = undefined;
+    try holdOpen(plain, &s, taps, n, 7);
+    try t.expect(!try plain.drafter().chances(&s, &out));
+    try plain.drafter().held(&.{&s}, &.{&plain_props});
+    const plain_logits = try gpa.dupe(u16, plain.captured());
+    defer gpa.free(plain_logits);
+    plain.drafter().release(&s);
+    // one that keeps them holds the same drafts from the same logits
+    var props: [7]u32 = undefined;
+    try holdOpen(kept, &s, taps, n, 7);
+    defer kept.drafter().release(&s);
+    try kept.drafter().held(&.{&s}, &.{&props});
+    try t.expectEqualSlices(u32, &plain_props, &props);
+    try t.expectEqualSlices(u16, plain_logits, kept.captured());
+    try t.expect(try kept.drafter().chances(&s, &out));
+    var want: [7]f64 = undefined;
+    hostProbs(kept.captured(), &want);
+    var spread: f64 = 0;
+    for (out, want) |got, p| {
+        try t.expect(got > 1.0 / @as(f64, valid) and got <= 1);
+        // the host sums logits rounded to bf16 (up to 6% in an exponent near the softcap), the drafter's are the f32 ones
+        try t.expectApproxEqRel(p, got, 0.15);
+        spread = @max(spread, @abs(got - out[0]));
+    }
+    try t.expect(spread > 0); // each step has its own
+    // the first drafts of the hold, asked for alone, have the same values; more than were held are refused
+    var few: [3]f64 = undefined;
+    try t.expect(try kept.drafter().chances(&s, &few));
+    try t.expectEqualSlices(f64, out[0..3], &few);
+    var more: [8]f64 = undefined;
+    try t.expectError(error.DraftHeldFewer, kept.drafter().chances(&s, &more));
+    var unopened = try lanes.Stream.init(gpa, .{ .id = "unopened", .prompt = &.{ 5, 6 }, .max_new = 1 });
+    defer unopened.deinit(gpa);
+    try t.expectError(error.DraftStreamUnknown, kept.drafter().chances(&unopened, &few));
+    // an absorb drops the hold, and its probabilities with it
+    try kept.drafter().absorb(&.{.{ .stream = &s, .features = features(taps, n, 1), .start = n, .follow = &.{}, .prompt = false }});
+    try t.expectError(error.DraftHeldFewer, kept.drafter().chances(&s, &few));
+}
+
+test "inkling2 dspark: each stream of a round has the probabilities of its hold alone, and a shallower hold the deeper one's first" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const d = try f.drafterWith(.{ .depth = 7, .probabilities = true });
+    defer d.deinit();
+    const dv = d.drafter();
+    const ns = [2]usize{ 300, 1200 };
+    var taps: [2]mtl.Buffer = undefined;
+    var prompts: [2][]u32 = undefined;
+    var streams: [2]lanes.Stream = undefined;
+    for (0..2) |i| {
+        taps[i] = try tapsBuffer(f.device, ns[i] + 1, 41 + i);
+        prompts[i] = try gpa.alloc(u32, ns[i]);
+        for (prompts[i], 0..) |*x, j| x.* = tokenAt(j + 3 * i);
+        streams[i] = try lanes.Stream.init(gpa, .{ .id = "pair", .prompt = prompts[i], .max_new = 4 });
+    }
+    defer for (0..2) |i| {
+        taps[i].deinit();
+        gpa.free(prompts[i]);
+        streams[i].deinit(gpa);
+    };
+    var alone: [2][7]f64 = undefined;
+    for (0..2) |i| {
+        try holdOpen(d, &streams[i], taps[i], ns[i], 7);
+        defer dv.release(&streams[i]);
+        try t.expect(try dv.chances(&streams[i], &alone[i]));
+    }
+    try t.expect(!std.mem.eql(f64, &alone[0], &alone[1]));
+    // both in one round, the second asking for four drafts: the probabilities are those of each hold alone
+    for (&streams) |*s| try dv.open(s);
+    defer for (&streams) |*s| dv.release(s);
+    try dv.absorb(&.{
+        .{ .stream = &streams[0], .features = features(taps[0], 0, ns[0]), .start = 0, .follow = &.{}, .prompt = true },
+        .{ .stream = &streams[1], .features = features(taps[1], 0, ns[1]), .start = 0, .follow = &.{}, .prompt = true },
+    });
+    try dv.hold(&.{
+        .{ .stream = &streams[0], .pending = tokenAt(ns[0]), .position = ns[0] + 1, .depth = 7 },
+        .{ .stream = &streams[1], .pending = tokenAt(ns[1]), .position = ns[1] + 1, .depth = 4 },
+    });
+    var both: [2][7]f64 = undefined;
+    try t.expect(try dv.chances(&streams[0], &both[0]));
+    try t.expect(try dv.chances(&streams[1], both[1][0..4]));
+    try t.expectEqualSlices(f64, &alone[0], &both[0]);
+    try t.expectEqualSlices(f64, alone[1][0..4], both[1][0..4]);
+    var deeper: [5]f64 = undefined;
+    try t.expectError(error.DraftHeldFewer, dv.chances(&streams[1], &deeper));
+}
+
+test "inkling2 dspark: the drafting settings give the lane core a floor of 0.7 and the deepest chain, or with the floor off every draft of a fixed depth" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const metal = try backend.Metal.init(gpa, f.model, .{ .capacity = 64, .budget = 1 << 30 });
+    defer metal.deinit();
+    for (&metal.costs, 1..) |*cost, rows| cost.* = .{ .width = @intCast(rows), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(rows)) };
+    metal.timed = backend.measured_widths;
+    const Case = struct { depth: ?[]const u8, floor: ?[]const u8, want: ?f64, held: u32, fixed: ?u8 };
+    for ([_]Case{
+        .{ .depth = null, .floor = null, .want = 0.7, .held = 7, .fixed = 7 }, // nothing set: the default floor, the deepest chain
+        .{ .depth = null, .floor = "0.9", .want = 0.9, .held = 7, .fixed = 7 },
+        .{ .depth = "5", .floor = null, .want = 0.7, .held = 5, .fixed = 5 }, // a depth caps what is held
+        .{ .depth = "auto", .floor = "0.5", .want = 0.5, .held = 7, .fixed = null },
+        .{ .depth = null, .floor = "off", .want = null, .held = 4, .fixed = 4 }, // off: every draft of the depth is verified
+        .{ .depth = "6", .floor = "OFF", .want = null, .held = 6, .fixed = 6 },
+        .{ .depth = "auto", .floor = "off", .want = null, .held = 7, .fixed = null },
+    }) |c| {
+        const drafting = try dspark.Drafting.parse(c.depth, c.floor);
+        try t.expectEqual(c.want, drafting.confidence);
+        const d = try f.drafterWith(drafting.options());
+        defer d.deinit();
+        const own = d.drafter().facts();
+        try t.expectEqual(c.want != null, own.chances);
+        try t.expectEqual(c.want, own.confidence_floor);
+        try t.expectEqual(c.held, own.depth);
+        var wrap = try dspark.wrap(gpa, metal.backend(), d);
+        defer wrap.deinit();
+        const facts = dspark.laneFacts(&wrap, metal.facts(), drafting.depth);
+        // with a floor the core compares each draft's chance with it, and prices no rows by chances or grants; without one it
+        // prices by its own rates, as it always has
+        try t.expectEqual(c.want, facts.draft_confidence);
+        try t.expect(!facts.draft_probabilities and !facts.granted_depth);
+        try t.expectEqual(c.fixed, facts.fixed_depth);
+        try t.expectEqual(c.held, facts.drafts);
+        var cfg = try lanes.Config.init(gpa, facts, state.window_rows, state.window_rows - 1);
+        defer cfg.deinit(gpa);
+        try t.expectEqual(c.want, cfg.draft_confidence);
+        try t.expectEqual(c.want != null, cfg.node_probabilities);
+        try t.expect(!cfg.granted_depth);
+        try t.expectEqual(c.held, cfg.most_drafts);
+        try t.expectEqual(c.fixed, cfg.fixed_depth);
+    }
+    // the library's own default offers no floor: only the settings' reading has one
+    const d = try f.drafter(4);
+    defer d.deinit();
+    const own = d.drafter().facts();
+    try t.expect(!own.chances and own.confidence_floor == null);
+    // a floor outside (0, 1) is not a floor
+    for ([_]f64{ 0, 1, -0.1, 1.5, std.math.nan(f64) }) |bad| try t.expectError(error.DraftConfidence, f.drafterWith(.{ .depth = 4, .confidence = bad }));
 }

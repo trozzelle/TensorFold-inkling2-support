@@ -1,7 +1,8 @@
 //! Inkling 2 kernel checks: the DSpark drafter's kernels (ikd_*, their own library) against FP64 references at the same rounding
 //! points, on random data at the real shapes: the tap mix, the context and block preparation (norm and rotary embedding),
 //! block attention over the ring and the block's own keys (and its time at 1,031 keys), the elementwise kernels, the Markov
-//! GRU and its projection, the fold's pick (a planted tie, planted ids past the unpadded vocabulary) and the fold's transpose.
+//! GRU and its projection, the fold's pick (a planted tie, planted ids past the unpadded vocabulary), the probability of the
+//! pick (its mass reduction over the vocabulary) and the fold's transpose.
 const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
@@ -39,8 +40,10 @@ const AttnArgs = extern struct { heads: u32, kv: u32, end: u32, window: u32, rin
 const EwArgs = extern struct { rows: u32, width: u32 };
 const ProjArgs = extern struct { n: u32, at: u32 };
 const FoldArgs = extern struct { vocab: u32, valid: u32, flags: u32, cap: f32 };
-const PickArgs = extern struct { groups: u32, step: u32 };
+const PickArgs = extern struct { groups: u32, step: u32, flags: u32 };
 const TArgs = extern struct { vocab: u32 };
+const LOGITS: u32 = 1; // the fold's flags: also write every id's logit
+const MASS: u32 = 2; // also write every group's mass and, from the pick, the proposal's probability
 
 const Ctx = struct {
     g: *const h.Gpu,
@@ -102,6 +105,7 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseProj(c, r);
     try caseGru(c, r);
     try caseFold(c, r);
+    try caseMass(c, r);
     try caseFoldT(c, r);
     try caseQmv(c, r);
     try timeAttn(c, r);
@@ -808,10 +812,13 @@ const Fold = struct {
     best_id: mtl.Buffer,
     seq: mtl.Buffer,
     logits: mtl.Buffer,
+    mass: mtl.Buffer,
+    prob: mtl.Buffer,
     bv: []u16,
     lv: []u16,
     wv: []u16,
     biasv: []u16,
+    bias: []f64, // each id's fold bias at the kernel's rounding points: `rebias` after its weights or bias change
     groups: usize,
 
     fn init(g: *const h.Gpu, r: std.Random) !Fold {
@@ -820,7 +827,7 @@ const Fold = struct {
         const latent = try g.buf(RANK * 2);
         const fw = try g.buf(V * RANK * 2);
         const fb = try g.buf(V * 2);
-        return .{
+        const x: Fold = .{
             .base = base,
             .latent = latent,
             .fw = fw,
@@ -829,33 +836,53 @@ const Fold = struct {
             .best_id = try g.buf(groups * 4),
             .seq = try g.buf(8 * 4),
             .logits = try g.buf(V * 2),
+            .mass = try g.buf(groups * 4),
+            .prob = try g.buf(8 * 4),
             .bv = h.fill16(base, 2 * V, r, 12.0),
             .lv = fillGrid(latent, RANK, r, 16, 16),
             .wv = fillGrid(fw, V * RANK, r, 127, 1024),
             .biasv = h.fill16(fb, V, r, 0.5),
+            .bias = try std.heap.page_allocator.alloc(f64, V),
             .groups = groups,
         };
+        for (0..V) |v| x.rebias(v);
+        return x;
     }
 
     fn deinit(x: Fold) void {
-        for ([_]mtl.Buffer{ x.base, x.latent, x.fw, x.fb, x.best, x.best_id, x.seq, x.logits }) |b| b.deinit();
+        for ([_]mtl.Buffer{ x.base, x.latent, x.fw, x.fb, x.best, x.best_id, x.seq, x.logits, x.mass, x.prob }) |b| b.deinit();
+        std.heap.page_allocator.free(x.bias);
     }
 
-    /// The pair of kernels at `step` (its base row); returns nothing, the proposal lands in seq[step + 1].
+    /// The pair of kernels at `step` (its base row); returns nothing, the proposal lands in seq[step + 1]. `mass`: also each
+    /// group's mass and the proposal's probability, prob[step].
+    fn pickWith(x: Fold, c: Ctx, step: u32, mass: bool) !void {
+        const fa: FoldArgs = .{ .vocab = V, .valid = VALID, .flags = if (mass) LOGITS | MASS else LOGITS, .cap = 30.0 };
+        try c.go("ikd_fold_pick", &.{ bytes(&fa), bo(x.base, step * V * 2), bs(x.latent), bs(x.fw), bs(x.fb), bs(x.best), bs(x.best_id), bs(x.logits), bs(x.mass) }, .{ x.groups, 1, 1 }, .{ 256, 1, 1 });
+        const pa: PickArgs = .{ .groups = @intCast(x.groups), .step = step, .flags = if (mass) MASS else 0 };
+        try c.go("ikd_pick", &.{ bytes(&pa), bs(x.best), bs(x.best_id), bs(x.seq), bs(x.mass), bs(x.prob) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 });
+    }
+
     fn pick(x: Fold, c: Ctx, step: u32) !void {
-        const fa: FoldArgs = .{ .vocab = V, .valid = VALID, .flags = 1, .cap = 30.0 };
-        try c.go("ikd_fold_pick", &.{ bytes(&fa), bo(x.base, step * V * 2), bs(x.latent), bs(x.fw), bs(x.fb), bs(x.best), bs(x.best_id), bs(x.logits) }, .{ x.groups, 1, 1 }, .{ 256, 1, 1 });
-        const pa: PickArgs = .{ .groups = @intCast(x.groups), .step = step };
-        try c.go("ikd_pick", &.{ bytes(&pa), bs(x.best), bs(x.best_id), bs(x.seq) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 });
+        try x.pickWith(c, step, false);
+    }
+
+    /// The fold bias of id `v` in FP64 at the kernel's rounding points.
+    fn rebias(x: Fold, v: usize) void {
+        var dot: f64 = 0;
+        for (0..RANK) |cc| dot += h.fb(x.lv[cc]) * h.fb(x.wv[v * RANK + cc]);
+        x.bias[v] = h.rb(h.rb(dot) + h.fb(x.biasv[v]));
     }
 
     /// The step's logit of every id in FP64 at the kernel's rounding points, -inf past the unpadded vocabulary.
     fn logit(x: Fold, step: u32, v: usize) f64 {
         if (v >= VALID) return -std.math.inf(f64);
-        var dot: f64 = 0;
-        for (0..RANK) |cc| dot += h.fb(x.lv[cc]) * h.fb(x.wv[v * RANK + cc]);
-        const bias = h.rb(h.rb(dot) + h.fb(x.biasv[v]));
-        return 30 * std.math.tanh((h.fb(x.bv[step * V + v]) + bias) / 30);
+        return 30 * std.math.tanh((h.fb(x.bv[step * V + v]) + x.bias[v]) / 30);
+    }
+
+    /// Every id's logit of step `step` into `out`.
+    fn refs(x: Fold, step: u32, out: []f64) void {
+        for (out, 0..) |*o, v| o.* = x.logit(step, v);
     }
 };
 
@@ -939,9 +966,172 @@ fn caseFold(c: Ctx, r: std.Random) !void {
     if (x.seq.slice(u32, 8)[1] != VALID - 1) ch.bad += 1;
     try ch.done();
     const fa: FoldArgs = .{ .vocab = V, .valid = VALID, .flags = 0, .cap = 30.0 };
-    try c.time("ikd_fold_pick, 201024 ids", "ikd_fold_pick", &.{ bytes(&fa), bo(x.base, 0), bs(x.latent), bs(x.fw), bs(x.fb), bs(x.best), bs(x.best_id), bs(x.logits) }, .{ x.groups, 1, 1 }, .{ 256, 1, 1 }, 50);
-    const pa: PickArgs = .{ .groups = @intCast(x.groups), .step = 0 };
-    try c.time("ikd_pick, 786 groups", "ikd_pick", &.{ bytes(&pa), bs(x.best), bs(x.best_id), bs(x.seq) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, 200);
+    try c.time("ikd_fold_pick, 201024 ids", "ikd_fold_pick", &.{ bytes(&fa), bo(x.base, 0), bs(x.latent), bs(x.fw), bs(x.fb), bs(x.best), bs(x.best_id), bs(x.logits), bs(x.mass) }, .{ x.groups, 1, 1 }, .{ 256, 1, 1 }, 50);
+    const pa: PickArgs = .{ .groups = @intCast(x.groups), .step = 0, .flags = 0 };
+    try c.time("ikd_pick, 786 groups", "ikd_pick", &.{ bytes(&pa), bs(x.best), bs(x.best_id), bs(x.seq), bs(x.mass), bs(x.prob) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, 200);
+}
+
+// ---- ikd_fold_pick, ikd_pick: the probability of the pick ----
+
+/// One group of 256 ids' mass in FP64 from the step's logits `ref`: the sum of exp(logit - the group's best) over its ids.
+fn groupMass(ref: []const f64, gi: usize) f64 {
+    const ids = ref[gi * 256 ..][0..@min(256, ref.len - gi * 256)];
+    var top: f64 = -std.math.inf(f64);
+    for (ids) |o| top = @max(top, o);
+    if (top == -std.math.inf(f64)) return 0;
+    var s: f64 = 0;
+    for (ids) |o| s += @exp(o - top);
+    return s;
+}
+
+/// The probability of the best logit in FP64: 1 / the sum over the vocabulary of exp(logit - the best).
+fn topProb(ref: []const f64) f64 {
+    var top: f64 = -std.math.inf(f64);
+    for (ref) |o| top = @max(top, o);
+    var s: f64 = 0;
+    for (ref) |o| s += @exp(o - top);
+    return 1 / s;
+}
+
+/// The kernels' group masses and `prob[step]` against the FP64 ones from the step's logits `ref`, within 1e-5 relative.
+fn checkMass(x: Fold, ch: *h.Check, ref: []const f64, step: u32) void {
+    const mass = x.mass.slice(f32, x.groups);
+    for (0..x.groups) |gi| closeF(ch, mass[gi], groupMass(ref, gi), 1e-5);
+    closeF(ch, x.prob.slice(f32, 8)[step], topProb(ref), 1e-5);
+}
+
+/// The pair of kernels run four more times: every byte of the masses, the best values and the probability the same.
+fn checkRepeats(x: Fold, c: Ctx, ch: *h.Check, step: u32) !void {
+    const page = std.heap.page_allocator;
+    const mass = try page.dupe(u8, x.mass.slice(u8, x.groups * 4));
+    defer page.free(mass);
+    const best = try page.dupe(u8, x.best.slice(u8, x.groups * 4));
+    defer page.free(best);
+    const prob = x.prob.slice(f32, 8)[step];
+    for (0..4) |_| {
+        try x.pickWith(c, step, true);
+        ch.same(x.mass.slice(u8, x.groups * 4), mass);
+        ch.same(x.best.slice(u8, x.groups * 4), best);
+        ch.same(std.mem.asBytes(&x.prob.slice(f32, 8)[step]), std.mem.asBytes(&prob));
+    }
+}
+
+/// The same step with the flag off: the same picks, best values and logits, and the mass and probability buffers left as they were.
+fn checkFlagOff(x: Fold, c: Ctx, ch: *h.Check, step: u32) !void {
+    const page = std.heap.page_allocator;
+    const best = try page.dupe(u8, x.best.slice(u8, x.groups * 4));
+    defer page.free(best);
+    const ids = try page.dupe(u8, x.best_id.slice(u8, x.groups * 4));
+    defer page.free(ids);
+    const logits = try page.dupe(u8, x.logits.slice(u8, V * 2));
+    defer page.free(logits);
+    const token = x.seq.slice(u32, 8)[step + 1];
+    const poison: u8 = 0xab;
+    @memset(x.mass.slice(u8, x.groups * 4), poison);
+    @memset(x.prob.slice(u8, 8 * 4), poison);
+    x.seq.slice(u32, 8)[step + 1] = 0xdeadbeef;
+    try x.pickWith(c, step, false);
+    ch.same(x.best.slice(u8, x.groups * 4), best);
+    ch.same(x.best_id.slice(u8, x.groups * 4), ids);
+    ch.same(x.logits.slice(u8, V * 2), logits);
+    ch.n += 1;
+    if (x.seq.slice(u32, 8)[step + 1] != token) ch.bad += 1;
+    var untouched = true;
+    for (x.mass.slice(u8, x.groups * 4)) |b| untouched = untouched and b == poison;
+    for (x.prob.slice(u8, 8 * 4)) |b| untouched = untouched and b == poison;
+    ch.n += 1;
+    if (!untouched) {
+        ch.bad += 1;
+        std.debug.print("  the mass or the probability was written with the flag off\n", .{});
+    }
+}
+
+/// A planted head: id `id` at base value `base` in step 0's row.
+const Head = struct { id: usize, base: f64 };
+
+/// Step 0's base row for a planted distribution: every id low (in [0, 6)), the ids past the unpadded vocabulary the largest of all
+/// (they are masked, so they may add nothing), and `heads` at their values.
+fn plant(x: Fold, heads: []const Head) void {
+    const bv = x.bv[0..V];
+    for (bv) |*b| b.* = h.bf(@mod(h.fb(b.*), 6.0));
+    for ([_]usize{ VALID, VALID + 1, 200100, 200500, V - 1 }) |v| bv[v] = h.bf(30);
+    for (heads) |hd| bv[hd.id] = h.bf(hd.base);
+}
+
+/// Id `hi`'s fold row and bias made those of id `lo`: with the same base value, the same logit exactly.
+fn twin(x: Fold, lo: usize, hi: usize) void {
+    @memcpy(x.wv[hi * RANK ..][0..RANK], x.wv[lo * RANK ..][0..RANK]);
+    x.biasv[hi] = x.biasv[lo];
+    x.rebias(hi);
+}
+
+/// The reference's own probability of step 0 inside `lo` and `hi`: the planted row is what it was meant to be.
+fn shaped(ch: *h.Check, what: []const u8, ref: []const f64, lo: f64, hi: f64) void {
+    const p = topProb(ref);
+    ch.n += 1;
+    if (!(p > lo and p < hi)) {
+        ch.bad += 1;
+        std.debug.print("  {s}: the reference's probability is {e}, not in ({e}, {e})\n", .{ what, p, lo, hi });
+    }
+}
+
+/// The probability of the pick (the kernels' MASS flag) against FP64: each group's mass (the sum of exp(logit - the group's best)
+/// over its ids) and the pick's probability, 1 / the sum over the vocabulary of exp(logit - the best logit), within 1e-5 relative.
+/// On random rows (flat ones, about 1e-4) and planted ones, where it counts: one id far above the rest, a graded head of four ids,
+/// a tie across groups and one within a group, and every valid id equal (each counted exactly once: 1 / 200,058, the lowest id the
+/// pick); the ids past 200,058 are the largest of all in each and must add nothing. Four more runs give the same bytes, and with the
+/// flag off the picks and logits are the same and the mass and the probability are not written.
+fn caseMass(c: Ctx, r: std.Random) !void {
+    const x = try Fold.init(c.g, r);
+    defer x.deinit();
+    const page = std.heap.page_allocator;
+    const ref = try page.alloc(f64, V);
+    defer page.free(ref);
+    var ch: h.Check = .{ .name = "fold mass" };
+    for ([_]u32{ 0, 1 }) |step| {
+        try x.pickWith(c, step, true);
+        x.refs(step, ref);
+        shaped(&ch, "random row", ref, 0, 1e-2);
+        checkMass(x, &ch, ref, step);
+        try checkRepeats(x, c, &ch, step);
+        try checkFlagOff(x, c, &ch, step);
+    }
+    const Planted = struct { what: []const u8, heads: []const Head, twins: []const [2]usize, lo: f64, hi: f64 };
+    const cases = [_]Planted{
+        .{ .what = "one id far above the rest", .heads = &.{.{ .id = 99999, .base = 28 }}, .twins = &.{}, .lo = 0.9, .hi = 1 },
+        // the four heads share one fold row, so their logits' gaps are their base values' alone
+        .{ .what = "a graded head of four", .heads = &.{ .{ .id = 17, .base = 22 }, .{ .id = 70000, .base = 21 }, .{ .id = 123456, .base = 20.5 }, .{ .id = 199999, .base = 19 } }, .twins = &.{ .{ 17, 70000 }, .{ 17, 123456 }, .{ 17, 199999 } }, .lo = 0.3, .hi = 0.7 },
+        .{ .what = "a tie across groups", .heads = &.{ .{ .id = 5, .base = 25 }, .{ .id = 150000, .base = 25 } }, .twins = &.{.{ 5, 150000 }}, .lo = 0.45, .hi = 0.5 },
+        .{ .what = "a tie within a group", .heads = &.{ .{ .id = 1000, .base = 25 }, .{ .id = 1001, .base = 25 } }, .twins = &.{.{ 1000, 1001 }}, .lo = 0.45, .hi = 0.5 },
+        .{ .what = "a tie across simdgroups", .heads = &.{ .{ .id = 70000, .base = 25 }, .{ .id = 70255, .base = 25 } }, .twins = &.{.{ 70000, 70255 }}, .lo = 0.45, .hi = 0.5 },
+    };
+    for (cases) |pc| {
+        plant(x, pc.heads);
+        for (pc.twins) |t| twin(x, t[0], t[1]);
+        try x.pickWith(c, 0, true);
+        x.refs(0, ref);
+        shaped(&ch, pc.what, ref, pc.lo, pc.hi);
+        checkMass(x, &ch, ref, 0);
+        try checkRepeats(x, c, &ch, 0);
+    }
+    // every valid id at the same logit, 0: the sum counts each exactly once
+    for (x.bv) |*b| b.* = h.bf(0);
+    for (x.biasv) |*b| b.* = h.bf(0);
+    for (x.lv) |*l| l.* = h.bf(0);
+    for (x.bias) |*b| b.* = 0;
+    for ([_]usize{ VALID, VALID + 1, 200100, 200500, V - 1 }) |v| x.bv[v] = h.bf(30);
+    try x.pickWith(c, 0, true);
+    x.refs(0, ref);
+    checkMass(x, &ch, ref, 0);
+    closeF(&ch, x.prob.slice(f32, 8)[0], 1.0 / @as(f64, VALID), 1e-5);
+    ch.n += 1;
+    if (x.seq.slice(u32, 8)[1] != 0) ch.bad += 1;
+    try checkRepeats(x, c, &ch, 0);
+    try ch.done();
+    const fa: FoldArgs = .{ .vocab = V, .valid = VALID, .flags = MASS, .cap = 30.0 };
+    try c.time("ikd_fold_pick with mass, 201024 ids", "ikd_fold_pick", &.{ bytes(&fa), bo(x.base, 0), bs(x.latent), bs(x.fw), bs(x.fb), bs(x.best), bs(x.best_id), bs(x.logits), bs(x.mass) }, .{ x.groups, 1, 1 }, .{ 256, 1, 1 }, 50);
+    const pa: PickArgs = .{ .groups = @intCast(x.groups), .step = 0, .flags = MASS };
+    try c.time("ikd_pick with mass, 786 groups", "ikd_pick", &.{ bytes(&pa), bs(x.best), bs(x.best_id), bs(x.seq), bs(x.mass), bs(x.prob) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, 200);
 }
 
 // ---- ikd_fold_t ----
