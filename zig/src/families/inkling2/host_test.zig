@@ -2,6 +2,8 @@
 test {
     _ = @import("config.zig");
     _ = @import("config_test.zig");
+    _ = @import("dspark_alpha.zig");
+    _ = @import("dspark_weights_host_test.zig");
     _ = @import("exl3_names_test.zig");
     _ = @import("expert_pack.zig");
     _ = @import("expert_pack_test.zig");

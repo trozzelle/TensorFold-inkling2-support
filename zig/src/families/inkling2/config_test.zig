@@ -44,6 +44,23 @@ test "Inkling 2 Small's config.json parses: 48 layers, 8 global, 384 experts, 8 
     try t.expectEqual(@as(u32, 256), m.rank);
     try t.expectEqualSlices(u32, &.{ 5, 11, 17, 23, 29, 35, 41, 48 }, m.taps[0..m.taps_n]);
     try t.expectEqualSlices(bool, &.{ true, true, false, true, true }, m.local[0..5]);
+    try t.expectEqual(@as(f32, 1e-6), m.eps);
+    try t.expectEqual(@as(u32, 4608), m.hidden);
+    try t.expectEqual(@as(u32, 201024), m.vocab);
+}
+
+test "the draft head's rms_norm_eps defaults to 1e-6 and is read when mtp_config names another" {
+    var why: config.Why = .{};
+    const a = try config.parse(t.allocator, real, &why);
+    try t.expectEqual(@as(f32, 1e-6), a.mtp.?.eps);
+    const from = "    \"rms_norm_eps\": 1e-06,\n    \"rope_theta\": 1000000.0,";
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, real, from));
+    const edited = try std.mem.replaceOwned(u8, t.allocator, real, from, "    \"rms_norm_eps\": 2e-05,\n    \"rope_theta\": 1000000.0,");
+    defer t.allocator.free(edited);
+    try t.expectEqual(@as(f32, 2e-5), (try config.parse(t.allocator, edited, &why)).mtp.?.eps);
+    const absent = try std.mem.replaceOwned(u8, t.allocator, real, from, "    \"rope_theta\": 1000000.0,");
+    defer t.allocator.free(absent);
+    try t.expectEqual(@as(f32, 1e-6), (try config.parse(t.allocator, absent, &why)).mtp.?.eps);
 }
 
 test "tiny-random's config.json parses: 12 layers, 96 experts, width 128, no quantization_config" {

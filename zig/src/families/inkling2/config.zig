@@ -72,6 +72,8 @@ pub const Text = struct {
     }
 };
 
+const default_mtp_eps: f32 = 1e-6;
+
 /// The draft head's shape (mtp_config); the target taps are indices into the backbone, `layers` meaning the final norm.
 pub const Mtp = struct {
     layers: u32,
@@ -86,6 +88,9 @@ pub const Mtp = struct {
     rank: u32,
     taps: [16]u32,
     taps_n: u32,
+    eps: f32, // rms_norm_eps of every draft norm (1e-6 when mtp_config names none)
+    hidden: u32, // the backbone's width and vocabulary, which the head's tensors are shaped by
+    vocab: u32,
 };
 
 pub const Vision = struct {
@@ -302,6 +307,7 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
     m.window = try int(o, "sliding_window_size", why);
     m.block = try int(o, "block_size", why);
     m.rank = try int(o, "markov_rank", why);
+    m.eps = if (o.get("rms_norm_eps") != null) try float(o, "rms_norm_eps", why) else default_mtp_eps;
     const ids = try get(o, "local_layer_ids", why);
     const taps = try get(o, "target_layer_ids", why);
     const bad = m.layers > m.local.len or m.q_heads % m.kv_heads != 0 or ids != .array or taps != .array or
@@ -325,6 +331,8 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
         m.taps[m.taps_n] = @intCast(e.integer);
         m.taps_n += 1;
     }
+    m.hidden = t.hidden;
+    m.vocab = t.vocab;
     return m;
 }
 

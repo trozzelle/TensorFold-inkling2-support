@@ -63,7 +63,7 @@ pub const Weights = struct {
     }
 };
 
-fn tensor(c: *const ck.Checkpoint, name: []const u8, dtype: ck.DType, dims: []const usize) !Tensor {
+pub fn tensor(c: *const ck.Checkpoint, name: []const u8, dtype: ck.DType, dims: []const usize) !Tensor {
     const x = try c.get(name);
     var ok = x.dtype == dtype and x.rank == dims.len;
     if (ok) for (dims, x.shape[0..x.rank]) |want, got| {
@@ -76,7 +76,7 @@ fn tensor(c: *const ck.Checkpoint, name: []const u8, dtype: ck.DType, dims: []co
     return x;
 }
 
-fn dense(c: *const ck.Checkpoint, name: []const u8, n: usize, k: usize) !Dense {
+pub fn dense(c: *const ck.Checkpoint, name: []const u8, n: usize, k: usize) !Dense {
     return .{ .t = try tensor(c, name, .bf16, &.{ n, k }), .n = @intCast(n), .k = @intCast(k) };
 }
 

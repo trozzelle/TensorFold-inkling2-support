@@ -3,6 +3,7 @@ pub const config = @import("config.zig");
 pub const plan = @import("plan.zig");
 pub const expert_pack = @import("expert_pack.zig");
 pub const weights = @import("weights.zig");
+pub const dspark_weights = @import("dspark_weights.zig");
 pub const state = @import("state.zig");
 pub const model = @import("model.zig");
 pub const Model = model.Model;
@@ -14,6 +15,7 @@ pub const greedy = @import("greedy.zig");
 
 test {
     _ = config;
+    _ = @import("dspark_weights_test.zig");
     _ = plan;
     _ = expert_pack;
     _ = state;
