@@ -17,6 +17,9 @@ pub const key_block = 256;
 /// Floats one (row, q head, block) partial of the split attention holds: the block's maximum and weight sum, then its
 /// 128 values.
 pub const part_slot = 130;
+/// Taps in a row of the drafter's features: the hidden state entering each of seven layers (forward.zig's `tap_layers`),
+/// then the finals.
+pub const feature_taps = 8;
 
 /// Rows of the grouped expert tiles for `slots` picks: each expert's picks padded to whole 8-row tiles.
 pub fn tileRows(slots: usize, experts: usize) usize {
@@ -54,6 +57,10 @@ pub fn cacheBytes(c: *const cfg.Text, capacity: usize, layers: usize) usize {
     return layers * (capacity * kvBytes(c) + convBytes(c)) + @as(usize, c.vocab) * 2;
 }
 
+/// A stream's latest tapped rows for its drafter: cache positions [start, start + rows), a row `feature_taps` hidden rows
+/// wide, from byte `off` of `buf`.
+pub const Tap = struct { buf: ?mtl.Buffer = null, off: usize = 0, start: usize = 0, rows: usize = 0 };
+
 pub const Cache = struct {
     kv: mtl.Buffer,
     conv: mtl.Buffer,
@@ -65,6 +72,9 @@ pub const Cache = struct {
     conv_layer: usize,
     widths: [4]usize,
     follow: ?mtl.ResidencySet.Follow = null,
+    tap: Tap = .{},
+    /// The prompt's last tapped row, kept for the first draft (the prompt chunk's buffer serves the next one).
+    last_tap: ?mtl.Buffer = null,
 
     pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, layers: usize) !Cache {
         var out = Cache{ .kv = undefined, .conv = undefined, .logits = undefined, .capacity = capacity, .layers = layers, .kv_layer = capacity * kvBytes(c), .conv_layer = convBytes(c), .widths = convWidths(c) };
@@ -99,6 +109,7 @@ pub const Cache = struct {
 
     pub fn deinit(self: *Cache) void {
         self.setResident(null);
+        if (self.last_tap) |x| x.deinit();
         self.kv.deinit();
         self.conv.deinit();
         self.logits.deinit();
@@ -111,7 +122,7 @@ pub fn partBytes(c: *const cfg.Text, capacity: usize) usize {
     return window_rows * @as(usize, c.local.q) * ((capacity + key_block - 1) / key_block) * part_slot * 4;
 }
 
-pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums" };
+pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums", "ftaps", "ptaps" };
 
 /// The segment tables of the stacked attention-input matvecs: one `seg_slot` bytes of up to `max_segs` entries a layer.
 pub const max_segs = 6;
@@ -140,6 +151,8 @@ fn sizes(c: *const cfg.Text, capacity: usize) ![fields.len]usize {
         partBytes(c, capacity),
         window_rows * c.topk * 2 * H * 4, // planes: the decode chain's w13 output per slot as two f32 K halves
         window_rows * c.topk * H * 4, // sums: its w2 output per slot before the output rotation, f32
+        window_rows * feature_taps * H * 2, // ftaps: a decode window's rows of the drafter's taps
+        prompt_rows * feature_taps * H * 2, // ptaps: a prompt chunk's
     };
 }
 
@@ -197,6 +210,9 @@ pub const Scratch = struct {
     part: mtl.Buffer,
     planes: mtl.Buffer,
     sums: mtl.Buffer,
+    /// The drafter's taps, [row][feature_taps][hidden] bf16: a decode window's rows and a prompt chunk's.
+    ftaps: mtl.Buffer,
+    ptaps: mtl.Buffer,
     /// Positions of the longest cache this scratch serves: the split attention's partials hold that many keys' blocks.
     capacity: usize,
     /// The GPU seconds a decode step of each row count is expected to take (0: none yet), for the next one's wait: a
@@ -223,10 +239,13 @@ pub const Scratch = struct {
     }
 };
 
+/// Inkling 2 Small's text config, as the size checks need it.
+const small = cfg.Text{ .hidden = 4608, .layers = 48, .vocab = 201024, .unpadded_vocab = 200058, .local = .{ .q = 48, .kv = 8, .dim = 128 }, .global = .{ .q = 48, .kv = 8, .dim = 128 }, .window = 1024, .d_rel = 16, .rel_extent = 1024, .log_floor = 8192, .log_alpha = 0.1, .eps = 1e-6, .qk_clip = 22.627, .rel_clip = 8, .block = 6, .experts = 384, .topk = 8, .expert_inter = 2304, .route_scale = 8, .gate_cap = 4, .up_cap = 25, .logit_cap = 30, .max_context = 1048576 };
+
 test "inkling2 state: tiles pad each expert to 8 rows; a cache's bytes; the split attention's partials" {
     try std.testing.expectEqual(@as(usize, 64), tileRows(8, 384));
     try std.testing.expectEqual(@as(usize, 4096 + 7 * 384), tileRows(4096, 384));
-    const c = cfg.Text{ .hidden = 4608, .layers = 48, .vocab = 201024, .unpadded_vocab = 200058, .local = .{ .q = 48, .kv = 8, .dim = 128 }, .global = .{ .q = 48, .kv = 8, .dim = 128 }, .window = 1024, .d_rel = 16, .rel_extent = 1024, .log_floor = 8192, .log_alpha = 0.1, .eps = 1e-6, .qk_clip = 22.627, .rel_clip = 8, .block = 6, .experts = 384, .topk = 8, .expert_inter = 2304, .route_scale = 8, .gate_cap = 4, .up_cap = 25, .logit_cap = 30, .max_context = 1048576 };
+    const c = small;
     try std.testing.expectEqual(@as(usize, 8), maxBlocks(&c));
     try std.testing.expectEqual(@as(usize, 48 * (100 * 4096 + 32 * 11264 * 2) + 201024 * 2), cacheBytes(&c, 100, 48));
     // 16 rows x 48 heads x one slot a 256-key block: 32k positions are 128 blocks, 51 MB
@@ -234,4 +253,14 @@ test "inkling2 state: tiles pad each expert to 8 rows; a cache's bytes; the spli
     try std.testing.expectEqual(partBytes(&c, 256), partBytes(&c, 1));
     try std.testing.expectEqual(2 * partBytes(&c, 256), partBytes(&c, 257));
     try std.testing.expectEqual(@as(usize, 0), partBytes(&c, 0));
+}
+
+test "inkling2 state: the drafter's taps are eight hidden rows a row, a decode window's and a prompt chunk's" {
+    const row: usize = feature_taps * 4608 * 2;
+    const bytes = try sizes(&small, 256);
+    inline for (fields, 0..) |f, i| {
+        if (comptime std.mem.eql(u8, f, "ftaps")) try std.testing.expectEqual(window_rows * row, bytes[i]);
+        if (comptime std.mem.eql(u8, f, "ptaps")) try std.testing.expectEqual(prompt_rows * row, bytes[i]);
+    }
+    try std.testing.expectEqual(@as(usize, 8), feature_taps);
 }

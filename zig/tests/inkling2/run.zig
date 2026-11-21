@@ -15,6 +15,9 @@ const usage =
     \\                                                         against 16-row windows, bit for bit
     \\tf-inkling-run <model> greedy <ids.json> <n>             the prompt, then n one-row greedy steps; tokens, tok/s
     \\tf-inkling-run <model> taps <index.txt> <out_dir> <steps>   each prompt, then steps greedy tokens: taps, picks, MoE inputs
+    \\tf-inkling-run <model> ftaps <ids.json> <out.bin> [at [window]]   every row's serving taps: bf16 [T, 8, H], the inputs of layers
+    \\                                                         5, 11, .. 41, then the finals. ids[..at] (default: all) go through in
+    \\                                                         prompt chunks, the rest in decode windows of at most `window` rows (16)
     \\tf-inkling-run <model> profile <layers> <pos> <rows> <steps> [repeat]   per-class GPU time of decode steps
     \\                                                         (the layers run repeat times a step, default 48/layers)
     \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat]   decode steps each followed by the greedy draw: median
@@ -33,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[2], "check")) return check(init, args);
     if (std.mem.eql(u8, args[2], "layers")) return layersMode(init, args);
     if (std.mem.eql(u8, args[2], "taps")) return tapsMode(init, args);
+    if (std.mem.eql(u8, args[2], "ftaps")) return ftapsMode(init, args);
     if (std.mem.eql(u8, args[2], "finals")) return finalsMode(init, args);
     if (std.mem.eql(u8, args[2], "exact")) return exactMode(init, args);
     if (std.mem.eql(u8, args[2], "greedy")) return greedyMode(init, args);
@@ -364,6 +368,41 @@ fn writeSeq(init: std.process.Init, dir: []const u8, seq: usize, suffix: []const
     const path = try std.fmt.allocPrint(init.gpa, "{s}/seq-{d:0>5}.{s}", .{ dir, seq, suffix });
     defer init.gpa.free(path);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = data });
+}
+
+/// ids[..at] in prompt chunks, then the rest in decode windows of at most `window` rows, every forward writing its rows' serving
+/// taps (what the drafter reads): bf16 [T][8][H] to the file, the layout of `taps` mode's taps.bin.
+fn ftapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
+    if (args.len < 5 or args.len > 7) return error.ExpectedIdsOutAtWindow;
+    const ids = try readIds(init, args[3]);
+    defer ids.deinit();
+    const T = ids.value.len;
+    const at = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else T;
+    const window = if (args.len > 6) try std.fmt.parseInt(usize, args[6], 10) else ik.state.window_rows;
+    if (T == 0 or at == 0 or at > T or window == 0 or window > ik.state.window_rows) return error.ExpectedAtInsideIdsAndWindowOneTo16;
+    const m = try ik.Model.load(init.gpa, init.io, args[1], .{});
+    defer m.deinit();
+    const c = &m.config.text;
+    const row: usize = ik.state.feature_taps * @as(usize, c.hidden);
+    var s = try ik.state.Scratch.init(m.device, c, T + 1);
+    defer s.deinit();
+    var cache = try ik.state.Cache.init(m.device, c, T + 1, c.layers);
+    defer cache.deinit();
+    const taps = try init.gpa.alloc(u16, T * row);
+    defer init.gpa.free(taps);
+    const t0 = now();
+    var done: usize = 0;
+    while (done < T) {
+        const prompt = done < at;
+        const n = if (prompt) @min(at - done, ik.state.prompt_rows) else @min(T - done, window);
+        const buf = if (prompt) s.ptaps else s.ftaps;
+        try ik.forward.run(m, &s, &cache, ids.value[done..][0..n], .{ .logits = .none, .prompt = prompt, .feature_taps = .{ .buf = buf } });
+        @memcpy(taps[done * row ..][0 .. n * row], buf.slice(u16, n * row));
+        cache.len += n;
+        done += n;
+    }
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[4], .data = std.mem.sliceAsBytes(taps) });
+    std.debug.print("{{\"rows\": {d}, \"prompt\": {d}, \"window\": {d}, \"seconds\": {d:.2}}}\n", .{ T, at, window, @as(f64, @floatFromInt(now() - t0)) / 1e9 });
 }
 
 const profile_classes = [_]ik.forward.counters.Class{ .dense, .norm, .attention_prepare, .attention, .route, .experts, .activation };

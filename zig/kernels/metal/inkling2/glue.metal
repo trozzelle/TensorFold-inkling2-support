@@ -173,6 +173,14 @@ inline float ik_resid_one(bool boundary, bfloat h, bfloat ya) { return (boundary
   dst[ulong(gid.y) * a.width + gid.x] = src[ulong(gid.y) * a.width + gid.x];
 }
 
+// One tap of the drafter's rows: bf16 rows copied into rows a.stride elements apart. The destination binding is offset to the
+// tap's columns, so a row's eight taps lie side by side as [row][8][width].
+[[kernel]] void ik_tap(constant ik_args& a [[buffer(0)]], const device bfloat* src [[buffer(1)]],
+    device bfloat* dst [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+  if (gid.x >= a.width || gid.y >= a.rows) return;
+  dst[ulong(gid.y) * a.stride + gid.x] = src[ulong(gid.y) * a.width + gid.x];
+}
+
 // a.cap * tanh(z / a.cap) over bf16 logits in place; the padded vocabulary (from a.extent) at -inf.
 [[kernel]] void ik_softcap(constant ik_args& a [[buffer(0)]], device bfloat* z [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= a.width || gid.y >= a.rows) return;

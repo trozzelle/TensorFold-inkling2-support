@@ -11,6 +11,7 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseNormF32(g, r);
     try caseDepth(g, r);
     try caseResidSoftcap(g, r);
+    try caseTap(g, r);
     try caseMatvecWidths(g, r);
 }
 
@@ -200,6 +201,29 @@ fn caseResidSoftcap(g: *const h.Gpu, r: std.Random) !void {
             if (got != 0xff80) c.bad += 1; // -inf
         } else c.b16(got, 30 * std.math.tanh(h.fb(before[t * V + i]) / 30));
     };
+    try c.done();
+}
+
+/// ik_tap: a row's eight taps written in turn into their own columns of the drafter's [row][8][H] layout (rows `stride`
+/// apart in the destination, the tap picked by the binding's offset); the taps not yet written and every other byte stay
+/// as they were.
+fn caseTap(g: *const h.Gpu, r: std.Random) !void {
+    const rows = 7;
+    const taps = 8;
+    const src = try g.buf(rows * H * 2);
+    const dst = try g.buf(rows * taps * H * 2);
+    defer for ([_]mtl.Buffer{ src, dst }) |b| b.deinit();
+    const want = try std.heap.page_allocator.alloc(u16, rows * taps * H);
+    defer std.heap.page_allocator.free(want);
+    @memset(want, 0xaaaa);
+    @memset(dst.slice(u16, rows * taps * H), 0xaaaa);
+    var c: h.Check = .{ .name = "tap" };
+    for (0..taps) |k| {
+        const xs = h.fill16(src, rows * H, r, 4);
+        try g.run("ik_tap", .{ .rows = rows, .width = H, .stride = taps * H }, &.{ .{ .buf = src }, .{ .buf = dst, .off = k * H * 2 } }, .{ H, rows, 1 }, .{ 256, 1, 1 }, false);
+        for (0..rows) |t| @memcpy(want[(t * taps + k) * H ..][0..H], xs[t * H ..][0..H]);
+        c.same(dst.slice(u8, rows * taps * H * 2), std.mem.sliceAsBytes(want));
+    }
     try c.done();
 }
 

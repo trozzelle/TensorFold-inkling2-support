@@ -5,6 +5,7 @@ const lanes = @import("lanes");
 const st = @import("state.zig");
 const fwd = @import("forward.zig");
 const greedy = @import("greedy.zig");
+const draw = @import("draw.zig");
 const Model = @import("model.zig").Model;
 const row = @import("../step5/backend.zig").row;
 const be = lanes.backend;
@@ -41,9 +42,14 @@ pub const Metal = struct {
     held: u64 = 0,
     tokens: []u32,
     next: u64 = 0,
-    values: []f32,
+    /// The host's draws from a logits row: greedy or keyed, and which of a window's rows a round reads.
+    drawer: draw.Drawer,
     /// Set by INKLING_ROUND_TIMING: what the stream's rounds spend, logged when it ends; null when off.
     spent: ?Spent = null,
+    /// Set by `prepare_features`: every forward taps its rows for the drafter.
+    tapped: bool = false,
+    /// A drafting prompt pass's: takes each chunk's tapped rows as they are made.
+    sink: ?be.FeatureSink = null,
 
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         const out = try gpa.create(Metal);
@@ -55,7 +61,7 @@ pub const Metal = struct {
         errdefer gpa.free(tokens);
         const values = try gpa.alloc(f32, model.config.text.vocab);
         errdefer gpa.free(values);
-        out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = scratch, .tokens = tokens, .values = values, .spent = if (std.c.getenv("INKLING_ROUND_TIMING") != null) Spent{} else null };
+        out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = scratch, .tokens = tokens, .drawer = .{ .gpa = gpa, .values = values }, .spent = if (std.c.getenv("INKLING_ROUND_TIMING") != null) Spent{} else null };
         return out;
     }
 
@@ -69,7 +75,7 @@ pub const Metal = struct {
         self.caches.deinit(self.gpa);
         self.scratch.deinit();
         self.gpa.free(self.tokens);
-        self.gpa.free(self.values);
+        self.gpa.free(self.drawer.values);
         self.gpa.destroy(self);
     }
 
@@ -98,7 +104,7 @@ pub const Metal = struct {
     }
 
     pub fn backend(self: *Metal) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .first_row = firstRowFn, .held = heldFn } };
+        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .prepare_features = prepareFn, .features = featuresFn, .prefill_features = prefillFeaturesFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .first_row = firstRowFn, .held = heldFn } };
     }
 
     fn cast(ptr: *anyopaque) *Metal {
@@ -114,29 +120,6 @@ pub const Metal = struct {
         return cache.logits.slice(u16, self.model.config.text.vocab);
     }
 
-    /// Greedy argmax or the keyed draw (lanes' gpu_full host twin) at `position`, a grammar mask's tokens only.
-    fn draw(self: *Metal, l: []const u16, sampling: ?lanes.Sampling, position: u64, mask: []const u32) !u32 {
-        const t = sampled(sampling) orelse {
-            if (mask.len == 0) return greedy.argmax(l);
-            var best: ?usize = null;
-            for (l, 0..) |w, id| {
-                if (!lanes.grammar.allows(mask, id)) continue;
-                if (best == null or logit(w) > logit(l[best.?])) best = id;
-            }
-            return @intCast(best orelse 0);
-        };
-        for (l, self.values, 0..) |w, *v, id| {
-            v.* = logit(w);
-            if (mask.len > 0 and !lanes.grammar.allows(mask, id)) v.* = -std.math.inf(f32);
-        }
-        return lanes.gpu_full.draw(self.gpa, self.values, t, @intCast(position), null);
-    }
-
-    fn sampled(sampling: ?lanes.Sampling) ?lanes.Sampling {
-        const t = sampling orelse return null;
-        return if (t.temperature > 0) t else null;
-    }
-
     fn put(self: *Metal, token: u32) u64 {
         const h = self.next;
         self.next += 1;
@@ -144,14 +127,37 @@ pub const Metal = struct {
         return h;
     }
 
-    /// ids at the cache's end in prompt chunks, the last chunk's last logits kept for the first draw.
+    /// A tapped row's bytes: every tap's hidden row, bf16.
+    fn tapBytes(self: *const Metal) usize {
+        return @as(usize, st.feature_taps) * self.model.config.text.hidden * 2;
+    }
+
+    /// A prompt chunk's `n` tapped rows (the first at the cache's end), given to the sink while they are held; the
+    /// prompt's last row stays in the cache for the first draft.
+    fn holdTaps(self: *Metal, cache: *st.Cache, stream: *lanes.Stream, n: usize, last: bool) !void {
+        const width = self.tapBytes();
+        if (self.sink) |k| try k.take(k.ptr, stream, .{ .buffer = @intFromPtr(self.scratch.ptaps.id), .rows = @intCast(n), .row_bytes = @intCast(width), .space = .device, .dtype = .bf16 }, cache.len);
+        if (!last) return;
+        if (cache.last_tap == null) {
+            const buf = try self.model.device.buffer(width, mtl.ResourceOptions.shared);
+            if (cache.follow) |f| f.join(f.ctx, buf);
+            cache.last_tap = buf;
+        }
+        @memcpy(cache.last_tap.?.slice(u8, width), self.scratch.ptaps.slice(u8, n * width)[(n - 1) * width ..][0..width]);
+        cache.tap = .{ .buf = cache.last_tap, .start = cache.len + n - 1, .rows = 1 };
+    }
+
+    /// ids at the cache's end in prompt chunks, the last chunk's last logits kept for the first draw. With the features
+    /// prepared each chunk is tapped, and `holdTaps` hands its rows on.
     fn feed(self: *Metal, cache: *st.Cache, ids: []const u32, stream: *lanes.Stream) !void {
         var at: usize = 0;
         while (at < ids.len) {
             if (stream.isCancelled()) return error.Cancelled;
             const n = @min(ids.len - at, st.prompt_rows);
             const last = at + n == ids.len;
-            try fwd.run(self.model, &self.scratch, cache, ids[at..][0..n], .{ .logits = if (last) .last else .none, .prompt = true });
+            const to: ?fwd.B = if (self.tapped) .{ .buf = self.scratch.ptaps } else null;
+            try fwd.run(self.model, &self.scratch, cache, ids[at..][0..n], .{ .logits = if (last) .last else .none, .prompt = true, .feature_taps = to });
+            if (to != null) try self.holdTaps(cache, stream, n, last);
             if (last) @memcpy(cache.logits.slice(u16, self.model.config.text.vocab), self.scratch.logits.slice(u16, self.model.config.text.vocab));
             cache.len += n;
             lanes.prefill_widths.completed(self.gpa, stream, n);
@@ -181,6 +187,30 @@ pub const Metal = struct {
         try self.feed(cache, ids, stream);
     }
 
+    /// The drafter's layers, told once before any forward. A forward taps the inputs of `fwd.tap_layers` and the finals
+    /// only, so a drafter that reads others is refused; from here on every forward taps its rows.
+    fn prepareFn(ptr: *anyopaque, taps: []const u32) !void {
+        const self = cast(ptr);
+        if (!tapsAre(taps, self.model.config.text.layers)) return error.UnsupportedInkling2Taps;
+        self.tapped = true;
+    }
+
+    /// Rows [start, start + count) of the stream's latest tapped rows, on the device.
+    fn featuresFn(ptr: *anyopaque, stream: *lanes.Stream, taps: []const u32, start: u64, count: u32) !be.Features {
+        const self = cast(ptr);
+        if (!self.tapped or !tapsAre(taps, self.model.config.text.layers)) return error.UnpreparedInkling2Taps;
+        return tappedRows((try self.cacheOf(stream)).tap, self.tapBytes(), start, count);
+    }
+
+    /// The prompt pass handing `sink` each chunk's tapped rows as it makes them.
+    fn prefillFeaturesFn(ptr: *anyopaque, stream: *lanes.Stream, taps: []const u32, sink: be.FeatureSink) !void {
+        const self = cast(ptr);
+        if (!self.tapped or !tapsAre(taps, self.model.config.text.layers)) return error.UnpreparedInkling2Taps;
+        self.sink = sink;
+        defer self.sink = null;
+        return prefillFn(ptr, stream);
+    }
+
     fn firstFn(ptr: *anyopaque, stream: *lanes.Stream, position: u64) !u64 {
         return cast(ptr).firstSlot(stream, position, &.{});
     }
@@ -192,7 +222,7 @@ pub const Metal = struct {
     fn firstSlot(self: *Metal, stream: *lanes.Stream, position: u64, mask: []const u32) !u64 {
         const cache = try self.cacheOf(stream);
         if (position != cache.len) return error.InvalidInkling2Position;
-        return self.put(try self.draw(self.logits(cache), stream.sampling, position, mask));
+        return self.put(try self.drawer.one(self.logits(cache), stream.sampling, position, mask));
     }
 
     /// The fed token's forward, the next token drawn from its logits (synchronous: no step runs ahead).
@@ -207,7 +237,7 @@ pub const Metal = struct {
         if (tok >= self.model.config.text.vocab) return error.InvalidInkling2Token;
         try fwd.run(self.model, &self.scratch, cache, &.{tok}, .{ .logits = .last });
         cache.len += 1;
-        return self.put(try self.draw(self.scratch.logits.slice(u16, self.model.config.text.vocab), stream.sampling, position, &.{}));
+        return self.put(try self.drawer.one(self.scratch.logits.slice(u16, self.model.config.text.vocab), stream.sampling, position, &.{}));
     }
 
     fn readFn(ptr: *anyopaque, handle: u64) !u32 {
@@ -223,11 +253,11 @@ pub const Metal = struct {
         return row(l, greedy.argmax(l), stream.logprobs orelse 0);
     }
 
-    /// One stream's pending token and copy drafts in one forward, every row drawn; keep() rolls back by length.
+    /// One stream's pending token and copy drafts in one forward, the rows drawn that the round reads (draw.zig);
+    /// keep() rolls back by length.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) !void {
         const self = cast(ptr);
         const c = &self.model.config.text;
-        const words = (c.vocab + 31) / 32;
         if (windows.len != 1 or out.len != 1) return error.UnsupportedInkling2Windows;
         const w = windows[0];
         const o = out[0];
@@ -242,17 +272,20 @@ pub const Metal = struct {
         if (self.spent) |*s| if (s.ended != 0) {
             s.between += began - s.ended;
         };
-        try fwd.run(self.model, &self.scratch, cache, ids[0..rows], .{ .logits = .all, .timing = if (self.spent) |*s| &s.forward else null });
+        const to: ?fwd.B = if (self.tapped) .{ .buf = self.scratch.ftaps } else null;
+        try fwd.run(self.model, &self.scratch, cache, ids[0..rows], .{ .logits = .all, .timing = if (self.spent) |*s| &s.forward else null, .feature_taps = to });
         const ran = nowSeconds();
+        // the window's rows are the drafter's next rows, from the pending token's position
+        if (to != null) cache.tap = .{ .buf = self.scratch.ftaps, .start = cache.len, .rows = rows };
         cache.len += rows;
         @memcpy(o.drafts, w.tokens);
         const all = self.scratch.logits.slice(u16, rows * c.vocab);
-        for (0..rows) |r| {
-            const l = all[r * c.vocab ..][0..c.vocab];
-            const mask = if (w.masks.len >= (r + 1) * words) w.masks[r * words ..][0..words] else &.{};
-            o.sampled[r] = try self.draw(l, w.stream.sampling, w.positions[r], mask);
-            if (o.rows.len == rows) o.rows[r] = row(l, o.sampled[r], w.stream.logprobs orelse 0);
-        }
+        // a window's logprob rows are made for every row: a forced window commits them along all its rows
+        const wanted = o.rows.len == rows;
+        try self.drawer.window(all, .{ .drafts = w.tokens, .positions = w.positions, .masks = w.masks, .sampling = w.stream.sampling, .vocab = c.vocab }, o.sampled, !wanted);
+        if (wanted) for (0..rows) |r| {
+            o.rows[r] = row(all[r * c.vocab ..][0..c.vocab], o.sampled[r], w.stream.logprobs orelse 0);
+        };
         if (self.spent) |*s| {
             s.ended = nowSeconds();
             s.rounds += 1;
@@ -294,12 +327,54 @@ pub const Metal = struct {
     }
 };
 
-fn logit(word: u16) f32 {
-    return @bitCast(@as(u32, word) << 16);
+/// Whether `taps` are the layers a forward taps, in order: the inputs of `fwd.tap_layers`, then the finals, named by the
+/// layer count.
+fn tapsAre(taps: []const u32, layers: u32) bool {
+    const n = fwd.tap_layers.len;
+    return taps.len == n + 1 and std.mem.eql(u32, taps[0..n], &fwd.tap_layers) and taps[n] == layers;
+}
+
+/// Rows [start, start + count) of the tapped rows `tp` holds, `width` bytes a row, as the drafter reads them.
+fn tappedRows(tp: st.Tap, width: usize, start: u64, count: u32) !be.Features {
+    const buf = tp.buf orelse return error.UnpreparedInkling2Taps;
+    if (count == 0 or start < tp.start or start + count > tp.start + tp.rows) return error.Inkling2TapsNotHeld;
+    return .{ .buffer = @intFromPtr(buf.id), .offset = tp.off + (start - tp.start) * width, .rows = count, .row_bytes = @intCast(width), .space = .device, .dtype = .bf16 };
 }
 
 fn nowSeconds() f64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(f64, @floatFromInt(ts.sec)) + @as(f64, @floatFromInt(ts.nsec)) * 1e-9;
+}
+
+test "inkling2 backend: the lane backend's functions compile against its interface" {
+    std.testing.refAllDecls(Metal);
+}
+
+test "inkling2 backend: the taps are the inputs of seven layers and the finals, named by the layer count, in order" {
+    try std.testing.expect(tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 48 }, 48));
+    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41 }, 48));
+    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 47 }, 48));
+    try std.testing.expect(!tapsAre(&.{ 11, 5, 17, 23, 29, 35, 41, 48 }, 48));
+    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 48, 48 }, 48));
+}
+
+test "inkling2 backend: features are the window's rows from the buffer's offset, and nothing outside it" {
+    const fake = mtl.Buffer{ .id = @ptrFromInt(0x4000) };
+    const width: usize = st.feature_taps * 4608 * 2;
+    const tp: st.Tap = .{ .buf = fake, .off = 100, .start = 7, .rows = 3 };
+    const whole = try tappedRows(tp, width, 7, 3);
+    try std.testing.expectEqual(@as(u64, 0x4000), whole.buffer);
+    try std.testing.expectEqual(@as(u64, 100), whole.offset);
+    try std.testing.expectEqual(@as(u32, 3), whole.rows);
+    try std.testing.expectEqual(@as(u32, width), whole.row_bytes);
+    try std.testing.expect(whole.space == .device and whole.dtype == .bf16);
+    const tail = try tappedRows(tp, width, 8, 2);
+    try std.testing.expectEqual(@as(u64, 100 + width), tail.offset);
+    try std.testing.expectEqual(@as(u32, 2), tail.rows);
+    try std.testing.expectError(error.Inkling2TapsNotHeld, tappedRows(tp, width, 6, 2));
+    try std.testing.expectError(error.Inkling2TapsNotHeld, tappedRows(tp, width, 8, 3));
+    try std.testing.expectError(error.Inkling2TapsNotHeld, tappedRows(tp, width, 10, 1));
+    try std.testing.expectError(error.Inkling2TapsNotHeld, tappedRows(tp, width, 7, 0));
+    try std.testing.expectError(error.UnpreparedInkling2Taps, tappedRows(.{}, width, 0, 1));
 }

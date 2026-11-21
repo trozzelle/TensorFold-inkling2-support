@@ -20,5 +20,7 @@ test {
     _ = expert_pack;
     _ = state;
     _ = budget;
+    _ = backend;
+    _ = @import("draw.zig");
     _ = greedy;
 }
