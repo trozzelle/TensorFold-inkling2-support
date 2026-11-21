@@ -137,7 +137,8 @@ const Enc = struct {
     }
 
     /// A short convolution of `in` (width `w`) into `out` over ring `which` of layer `l`, then the ring advanced; a
-    /// dynamic one's projection is a dense span, the convolution an attention_prepare span.
+    /// dynamic one's projection is a dense span, the convolution an attention_prepare span. The decode path advances the
+    /// ring in the convolution's own dispatch.
     fn conv(x: Enc, cv: wts.Conv, in: B, dyn_in: B, out: B, l: usize, which: usize, w: usize, kv: u32) !void {
         const ring = bo(x.cache.conv, x.cache.ringAt(l, which));
         const n = x.n;
@@ -146,7 +147,7 @@ const Enc = struct {
             .static => |taps| {
                 a.scale = @sqrt(5.0);
                 try x.begin(.attention_prepare);
-                x.glue(.conv, a, &.{ in, ring, t(taps), out }, .{ w, n, 1 }, .{ 256, 1, 1 }, false);
+                x.glue(if (x.decode) .conv_ring else .conv, a, &.{ in, ring, t(taps), out }, .{ w, n, 1 }, .{ 256, 1, 1 }, false);
             },
             .dynamic => |d| {
                 try x.begin(.dense);
@@ -154,10 +155,22 @@ const Enc = struct {
                 try x.end();
                 a.scale = 3;
                 try x.begin(.attention_prepare);
-                x.glue(.conv_dyn, a, &.{ in, ring, t(d.taps), b(x.s.dyn), out }, .{ w, n, 1 }, .{ 256, 1, 1 }, false);
+                x.glue(if (x.decode) .conv_dyn_ring else .conv_dyn, a, &.{ in, ring, t(d.taps), b(x.s.dyn), out }, .{ w, n, 1 }, .{ 256, 1, 1 }, false);
             },
         }
-        x.glue(.ring, a, &.{ in, ring }, .{ w, @min(n, st.ring), 1 }, .{ 256, 1, 1 }, false);
+        if (!x.decode) x.glue(.ring, a, &.{ in, ring }, .{ w, @min(n, st.ring), 1 }, .{ 256, 1, 1 }, false);
+        try x.end();
+    }
+
+    /// The decode path's MLP branch in one dispatch: the convolution of `in` over ring 3 of layer `l`, the ring
+    /// advanced, and the layer's output `h` = bf16(`res` + the convolution), in a norm span.
+    fn convOut(x: Enc, taps: wts.Tensor, in: B, res: B, h: B, l: usize, w: usize) !void {
+        std.debug.assert(x.decode);
+        const ring = bo(x.cache.conv, x.cache.ringAt(l, 3));
+        const n = x.n;
+        const a = Args{ .rows = @intCast(n), .width = @intCast(w), .pos = @intCast(x.cache.len), .scale = @sqrt(5.0) };
+        try x.begin(.norm);
+        x.glue(.conv_out, a, &.{ in, ring, t(taps), res, h }, .{ w, n, 1 }, .{ 256, 1, 1 }, false);
         try x.end();
     }
 
@@ -371,10 +384,14 @@ fn layer(x: Enc, i: u32) !void {
         x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
     }
     try x.end();
-    try x.conv(.{ .static = w.mlp_conv }, b(s.moe), b(s.moe), b(s.ym), i, 3, H, 0);
-    try x.begin(.norm);
-    x.glue(.out, .{ .rows = nr, .width = c.hidden }, &.{ b(s.res), b(s.ym), b(s.h) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
-    try x.end();
+    if (x.decode) {
+        try x.convOut(w.mlp_conv, b(s.moe), b(s.res), b(s.h), i, H);
+    } else {
+        try x.conv(.{ .static = w.mlp_conv }, b(s.moe), b(s.moe), b(s.ym), i, 3, H, 0);
+        try x.begin(.norm);
+        x.glue(.out, .{ .rows = nr, .width = c.hidden }, &.{ b(s.res), b(s.ym), b(s.h) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+        try x.end();
+    }
 }
 
 /// The output query over every block and the last layer's normed output, then the final norm into s.finals.
