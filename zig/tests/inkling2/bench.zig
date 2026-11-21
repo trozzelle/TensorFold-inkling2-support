@@ -48,6 +48,12 @@ fn median(ms: []f64) f64 {
 /// GPU ms of `reps` encodes of `body` in one command buffer, median over TRIALS after one discarded warm-up.
 fn timed(q: mtl.Queue, reps: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), mtl.ComputeEncoder, usize) void) !f64 {
     var ms: [TRIALS]f64 = undefined;
+    try trials(q, reps, ctx, body, &ms);
+    return median(&ms);
+}
+
+/// Each trial's GPU ms of `reps` encodes of `body`, after one discarded warm-up.
+fn trials(q: mtl.Queue, reps: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), mtl.ComputeEncoder, usize) void, ms: *[TRIALS]f64) !void {
     for (0..TRIALS + 1) |t| {
         const cb = q.commandBuffer();
         const e = cb.compute(.serial);
@@ -61,7 +67,6 @@ fn timed(q: mtl.Queue, reps: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx
         }
         if (t > 0) ms[t - 1] = (cb.gpuEnd() - cb.gpuStart()) * 1e3 / @as(f64, @floatFromInt(reps));
     }
-    return median(&ms);
 }
 
 const Gemm = struct { pipes: [2][2]mtl.Pipeline, x: mtl.Buffer, w: mtl.Buffer, y: mtl.Buffer, m: usize, n: usize, k: usize };
@@ -112,10 +117,12 @@ fn gemm(init: std.process.Init) !void {
 }
 
 const Mv = struct { pipe: [6]mtl.Pipeline, x: mtl.Buffer, y: mtl.Buffer };
-const MvOp = struct { w: mtl.Buffer, rows: u32, n: u32, k: u32 };
+/// `kern` forces the kernel's row capacity (1, 2, 4, 8, 16 or 32); 0 picks the smallest that holds `rows`, as the forward does.
+const MvOp = struct { w: mtl.Buffer, rows: u32, n: u32, k: u32, kern: u32 = 0 };
 
 fn mvEncode(mv: *const Mv, e: mtl.ComputeEncoder, op: MvOp) void {
-    const idx: usize = if (op.rows <= 1) 0 else if (op.rows <= 2) 1 else if (op.rows <= 4) 2 else if (op.rows <= 8) 3 else if (op.rows <= 16) 4 else 5;
+    const cap = if (op.kern != 0) op.kern else op.rows;
+    const idx: usize = if (cap <= 1) 0 else if (cap <= 2) 1 else if (cap <= 4) 2 else if (cap <= 8) 3 else if (cap <= 16) 4 else 5;
     e.setPipeline(mv.pipe[idx]);
     e.setBuffer(mv.x, 0, 0);
     e.setBuffer(op.w, 0, 1);
@@ -164,21 +171,31 @@ fn dense(init: std.process.Init, widths: []const [:0]const u8) !void {
         ops[l * shapes.len + j] = .{ .w = b, .rows = 1, .n = @intCast(sh[0]), .k = @intCast(sh[1]) };
         bytes += @floatFromInt(sh[0] * sh[1] * 2);
     };
-    var list: [16]u32 = undefined;
+    // each width is `R` (the forward's kernel choice) or `R@K` (R rows through the K-row kernel)
+    var list: [32][2]u32 = undefined;
     var nw: usize = 0;
     for (widths) |w| {
-        list[nw] = try std.fmt.parseInt(u32, w, 10);
+        var it = std.mem.splitScalar(u8, w, '@');
+        const r = try std.fmt.parseInt(u32, it.first(), 10);
+        list[nw] = .{ r, if (it.next()) |kk| try std.fmt.parseInt(u32, kk, 10) else 0 };
         nw += 1;
     }
     if (nw == 0) for ([_]u32{ 1, 2, 4, 6, 8, 16 }) |r| {
-        list[nw] = r;
+        list[nw] = .{ r, 0 };
         nw += 1;
     };
-    for (list[0..nw]) |rows| {
-        for (&ops) |*op| op.rows = rows;
-        const ms = try timed(q, 2, Phase{ .mv = &mv, .ops = &ops }, phaseBody);
-        std.debug.print("{{\"dense_rows\": {d}, \"ms\": {d:.3}, \"gb\": {d:.2}, \"gbps\": {d:.0}}}\n", .{ rows, ms, bytes / 1e9, bytes / 1e6 / ms });
+    for (list[0..nw]) |rk| {
+        for (&ops) |*op| {
+            op.rows = rk[0];
+            op.kern = rk[1];
+        }
+        var t: [TRIALS]f64 = undefined;
+        try trials(q, 2, Phase{ .mv = &mv, .ops = &ops }, phaseBody, &t);
+        const all = t;
+        const ms = median(&t);
+        std.debug.print("{{\"dense_rows\": {d}, \"kernel\": {d}, \"ms\": {d:.3}, \"trials\": [{d:.2}, {d:.2}, {d:.2}, {d:.2}, {d:.2}], \"gb\": {d:.2}, \"gbps\": {d:.0}}}\n", .{ rk[0], rk[1], ms, all[0], all[1], all[2], all[3], all[4], bytes / 1e9, bytes / 1e6 / ms });
     }
+    for (&ops) |*op| op.kern = 0;
     const names = [_][]const u8{ "q", "gate", "k", "v", "r", "sink", "o", "router" };
     for (shapes, names, 0..) |sh, name, j| for ([_]u32{ 1, 8 }) |rows| {
         var one: [48]MvOp = undefined;
