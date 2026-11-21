@@ -72,6 +72,8 @@ pub const Text = struct {
     }
 };
 
+const default_mtp_eps: f32 = 1e-6;
+
 /// The draft head's shape (mtp_config); the target taps are indices into the backbone, `layers` meaning the final norm.
 pub const Mtp = struct {
     layers: u32,
@@ -86,6 +88,9 @@ pub const Mtp = struct {
     rank: u32,
     taps: [16]u32,
     taps_n: u32,
+    eps: f32, // rms_norm_eps of every draft norm (1e-6 when mtp_config names none)
+    hidden: u32, // the backbone's width and vocabulary, which the head's tensors are shaped by
+    vocab: u32,
 };
 
 pub const Vision = struct {
@@ -100,12 +105,19 @@ pub const Vision = struct {
     text_hidden: u32,
 };
 
+/// How the routed experts are stored: the source checkpoint's own, ModelOpt NVFP4, or an EXL3 pack in experts/.
+pub const Quant = enum { source, nvfp4, exl3 };
+
+/// The EXL3 pack layout the Metal family reads (kortexa's: per-expert trellis files and checkpoint.json).
+pub const pack_format = "kortexa-inkling2-exl3-v1";
+
 pub const Config = struct {
     text: Text,
     vision: Vision,
     mtp: ?Mtp,
     eos: u32,
     image_token: u32,
+    quant: Quant = .source,
 };
 
 fn get(o: std.json.ObjectMap, key: []const u8, why: *Why) !std.json.Value {
@@ -295,6 +307,7 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
     m.window = try int(o, "sliding_window_size", why);
     m.block = try int(o, "block_size", why);
     m.rank = try int(o, "markov_rank", why);
+    m.eps = if (o.get("rms_norm_eps") != null) try float(o, "rms_norm_eps", why) else default_mtp_eps;
     const ids = try get(o, "local_layer_ids", why);
     const taps = try get(o, "target_layer_ids", why);
     const bad = m.layers > m.local.len or m.q_heads % m.kv_heads != 0 or ids != .array or taps != .array or
@@ -318,22 +331,27 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
         m.taps[m.taps_n] = @intCast(e.integer);
         m.taps_n += 1;
     }
+    m.hidden = t.hidden;
+    m.vocab = t.vocab;
     return m;
 }
 
-/// A quantization_config in config.json must be ModelOpt NVFP4, which the experts' header dtype refines per layer.
-fn quantization(o: std.json.ObjectMap, why: *Why) !void {
-    const v = o.get("quantization_config") orelse return;
+/// A quantization_config in config.json: ModelOpt NVFP4 (MXFP8 layers follow from their tensors) or an EXL3 pack.
+fn quantization(o: std.json.ObjectMap, why: *Why) !Quant {
+    const v = o.get("quantization_config") orelse return .source;
     const q = if (v == .object) v.object else {
         why.set("quantization_config is not an object", .{});
         return error.Quant;
     };
-    const ok = std.ascii.eqlIgnoreCase(text(q, "quant_method") orelse "", "modelopt") and
-        std.ascii.eqlIgnoreCase(text(q, "quant_algo") orelse "", "NVFP4");
-    if (!ok) {
-        why.set("quantization_config: the loader reads ModelOpt NVFP4 experts (MXFP8 layers follow from their tensors)", .{});
+    const method = text(q, "quant_method") orelse "";
+    if (std.ascii.eqlIgnoreCase(method, "exl3")) {
+        if (std.mem.eql(u8, text(q, "format") orelse "", pack_format)) return .exl3;
+        why.set("quantization_config: an EXL3 pack must name format {s}", .{pack_format});
         return error.Quant;
     }
+    if (std.ascii.eqlIgnoreCase(method, "modelopt") and std.ascii.eqlIgnoreCase(text(q, "quant_algo") orelse "", "NVFP4")) return .nvfp4;
+    why.set("quantization_config: the loader reads ModelOpt NVFP4 experts (MXFP8 layers follow from their tensors) or an EXL3 pack", .{});
+    return error.Quant;
 }
 
 /// config.json as the reference (configuration_inkling2.py) and the checkpoint read it; a refusal is in `why`.
@@ -356,7 +374,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
         return error.NotInkling2;
     }
     try fixed(o, "tie_word_embeddings", false, why);
-    try quantization(o, why);
+    const quant = try quantization(o, why);
     const t = try parseText(try object(o, "text_config", why), why);
     const eos = try int(o, "eos_token_id", why);
     if (eos >= t.vocab) {
@@ -371,5 +389,6 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
         .mtp = mtp,
         .eos = eos,
         .image_token = image,
+        .quant = quant,
     };
 }

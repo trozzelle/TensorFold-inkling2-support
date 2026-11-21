@@ -282,3 +282,173 @@ test "hold budgeting queries a stateful copy proposer once for a granted depth" 
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(@as(i64, 2), out[0]);
 }
+
+/// Draft `j` of the hold at `position`: its own probability. A pattern that dips under a floor now and then, and gives the floor's
+/// own value (0.7) too, which a draft at the floor must pass.
+fn own(position: u64, j: usize) f64 {
+    return switch ((position *% 2654435761 +% j *% 40503) % 10) {
+        0, 1 => 0.3,
+        2 => 0.55,
+        3 => 0.7,
+        4 => 0.75,
+        else => 0.95,
+    };
+}
+
+/// The drafts a floor lets through: the first, then each next while its own chance reaches the floor.
+fn through(chances: []const f64, floor: f64) usize {
+    if (chances.len == 0) return 0;
+    var n: usize = 1;
+    while (n < chances.len and chances[n] >= floor) n += 1;
+    return n;
+}
+
+/// A drafter that gives each held draft's own probability, as the DSpark head's chances do, not the running product along the
+/// chain; it notes what the floor lets through of each hold and what the engine reads of it.
+const Own = struct {
+    head: dt.FakeDrafter,
+    floor: f64,
+    vtable: dr.Drafter.VTable = undefined,
+    inner_hold: *const fn (*anyopaque, []const dr.Hold) anyerror!void = undefined,
+    inner_held: *const fn (*anyopaque, []const *sm.Stream, []const []u32) anyerror!void = undefined,
+    at: std.AutoHashMapUnmanaged(*sm.Stream, u64) = .empty, // each stream's last hold's position
+    expect: std.AutoHashMapUnmanaged(*sm.Stream, usize) = .empty, // what the floor lets through of its last chances
+    wrong: u32 = 0, // drafts read that were not what the floor lets through
+    trimmed: u32 = 0, // drafts read that were fewer than the hold's
+    by_len: [8]u32 = @splat(0), // windows by the drafts they verify
+
+    fn of(ptr: *anyopaque) *Own {
+        return @fieldParentPtr("head", @as(*dt.FakeDrafter, @ptrCast(@alignCast(ptr))));
+    }
+
+    fn hold(ptr: *anyopaque, items: []const dr.Hold) anyerror!void {
+        const p = of(ptr);
+        for (items) |it| try p.at.put(gpa, it.stream, it.position);
+        return p.inner_hold(ptr, items);
+    }
+
+    fn chances(ptr: *anyopaque, s: *sm.Stream, out: []f64) anyerror!bool {
+        const p = of(ptr);
+        const lane = p.head.lanes.getPtr(s) orelse return false;
+        if (out.len > lane.held.items.len) return error.TooFewDrafts;
+        const position = p.at.get(s) orelse return error.NoHold;
+        for (out, 0..) |*o, j| o.* = own(position, j);
+        try p.expect.put(gpa, s, through(out, p.floor));
+        return true;
+    }
+
+    fn held(ptr: *anyopaque, streams: []const *sm.Stream, out: []const []u32) anyerror!void {
+        const p = of(ptr);
+        for (streams, out) |s, o| {
+            const lane = p.head.lanes.getPtr(s) orelse return error.UnknownStream;
+            const want = p.expect.get(s) orelse return error.ReadBeforeChances;
+            if (o.len != want) p.wrong += 1;
+            if (o.len < lane.held.items.len) p.trimmed += 1;
+            p.by_len[@min(o.len, 7)] += 1;
+        }
+        return p.inner_held(ptr, streams, out);
+    }
+
+    fn drafter(p: *Own) dr.Drafter {
+        const base_ = p.head.drafter();
+        p.vtable = base_.vtable.*;
+        p.inner_hold = base_.vtable.hold;
+        p.inner_held = base_.vtable.held;
+        p.vtable.hold = hold;
+        p.vtable.held = held;
+        p.vtable.chances = chances;
+        return .{ .ptr = &p.head, .vtable = &p.vtable };
+    }
+
+    fn deinit(p: *Own) void {
+        p.at.deinit(gpa);
+        p.expect.deinit(gpa);
+        p.head.deinit();
+    }
+};
+
+const Floored = struct { run: Run, wrong: u32, trimmed: u32, by_len: [8]u32 };
+
+/// Each prompt decoded together, sixty tokens each: as the DSpark head is served with a floor, every round holding `cap` drafts (the
+/// fixed depth) and the lane core verifying those the floor lets through of the drafter's own chances (`copies`: context copies may
+/// take a round); or, with no floor, plain one-token decode.
+fn runFloor(prompts: []const []const u32, floor: ?f64, cap: u32, copies: bool) !Floored {
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var p: Own = .{ .head = .{ .facts_ = .{ .depth = cap, .step_ms = 0.5, .chances = true, .confidence_floor = floor } }, .floor = floor orelse 0 };
+    defer p.deinit();
+    var strict: dt.Strict = .{ .inner = target.backend() };
+    defer strict.deinit();
+    var wrapped = try Drafted.init(gpa, strict.backend(), p.drafter());
+    defer wrapped.deinit();
+    var model = base();
+    if (floor) |x| {
+        model = wrapped.facts(model);
+        model.fixed_depth = @intCast(cap);
+        model.copy_drafts = copies;
+        try std.testing.expect(model.draft_confidence.? == x and !model.draft_probabilities and !model.granted_depth);
+    }
+    var cfg = try Config.init(gpa, model, 16, 15);
+    defer cfg.deinit(gpa);
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, if (floor != null) wrapped.backend() else strict.backend(), clock.clock());
+    defer engine.deinit();
+    var streams: [most_streams]sm.Stream = undefined;
+    const n = prompts.len;
+    for (prompts, streams[0..n]) |prompt, *s| s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = prompt, .max_new = 60, .drafts = floor != null });
+    defer for (streams[0..n]) |*s| s.deinit(gpa);
+    for (streams[0..n]) |*s| try engine.addStream(s);
+    while (engine.activeCount() > 0) try engine.step();
+    var out: Floored = .{ .run = .{ .holds = p.head.holds }, .wrong = p.wrong, .trimmed = p.trimmed, .by_len = p.by_len };
+    for (streams[0..n], 0..) |*s, i| {
+        out.run.lens[i] = s.emitted().len;
+        @memcpy(out.run.tokens[i][0..out.run.lens[i]], s.emitted());
+        out.run.drafted += s.drafted;
+    }
+    return out;
+}
+
+test "a floor on the drafts' own chances cuts each window at the first draft under it, and drafted replies equal one-token decode" {
+    var buf: [most_streams][]const u32 = undefined;
+    for ([_]usize{ 1, 3 }) |n| {
+        const ps = unequal(&buf, n);
+        const plain = try runFloor(ps, null, 7, false);
+        var mean: [4]f64 = undefined;
+        for ([_]f64{ 0, 0.5, 0.7, 0.9 }, &mean) |floor, *drafts| {
+            const r = try runFloor(ps, floor, 7, false);
+            try expectSame(plain.run, r.run, n);
+            // every window the engine verified had the drafts the floor lets through of its hold's chances: at 0.7, one at exactly
+            // 0.7 passes, and a draft under it ends the window even where the later ones are over it
+            try std.testing.expectEqual(@as(u32, 0), r.wrong);
+            try std.testing.expect(r.run.drafted > 0);
+            if (floor == 0) try std.testing.expectEqual(@as(u32, 0), r.trimmed) else try std.testing.expect(r.trimmed > 0);
+            var windows: f64 = 0;
+            var verified: f64 = 0;
+            for (r.by_len, 0..) |count, len| {
+                windows += @floatFromInt(count);
+                verified += @as(f64, @floatFromInt(count)) * @as(f64, @floatFromInt(len));
+            }
+            drafts.* = verified / windows;
+            if (floor == 0.7) try std.testing.expect(r.by_len[1] > 0 and r.by_len[2] + r.by_len[3] + r.by_len[4] + r.by_len[5] + r.by_len[6] + r.by_len[7] > 0);
+        }
+        // a window verifies what was held without a floor, and a floor cuts it to a few drafts: more of them the lower it is
+        try std.testing.expect(mean[0] > mean[1] and mean[1] > mean[3] and mean[0] > mean[3] + 1);
+        // with context copies free to take a round, the head's windows are still cut at the floor and the replies the same
+        const copying = try runFloor(ps, 0.7, 7, true);
+        try expectSame(plain.run, copying.run, n);
+        try std.testing.expectEqual(@as(u32, 0), copying.wrong);
+    }
+}
+
+test "a depth beside the floor caps the drafts a hold offers, and replies stay one-token decode" {
+    var buf: [most_streams][]const u32 = undefined;
+    const ps = unequal(&buf, 3);
+    const plain = try runFloor(ps, null, 7, false);
+    for ([_]u32{ 1, 3, 5 }) |cap| {
+        const r = try runFloor(ps, 0.7, cap, false);
+        try expectSame(plain.run, r.run, 3);
+        try std.testing.expectEqual(@as(u32, 0), r.wrong);
+        for (r.by_len[cap + 1 ..]) |windows| try std.testing.expectEqual(@as(u32, 0), windows); // no window longer than the cap
+        try std.testing.expect(r.by_len[1] > 0);
+    }
+}

@@ -66,6 +66,7 @@ pub const Rule = struct {
     copy_guard: bool = false, // a lone stream's copies compete with its own plain rounds (Config.copy_guard)
     node_probabilities: bool,
     granted_depth: bool = false, // node_probabilities: a stream drafts its last grant plus draft_slack, lone ones too
+    fixed_depth: ?u8 = null, // Config.fixed_depth: headDepth skips the cost rule and probes
     confidence_floor: ?f64 = null,
     plain_streams: u32 = 0, // a shared round with this many streams or more drafts none (0: off; a family's switch)
     batch_rows: u32,
@@ -292,7 +293,9 @@ pub const Rule = struct {
 
     /// Python `_head_depth`: the next round's head drafts for a stream (0 when forced, 1 or none with a copy ahead).
     pub fn headDepth(r: *Rule, who: *const Who, budget: ?i64, probe: Probe) !i64 {
-        const d: i64 = if (who.finished) 0 else if (budget) |b| b else if (r.granted_depth)
+        const d: i64 = if (who.finished) 0 else if (r.fixed_depth) |f|
+            @min(@as(i64, f), @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1)), budget orelse std.math.maxInt(i64))
+        else if (budget) |b| b else if (r.granted_depth)
             try r.grantDepth(who.*)
         else if (r.node_probabilities and !((who.sampled or r.k.floor_rates) and r.confidence_floor != null))
             @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1))

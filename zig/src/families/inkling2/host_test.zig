@@ -2,6 +2,13 @@
 test {
     _ = @import("config.zig");
     _ = @import("config_test.zig");
+    _ = @import("dspark_alpha.zig");
+    _ = @import("dspark_quant.zig");
+    _ = @import("dspark_weights_host_test.zig");
+    _ = @import("exl3_names_test.zig");
+    _ = @import("expert_pack.zig");
+    _ = @import("expert_pack_test.zig");
+    _ = @import("greedy.zig");
     _ = @import("names.zig");
     _ = @import("names_test.zig");
     _ = @import("plan.zig");

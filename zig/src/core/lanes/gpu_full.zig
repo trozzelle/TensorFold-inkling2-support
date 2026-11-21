@@ -62,24 +62,33 @@ fn markOf(c: rule.Cand) Mark {
 pub fn plan(gpa: Allocator, logits: []const f32, s: Sampling) !Plan {
     const r = rule.rule(s);
     const inv_t = r.inv_t;
-    const order = try gpa.alloc(rule.Cand, logits.len);
+    const top_p = r.top_p;
+    const cut_top = s.top_k != 0 and s.top_k < logits.len;
+    const cut_nucleus = top_p > 0.0 and top_p < 1.0;
+    // the order is read at top_k - 1 and over a nucleus's first `candidates` places, and nowhere else
+    const need: usize = @max(if (cut_top) s.top_k else 0, if (cut_nucleus) @min(logits.len, rule.candidates) else 0);
+    const order = try gpa.alloc(rule.Cand, if (need > 0) logits.len else 0);
     defer gpa.free(order);
     var m = -std.math.inf(f32);
-    for (order, logits, 0..) |*c, l, i| {
-        c.* = .{ .v = l * inv_t, .i = @intCast(i) };
-        m = @max(m, c.v);
+    if (need > 0) {
+        for (order, logits, 0..) |*c, l, i| {
+            c.* = .{ .v = l * inv_t, .i = @intCast(i) };
+            m = @max(m, c.v);
+        }
+        rule.orderTop(order, need);
+    } else for (logits) |l| {
+        m = @max(m, l * inv_t);
     }
-    std.mem.sort(rule.Cand, order, {}, rule.better);
     const min_log = r.min_log;
     var p = Plan{ .inv_t = inv_t, .m = m, .lo = @max(m + min_log, m - never) };
-    if (s.top_k != 0 and s.top_k < logits.len) p.top = markOf(order[s.top_k - 1]);
-    const top_p = r.top_p;
-    if (top_p > 0.0 and top_p < 1.0) p.cut = nucleus(logits, p, order, top_p);
+    if (cut_top) p.top = markOf(order[s.top_k - 1]);
+    if (cut_nucleus) p.cut = nucleus(logits, p, order, top_p);
     return p;
 }
 
-/// The nucleus's last token: tf_gpu_sample's sequential sum over its 1,024 candidates, extended when it falls short.
-fn nucleus(logits: []const f32, p: Plan, order: []const rule.Cand, top_p: f32) Mark {
+/// The nucleus's last token: tf_gpu_sample's sequential sum over its 1,024 candidates, extended when it falls short;
+/// `order`'s first 1,024 places (all of them when fewer) hold the best candidates in order.
+pub fn nucleus(logits: []const f32, p: Plan, order: []const rule.Cand, top_p: f32) Mark {
     const norm = mass(logits, p, 1.0, -std.math.inf(f32), start, p.top, end, false);
     const n = @min(order.len, rule.candidates);
     var cum: f32 = 0.0;

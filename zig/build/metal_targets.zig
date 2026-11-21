@@ -374,6 +374,9 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
         .{ .name = "tf-spark-run", .path = "zig/tests/spark25/run.zig", .about = "Spark2.5 on Metal: greedy tokens, every position's logits or a prompt's last logits, for the reference's check" },
         .{ .name = "tf-minimax-run", .path = "zig/tests/minimax_m3/run.zig", .about = "MiniMax-M3.1-Flash greedy tokens, every position's logits or a prompt's last logits, for the reference's check" },
         .{ .name = "tf-minimax-vision", .path = "zig/tests/minimax_m3/vision.zig", .about = "MiniMax-M3.1-Flash's image tower alone: an image's patches and text rows, for tools/vision_ref.py's check" },
+        .{ .name = "tf-inkling-run", .path = "zig/tests/inkling2/run.zig", .about = "Inkling 2 (EXL3 experts) on Metal: load check, layer dumps, teacher-forced finals, exactness, greedy decoding" },
+        .{ .name = "tf-inkling-kernels", .path = "zig/tests/inkling2/kernels.zig", .about = "Inkling 2's Metal glue against FP64 references: values, row independence, non-finite containment" },
+        .{ .name = "tf-inkling-bench", .path = "zig/tests/inkling2/bench.zig", .about = "Inkling 2 benches: tensor-unit GEMM at the dense shapes, the DSpark hold block as matvecs, the core EXL3 expert projections on recorded inputs" },
         .{ .name = "tf-llama-run", .path = "zig/tests/llama/run.zig", .about = "Llama on Metal: greedy tokens, every position's logits or a prompt's last logits, for the reference's check" },
         .{ .name = "tf-flint-run", .path = "zig/tests/flint/run.zig", .about = "Flint greedy tokens, every position's logits or a prompt's last logits, for the reference's check" },
         .{ .name = "tf-qwen36-row-seam", .path = "zig/tests/qwen36_row_seam.zig", .about = "Model-free fixture: the row projection's bias sums stay fp32 at every width" },
@@ -515,6 +518,8 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     b.step("test-lfm2", "The LFM2-MoE family's tests: config, draws, state and its shared rounds on this Mac's GPU").dependOn(&lfm2_tests.step);
     const lfm2_dspark = b.addRunArtifact(b.addTest(.{ .root_module = engine, .filters = &.{"lfm2 dspark:"} }));
     b.step("test-lfm2-dspark", "LFM2's taps for a drafter: the tap kernel on this Mac's GPU").dependOn(&lfm2_dspark.step);
+    const inkling2_tests = b.addRunArtifact(b.addTest(.{ .root_module = engine, .filters = &.{"inkling2"} }));
+    b.step("test-inkling2-engine", "The Inkling 2 family's engine tests: state sizes, load budget and the Metal backend on this Mac's GPU").dependOn(&inkling2_tests.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes })).step);
     // the fake fabric maps windows with mmap (the Macs' RDMA, not Windows); verbs is its own module, with its own root
     if (target.result.os.tag != .windows) {

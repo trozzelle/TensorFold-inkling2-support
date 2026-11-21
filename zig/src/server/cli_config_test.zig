@@ -183,8 +183,9 @@ test "serve --config: a file parses as its flags typed by hand, and the command 
         \\alias = ["a", "b"]
         \\compact-at = "auto"
         \\prompt_cache_gib = 2.5
+        \\load_limit_gb = 236
     ;
-    const typed: []const []const u8 = &.{ "org/Model", "--host", "0.0.0.0", "--port", "9000", "--context", "131072", "--temperature", "0.6", "--no-thinking", "--dashboard", "--alias", "a", "--alias", "b", "--compact-at", "auto", "--prompt-cache-gib", "2.5" };
+    const typed: []const []const u8 = &.{ "org/Model", "--host", "0.0.0.0", "--port", "9000", "--context", "131072", "--temperature", "0.6", "--no-thinking", "--dashboard", "--alias", "a", "--alias", "b", "--compact-at", "auto", "--prompt-cache-gib", "2.5", "--load-limit-gb", "236" };
     const from_file = try cli.parse(a, try f.merged(text, &.{}), &f.u);
     const by_hand = try cli.parse(a, typed, &f.u);
     try t.expectEqualDeep(by_hand, from_file);

@@ -55,6 +55,31 @@ test "under a confidence floor a greedy stream drafts the most, and a sampled on
     try std.testing.expectEqual(@as(i64, 1), try rule.headDepth(&sampled, null, probe)); // a first rate under 0.8: one draft
 }
 
+test "a fixed depth skips the cost rule and is bounded by the most drafts" {
+    const gpa = std.testing.allocator;
+    const No = struct {
+        fn copy(_: *anyopaque, _: *const Who) bool {
+            return false;
+        }
+    };
+    var unused: u8 = 0;
+    const probe: Probe = .{ .ptr = &unused, .copy = No.copy };
+    for ([_]f64{ 0.05, 0.99 }) |p| { // costs favouring one draft, then seven
+        var fc: Table = .{};
+        defer fc.deinit(gpa);
+        for (1..9) |w| try fc.put(gpa, @intCast(w), if (p < 0.5) 5.0 * @as(f64, @floatFromInt(w)) else 5.0);
+        const shared: Table = .{};
+        var rule: Rule = .{ .gpa = gpa, .prior = &.{ p, p, p, p, p, p, p }, .most_drafts = 7, .fixed_depth = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0.5, .plain_guard = false, .node_probabilities = false, .batch_rows = 8 };
+        defer rule.deinit();
+        var st: ?State = null;
+        defer if (st) |*s| s.deinit(gpa);
+        const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
+        try std.testing.expectEqual(@as(i64, 3), try rule.headDepth(&who, null, probe));
+        rule.most_drafts = 2;
+        try std.testing.expectEqual(@as(i64, 2), try rule.headDepth(&who, null, probe));
+    }
+}
+
 test "a shared round's drafts come out the same whichever depths its overhead was measured at" {
     const gpa = std.testing.allocator;
     var shared: Table = .{};

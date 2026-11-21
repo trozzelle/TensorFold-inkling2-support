@@ -74,6 +74,7 @@ pub const Engine = struct {
                 .copy_guard = cfg.copy_guard,
                 .node_probabilities = cfg.node_probabilities,
                 .granted_depth = cfg.granted_depth,
+                .fixed_depth = cfg.fixed_depth,
                 .confidence_floor = cfg.draft_confidence,
                 .plain_streams = cfg.plain_streams,
                 .batch_rows = cfg.batch_rows,
