@@ -10,6 +10,7 @@ const exl3 = @import("tensorfold").exl3_projection;
 const usage =
     \\tf-inkling-bench gemm                                         tensor-unit GEMM at the dense shapes, M 512/2048/4096
     \\tf-inkling-bench draft                                        the DSpark hold block as bf16 matvecs
+    \\tf-inkling-bench dense                                        48 layers' dense matvecs at 1-16 rows, unembed at 1 row
     \\tf-inkling-bench experts <model> <layer> <xm.bin> <eids.bin> <rows> <row0> <act.bin> <out>
     \\                                                              w13 and w2 on recorded MoE inputs, bf16 out
     \\
@@ -24,6 +25,7 @@ pub fn main(init: std.process.Init) !void {
     defer pool.pop();
     if (args.len >= 2 and std.mem.eql(u8, args[1], "gemm")) return gemm(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "draft")) return draft(init);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "dense")) return dense(init);
     if (args.len == 10 and std.mem.eql(u8, args[1], "experts")) return experts(init, args);
     std.debug.print("{s}", .{usage});
     return error.UnknownMode;
@@ -128,16 +130,57 @@ fn phaseBody(p: Phase, e: mtl.ComputeEncoder, _: usize) void {
     for (p.ops) |op| mvEncode(p.mv, e, op);
 }
 
-fn draft(init: std.process.Init) !void {
-    const device = try mtl.Device.init();
-    const q = try device.queue();
+fn mvSetup(device: mtl.Device) !struct { mv: Mv, lib: mtl.Library } {
     const lib = try mtl.Library.fromSource(device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
-    defer lib.deinit();
     var mv: Mv = undefined;
     for ([_][:0]const u8{ "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32" }, 0..) |n, i| mv.pipe[i] = try mtl.Pipeline.init(device, lib, n, false);
     mv.x = try device.buffer(8 * 18432 * 2, mtl.ResourceOptions.shared);
     mv.y = try device.buffer(8 * 201024 * 2, mtl.ResourceOptions.shared);
     fill(mv.x, 8 * 18432, 3);
+    return .{ .mv = mv, .lib = lib };
+}
+
+/// The decode step's dense matvecs: every layer's q, gate, k, v, r, sink, o and router with its own weights (9.55 GB,
+/// so nothing stays in cache), at the window widths, and the unembed for one row.
+fn dense(init: std.process.Init) !void {
+    const device = try mtl.Device.init();
+    const q = try device.queue();
+    const s = try mvSetup(device);
+    defer s.lib.deinit();
+    const mv = s.mv;
+    var bufs: std.ArrayList(mtl.Buffer) = .empty;
+    defer {
+        for (bufs.items) |b| b.deinit();
+        bufs.deinit(init.gpa);
+    }
+    const shapes = [_][2]usize{ .{ 6144, 4608 }, .{ 6144, 4608 }, .{ 1024, 4608 }, .{ 1024, 4608 }, .{ 768, 4608 }, .{ 48, 4608 }, .{ 4608, 6144 }, .{ 384, 4608 } };
+    var ops: [48 * shapes.len]MvOp = undefined;
+    var bytes: f64 = 0;
+    for (0..48) |l| for (shapes, 0..) |sh, j| {
+        const b = try device.buffer(sh[0] * sh[1] * 2, mtl.ResourceOptions.shared);
+        try bufs.append(init.gpa, b);
+        fill(b, sh[0] * sh[1], 200 + l * shapes.len + j);
+        ops[l * shapes.len + j] = .{ .w = b, .rows = 1, .n = @intCast(sh[0]), .k = @intCast(sh[1]) };
+        bytes += @floatFromInt(sh[0] * sh[1] * 2);
+    };
+    for ([_]u32{ 1, 2, 4, 6, 8, 16 }) |rows| {
+        for (&ops) |*op| op.rows = rows;
+        const ms = try timed(q, 2, Phase{ .mv = &mv, .ops = &ops }, phaseBody);
+        std.debug.print("{{\"dense_rows\": {d}, \"ms\": {d:.3}, \"gb\": {d:.2}, \"gbps\": {d:.0}}}\n", .{ rows, ms, bytes / 1e9, bytes / 1e6 / ms });
+    }
+    const unembed = [_]MvOp{.{ .w = try device.buffer(201024 * 4608 * 2, mtl.ResourceOptions.shared), .rows = 1, .n = 201024, .k = 4608 }};
+    try bufs.append(init.gpa, unembed[0].w);
+    fill(unembed[0].w, 201024 * 4608, 300);
+    const ms = try timed(q, 4, Phase{ .mv = &mv, .ops = &unembed }, phaseBody);
+    std.debug.print("{{\"unembed1_ms\": {d:.3}, \"gbps\": {d:.0}}}\n", .{ ms, 201024.0 * 4608 * 2 / 1e6 / ms });
+}
+
+fn draft(init: std.process.Init) !void {
+    const device = try mtl.Device.init();
+    const q = try device.queue();
+    const s = try mvSetup(device);
+    defer s.lib.deinit();
+    const mv = s.mv;
     var gpa_ops: std.ArrayList(MvOp) = .empty;
     defer gpa_ops.deinit(init.gpa);
     var bufs: std.ArrayList(mtl.Buffer) = .empty;
