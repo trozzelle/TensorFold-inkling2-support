@@ -18,6 +18,7 @@ pub const Model = struct {
     limit_shared_drafts: bool = false, // retain the cost rule's depth cap before reserving shared rows
     root_copies: bool = false, // verified context copies precede head drafts and skip their proposal pass
     copy_drafts: bool = true, // global serving switch, independent of shared verification capacity
+    fixed_depth: ?u8 = null, // a head that drafts this deep every round, bounded by the room and drafts (skips the cost rule)
     own_copy_rates: bool = false, // a copy window is priced by its stream's own copies, not copy_rate's prior
 
     exact_width: u32 = 1, // the widest window that reproduces one-token steps bit for bit
@@ -78,6 +79,7 @@ pub const Config = struct {
     pipelined: bool,
     plain_guard: bool,
     copy_guard: bool = false, // Model.copy_guard: off unless the family sets it (lanes/lone_copy.zig)
+    fixed_depth: ?u8 = null, // Model.fixed_depth
     most_drafts: u32,
     draft_confidence: ?f64 = null,
     family_streams: bool,
@@ -168,6 +170,7 @@ pub const Config = struct {
             .plain_guard = m.plain_guard,
             .copy_guard = m.copy_guard,
             .most_drafts = @min(m.drafts, @min(width - 1, max_draft)),
+            .fixed_depth = m.fixed_depth,
             .draft_confidence = m.draft_confidence,
             .family_streams = streams,
             .batch_rows = batch_rows,
