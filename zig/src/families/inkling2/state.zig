@@ -7,8 +7,26 @@ const exl3 = @import("../../core/exl3_projection.zig");
 
 /// Rows of a verify window at most (the pending token and its copy drafts).
 pub const window_rows = 16;
-/// Rows of a prompt chunk at most; every kernel keeps rows independent, so chunks change no bits.
-pub const prompt_rows = 512;
+/// Rows of a prompt chunk at most when a load does not ask for others (`model.Options.prefill_rows`): every kernel keeps rows
+/// independent, so the rows a chunk holds change no bits.
+pub const default_prefill_rows = 512;
+/// A load's chunk rows are a multiple of `prefill_unit` from `prefill_unit` to `max_prefill_rows`.
+pub const prefill_unit = 64;
+pub const max_prefill_rows = 8192;
+
+/// Whether `rows` is a prompt chunk size a load may take.
+pub fn validPrefillRows(rows: usize) bool {
+    return rows >= prefill_unit and rows <= max_prefill_rows and rows % prefill_unit == 0;
+}
+
+/// The rows INKLING_PREFILL_ROWS names: null or blank is `default_prefill_rows`, else a whole number `validPrefillRows` accepts.
+pub fn parsePrefillRows(text: ?[]const u8) error{BadPrefillRows}!u32 {
+    const t = std.mem.trim(u8, text orelse "", " \t");
+    if (t.len == 0) return default_prefill_rows;
+    const n = std.fmt.parseInt(u32, t, 10) catch return error.BadPrefillRows;
+    return if (validPrefillRows(n)) n else error.BadPrefillRows;
+}
+
 /// Positions each convolution's input ring holds: three taps back plus a window's rows, so a rejected window rolls
 /// back by moving the cache length alone.
 pub const ring = 32;
@@ -128,9 +146,10 @@ pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", 
 pub const max_segs = 6;
 pub const seg_slot = 256;
 
-/// Bytes of each Scratch buffer, in `fields` order, for prompt_rows rows and caches of up to `capacity` positions.
-fn sizes(c: *const cfg.Text, capacity: usize) ![fields.len]usize {
-    const R: usize = prompt_rows;
+/// Bytes of each Scratch buffer, in `fields` order, for `rows` prompt rows and caches of up to `capacity` positions.
+fn sizes(c: *const cfg.Text, capacity: usize, rows: usize) ![fields.len]usize {
+    if (!validPrefillRows(rows)) return error.InvalidInkling2PrefillRows;
+    const R: usize = rows;
     const H: usize = c.hidden;
     const qh: usize = c.local.q;
     const qw: usize = qh * c.local.dim;
@@ -152,14 +171,15 @@ fn sizes(c: *const cfg.Text, capacity: usize) ![fields.len]usize {
         window_rows * c.topk * 2 * H * 4, // planes: the decode chain's w13 output per slot as two f32 K halves
         window_rows * c.topk * H * 4, // sums: its w2 output per slot before the output rotation, f32
         window_rows * feature_taps * H * 2, // ftaps: a decode window's rows of the drafter's taps
-        prompt_rows * feature_taps * H * 2, // ptaps: a prompt chunk's
+        rows * feature_taps * H * 2, // ptaps: a prompt chunk's
     };
 }
 
-/// Bytes of a Scratch for caches of up to `capacity` positions; capacity 0 counts what does not grow with the context.
-pub fn scratchBytes(c: *const cfg.Text, capacity: usize) !usize {
+/// Bytes of a Scratch for caches of up to `capacity` positions and prompt chunks of `rows` rows; capacity 0 counts what does not
+/// grow with the context.
+pub fn scratchBytes(c: *const cfg.Text, capacity: usize, rows: usize) !usize {
     var total: usize = 0;
-    for (try sizes(c, capacity)) |n| total += n;
+    for (try sizes(c, capacity, rows)) |n| total += n;
     return total;
 }
 
@@ -215,15 +235,18 @@ pub const Scratch = struct {
     ptaps: mtl.Buffer,
     /// Positions of the longest cache this scratch serves: the split attention's partials hold that many keys' blocks.
     capacity: usize,
+    /// Rows of a prompt chunk at most: every per-row buffer holds that many.
+    prefill_rows: usize,
     /// The GPU seconds a decode step of each row count is expected to take (0: none yet), for the next one's wait: a
     /// shorter step replaces it at once, a longer one moves it a quarter of the way.
     expected: [window_rows + 1]f64,
 
-    pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize) !Scratch {
+    pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, rows: usize) !Scratch {
         @setEvalBranchQuota(10000);
-        const sz = try sizes(c, capacity);
+        const sz = try sizes(c, capacity, rows);
         var s: Scratch = undefined;
         s.capacity = capacity;
+        s.prefill_rows = rows;
         s.expected = @splat(0);
         var made: [fields.len]bool = @splat(false);
         errdefer inline for (fields, 0..) |f, i| if (made[i]) @field(s, f).deinit();
@@ -257,10 +280,60 @@ test "inkling2 state: tiles pad each expert to 8 rows; a cache's bytes; the spli
 
 test "inkling2 state: the drafter's taps are eight hidden rows a row, a decode window's and a prompt chunk's" {
     const row: usize = feature_taps * 4608 * 2;
-    const bytes = try sizes(&small, 256);
+    const bytes = try sizes(&small, 256, default_prefill_rows);
     inline for (fields, 0..) |f, i| {
         if (comptime std.mem.eql(u8, f, "ftaps")) try std.testing.expectEqual(window_rows * row, bytes[i]);
-        if (comptime std.mem.eql(u8, f, "ptaps")) try std.testing.expectEqual(prompt_rows * row, bytes[i]);
+        if (comptime std.mem.eql(u8, f, "ptaps")) try std.testing.expectEqual(default_prefill_rows * row, bytes[i]);
     }
     try std.testing.expectEqual(@as(usize, 8), feature_taps);
+}
+
+test "inkling2 state: a prompt chunk's rows are a multiple of 64 from 64 to 8192, and 512 unless the setting names others" {
+    for ([_]usize{ 64, 128, 512, 4096, 8192 }) |rows| try std.testing.expect(validPrefillRows(rows));
+    for ([_]usize{ 0, 1, 63, 65, 100, 8192 + 64, 1 << 20 }) |rows| try std.testing.expect(!validPrefillRows(rows));
+    try std.testing.expectEqual(@as(usize, 512), default_prefill_rows);
+    try std.testing.expectEqual(@as(u32, 512), try parsePrefillRows(null));
+    try std.testing.expectEqual(@as(u32, 512), try parsePrefillRows(" \t"));
+    try std.testing.expectEqual(@as(u32, 2048), try parsePrefillRows("2048"));
+    try std.testing.expectEqual(@as(u32, 64), try parsePrefillRows(" 64 "));
+    for ([_][]const u8{ "0", "63", "100", "8256", "-64", "lots", "2048k", "1e3", "0x40" }) |bad| try std.testing.expectError(error.BadPrefillRows, parsePrefillRows(bad));
+}
+
+test "inkling2 state: the scratch's per-row buffers follow the prompt chunk's rows, the context's partials do not" {
+    const row: usize = feature_taps * 4608 * 2;
+    for ([_]usize{ 64, 512, 2048, 8192 }) |rows| {
+        const bytes = try sizes(&small, 256, rows);
+        inline for (fields, 0..) |f, i| {
+            if (comptime std.mem.eql(u8, f, "ids")) try std.testing.expectEqual(rows * 4, bytes[i]);
+            if (comptime std.mem.eql(u8, f, "h")) try std.testing.expectEqual(rows * 4608 * 2, bytes[i]);
+            if (comptime std.mem.eql(u8, f, "blocks")) try std.testing.expectEqual(maxBlocks(&small) * rows * 4608 * 4, bytes[i]);
+            if (comptime std.mem.eql(u8, f, "ptaps")) try std.testing.expectEqual(rows * row, bytes[i]);
+            if (comptime std.mem.eql(u8, f, "ftaps")) try std.testing.expectEqual(window_rows * row, bytes[i]);
+            if (comptime std.mem.eql(u8, f, "part")) try std.testing.expectEqual(partBytes(&small, 256), bytes[i]);
+        }
+    }
+    // the default chunk's scratch is what a load held before the chunk was a setting
+    try std.testing.expectEqual(@as(usize, 614_881_792), try scratchBytes(&small, 0, default_prefill_rows));
+    try std.testing.expect(try scratchBytes(&small, 0, 2048) > try scratchBytes(&small, 0, 512));
+    for ([_]usize{ 0, 63, 100, 8192 + 64 }) |rows| {
+        try std.testing.expectError(error.InvalidInkling2PrefillRows, sizes(&small, 256, rows));
+        try std.testing.expectError(error.InvalidInkling2PrefillRows, scratchBytes(&small, 0, rows));
+    }
+}
+
+test "inkling2 state: a scratch made for some rows holds buffers for them and says how many" {
+    const device = mtl.Device.init() catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer device.deinit();
+    var few = try Scratch.init(device, &small, 256, 64);
+    defer few.deinit();
+    var more = try Scratch.init(device, &small, 256, 128);
+    defer more.deinit();
+    try std.testing.expectEqual(@as(usize, 64), few.prefill_rows);
+    try std.testing.expectEqual(@as(usize, 128), more.prefill_rows);
+    try std.testing.expectEqual(@as(usize, 64 * feature_taps * 4608 * 2), few.ptaps.length());
+    try std.testing.expectEqual(@as(usize, 128 * feature_taps * 4608 * 2), more.ptaps.length());
+    try std.testing.expectError(error.InvalidInkling2PrefillRows, Scratch.init(device, &small, 256, 100));
 }

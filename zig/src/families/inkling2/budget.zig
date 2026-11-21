@@ -32,7 +32,7 @@ pub fn caches(ram: u64, working_set: u64, limit_gb: ?f64, resident: u64) error{B
 /// its fold among them), the scratch that does not grow with the context, and `head`, the draft head's scratch and its stream's
 /// state (0 without one).
 pub fn held(model: *const Model, head: u64) !u64 {
-    return model.checkpoint.residentBytes() + try st.scratchBytes(&model.config.text, 0) + head;
+    return model.checkpoint.residentBytes() + try st.scratchBytes(&model.config.text, 0, model.prefill_rows) + head;
 }
 
 /// Bytes a context of `capacity` positions takes besides the weights: a stream's caches, and the scratch that grows with

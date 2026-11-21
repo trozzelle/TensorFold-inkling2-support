@@ -17,6 +17,7 @@ const Model = @import("model.zig").Model;
 const glue_names = @import("model.zig").glue_names;
 const dspark = @import("dspark.zig");
 const backend = @import("backend.zig");
+const fwd = @import("forward.zig");
 const budget = @import("budget.zig");
 const state = @import("state.zig");
 
@@ -184,6 +185,7 @@ const Fixture = struct {
             .draft = w,
             .warm_wait = true,
             .first_chunk = 0,
+            .prefill_rows = state.default_prefill_rows,
         };
         return f;
     }
@@ -662,7 +664,7 @@ test "inkling2 dspark: the load's budget takes the head's file, fold, scratch an
     const dense = 5 << 20;
     try f.model.checkpoint.own(try f.device.buffer(dense, mtl.ResourceOptions.shared), dense);
     const plain = try budget.held(f.model, 0);
-    try t.expectEqual(dense + try state.scratchBytes(&f.model.config.text, 0), plain);
+    try t.expectEqual(dense + try state.scratchBytes(&f.model.config.text, 0, f.model.prefill_rows), plain);
     // with drafts: the draft file joins the shards (as `Model.load` leaves it), then the head is made and its fold joins them
     const file = 3 << 20;
     try f.model.checkpoint.own(try f.device.buffer(file, mtl.ResourceOptions.shared), file);
@@ -678,6 +680,39 @@ test "inkling2 dspark: the load's budget takes the head's file, fold, scratch an
     const room_drafted = try budget.caches(256 * gib, 240 * gib, 236, base + drafted);
     try t.expect(room_plain > 20 * gib);
     try t.expectEqual(d.residentBytes(1), room_plain - room_drafted);
+}
+
+test "inkling2 prefill rows: the model's setting sizes the scratch and the load's budget, and a chunk past the scratch's rows is refused" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const c = &f.model.config.text;
+    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    defer cache.deinit();
+    var ids: [129]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(5 + i);
+    // a scratch of 64 rows takes a chunk of 64 and refuses one of 65; a scratch of 128 takes 128 and refuses 129
+    const prompt: fwd.Out = .{ .logits = .none, .prompt = true };
+    var few = try state.Scratch.init(f.device, c, 256, 64);
+    defer few.deinit();
+    try fwd.run(f.model, &few, &cache, ids[0..64], prompt);
+    try t.expectError(error.Inkling2RowsExceeded, fwd.run(f.model, &few, &cache, ids[0..65], prompt));
+    var more = try state.Scratch.init(f.device, c, 256, 128);
+    defer more.deinit();
+    try fwd.run(f.model, &more, &cache, ids[0..128], prompt);
+    try t.expectError(error.Inkling2RowsExceeded, fwd.run(f.model, &more, &cache, ids[0..129], prompt));
+    // the model's rows size the backend's scratch, and the load's budget counts that scratch
+    f.model.prefill_rows = 256;
+    const metal = try backend.Metal.init(gpa, f.model, .{ .capacity = 64, .budget = 1 << 30 });
+    defer metal.deinit();
+    try t.expectEqual(@as(usize, 256), metal.scratch.prefill_rows);
+    try t.expectEqual(try state.scratchBytes(c, 0, 256), try budget.held(f.model, 0) - f.model.checkpoint.residentBytes());
+    f.model.prefill_rows = 128;
+    try t.expectEqual(try state.scratchBytes(c, 0, 128), try budget.held(f.model, 0) - f.model.checkpoint.residentBytes());
 }
 
 test "inkling2 dspark: a drafted load's facts fix the depth or leave it to the rule, with the timed window costs and the logprob rows kept" {

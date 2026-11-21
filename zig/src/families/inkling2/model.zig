@@ -25,7 +25,9 @@ comptime {
 /// experts: the embedding, the final norm and the unembedding alone, enough to run the draft head over recorded taps.
 /// `drafts`: also load the DSpark draft head from the folder's mtp.safetensors, when the config has one and the file is there.
 /// `draft_bits`: the width of the draft layers' projections (INKLING_DRAFT_BITS): quantized to 8 bits at load, or the file's bf16.
-pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default };
+/// `prefill_rows`: rows of a prompt chunk at most (INKLING_PREFILL_ROWS), a multiple of 64 from 64 to 8192: a scratch is made for
+/// that many rows and a prompt is fed in pieces of them.
+pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default, prefill_rows: u32 = st.default_prefill_rows };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -45,13 +47,17 @@ pub const Model = struct {
     /// Layers a decode step commits in a command buffer of their own, before the rest are encoded (0: the step is one
     /// command buffer); INKLING_FIRST_CHUNK.
     first_chunk: u32,
+    /// Rows of a prompt chunk at most (`Options.prefill_rows`): the load's scratch and budget are sized for them.
+    prefill_rows: u32,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Options) !*Model {
+        if (!st.validPrefillRows(opts.prefill_rows)) return error.InvalidInkling2PrefillRows;
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.gpa = gpa;
+        m.prefill_rows = opts.prefill_rows;
         m.warm_wait = if (std.c.getenv("INKLING_WARM_WAIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.first_chunk = if (std.c.getenv("INKLING_FIRST_CHUNK")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4 else 4;
         const cpath = try std.fs.path.join(gpa, &.{ dir, "config.json" });

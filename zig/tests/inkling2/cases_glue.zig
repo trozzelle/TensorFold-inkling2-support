@@ -134,7 +134,7 @@ fn caseDepth(g: *const h.Gpu, r: std.Random) !void {
     const rows = 3;
     const K = 4;
     const Q = 3;
-    const stride = 8; // the blocks' rows apart, as the scratch's prompt_rows
+    const stride = 8; // the blocks' rows apart, as the scratch's prefill rows
     const blocks = try g.buf(K * stride * H * 4);
     const part = try g.buf(rows * H * 4);
     const q = try g.buf(Q * H * 4);

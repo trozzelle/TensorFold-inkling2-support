@@ -67,6 +67,12 @@ checks that each row's result is independent of the rows beside it, and that a N
   prints the median wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw), with a digest
   of the last hidden rows to compare two configurations bit for bit. `tf-inkling-kernels time` times the fused norm
   kernels at the block and query counts of the real layers.
+- `INKLING_PREFILL_ROWS` sets the rows of a prompt chunk at most (a multiple of 64 from 64 to 8,192; default 512). The
+  scratch is made for that many rows, so a larger chunk takes more of the load limit, and a prompt is fed in pieces of
+  that many. Every kernel keeps rows independent, so the chunk size changes no bits.
+- `tf-inkling-run MODEL prefill ids.json [--chunk N] [--layers L] [--spans] [--drafts]` feeds a prompt through the
+  serving prompt path and prints its time and its GPU time by class (`--spans` adds a line a chunk; `--drafts` adds
+  the draft head's taps and absorb). `INKLING_PREFILL_ROWS` sets the chunk of its other modes too.
 
 ## Drafts
 

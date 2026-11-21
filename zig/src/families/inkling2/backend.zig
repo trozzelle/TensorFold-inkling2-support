@@ -61,7 +61,7 @@ pub const Metal = struct {
         const out = try gpa.create(Metal);
         errdefer gpa.destroy(out);
         // a stream's cache holds one position past the context window; the warm-up window runs a window's rows at least
-        var scratch = try st.Scratch.init(model.device, &model.config.text, @max(options.capacity + 1, st.window_rows));
+        var scratch = try st.Scratch.init(model.device, &model.config.text, @max(options.capacity + 1, st.window_rows), model.prefill_rows);
         errdefer scratch.deinit();
         const tokens = try gpa.alloc(u32, ring);
         errdefer gpa.free(tokens);
@@ -181,7 +181,7 @@ pub const Metal = struct {
         var at: usize = 0;
         while (at < ids.len) {
             if (stream.isCancelled()) return error.Cancelled;
-            const n = @min(ids.len - at, st.prompt_rows);
+            const n = @min(ids.len - at, self.scratch.prefill_rows);
             const last = at + n == ids.len;
             const to: ?fwd.B = if (self.tapped) .{ .buf = self.scratch.ptaps } else null;
             try fwd.run(self.model, &self.scratch, cache, ids[at..][0..n], .{ .logits = if (last) .last else .none, .prompt = true, .feature_taps = to });

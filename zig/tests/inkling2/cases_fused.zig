@@ -6,7 +6,7 @@ const mtl = @import("metal");
 const h = @import("harness.zig");
 
 const H = 4608;
-const stride = 24; // the blocks' rows apart (the scratch uses prompt_rows)
+const stride = 24; // the blocks' rows apart (the scratch uses its prefill rows)
 const eps_norm: f32 = 1e-5; // away from the RMS's 1e-6, so a swapped epsilon shows
 const eps_rms: f32 = 1e-6;
 const f32_in: u32 = 1; // forward.zig's flags

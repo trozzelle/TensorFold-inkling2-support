@@ -35,8 +35,8 @@ fn t(x: wts.Tensor) B {
 /// `prompt` marks rows that feed a prompt: they always take the one-kernel-per-op path, whatever their count; other
 /// forwards of at most `window_rows` rows take the decode path (fused norms, stacked attention-input matvec, split-K
 /// attention).
-/// `spans` records each stage group's GPU time by class (the `profile` mode); `repeat` runs the loaded layers that many
-/// times in the one command buffer (profile only: the cache's position stays, so the repeats re-read the same rows).
+/// `spans` records each stage group's GPU time by class (the `profile` and `prefill` modes); `repeat` runs the loaded layers
+/// that many times in the one command buffer (profile only: the cache's position stays, so the repeats re-read the same rows).
 pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1 };
 /// `encode` and `gpu` add up over forwards; `committed`, `started`, `ended` and `woke` are the last forward's clocks in
 /// `seconds()`'s timebase: the host's commit, the GPU's start and end, and the host's return from the wait.
@@ -124,10 +124,12 @@ const Enc = struct {
         if (groups) x.e.dispatchGroups(g3, t3) else x.e.dispatchThreads(g3, t3);
     }
 
-    /// The `n` hidden rows at `src` as tap `k` of the rows of eight taps at `to` ([n][8][hidden] bf16).
-    fn tap(x: Enc, to: B, src: B, k: usize) void {
+    /// The `n` hidden rows at `src` as tap `k` of the rows of eight taps at `to` ([n][8][hidden] bf16), in a taps span.
+    fn tap(x: Enc, to: B, src: B, k: usize) !void {
         const H: usize = x.m.config.text.hidden;
+        try x.begin(.taps);
         x.glue(.tap, .{ .rows = @intCast(x.n), .width = @intCast(H), .stride = @intCast(st.feature_taps * H) }, &.{ src, bo(to.buf, to.off + k * H * 2) }, .{ H, x.n, 1 }, .{ 256, 1, 1 }, false);
+        try x.end();
     }
 
     /// out = in W^T for `rows` rows in slabs of at most 32 (one row's bits do not depend on the slab).
@@ -235,7 +237,7 @@ const Enc = struct {
 pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, out: Out) !void {
     const c = &m.config.text;
     const n = ids.len;
-    if (n == 0 or n > st.prompt_rows or (out.logits == .all and n > st.window_rows)) return error.Inkling2RowsExceeded;
+    if (n == 0 or n > s.prefill_rows or (out.logits == .all and n > st.window_rows)) return error.Inkling2RowsExceeded;
     if (cache.len + n > cache.capacity) return error.Inkling2ContextFull;
     const decode = !out.prompt and n <= st.window_rows;
     // the decode path's split attention keeps one partial for each 256-key block of the cache so far
@@ -266,7 +268,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
         const i = li % m.layers;
         if (out.taps != null or out.feature_taps != null) for (tap_layers, 0..) |l, k| if (l == i) {
             if (out.taps) |tp| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(tp.h, k * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
-            if (out.feature_taps) |ft| x.tap(ft, b(s.h), k);
+            if (out.feature_taps) |ft| try x.tap(ft, b(s.h), k);
         };
         try layer(x, @intCast(i));
         if (out.taps) |tp| {
@@ -288,7 +290,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
         }
     }
     if (out.finals or out.feature_taps != null or out.logits != .none) try final(x);
-    if (out.feature_taps) |ft| x.tap(ft, b(s.finals), tap_layers.len);
+    if (out.feature_taps) |ft| try x.tap(ft, b(s.finals), tap_layers.len);
     if (out.logits != .none) {
         const first: usize = if (out.logits == .last) n - 1 else 0;
         const rows = n - first;
@@ -364,8 +366,8 @@ fn layer(x: Enc, i: u32) !void {
     const hd = p.heads;
     const kvw: usize = @as(usize, hd.kv) * hd.dim;
     const K: u32 = p.blocks_in;
-    const stride: u32 = st.prompt_rows;
-    const slab: usize = st.prompt_rows * H * 4;
+    const stride: u32 = @intCast(s.prefill_rows);
+    const slab: usize = s.prefill_rows * H * 4;
     const glob = p.kind == .global;
     const pos: u32 = @intCast(cache.len);
     const one = .{ 1024, 1, 1 };
@@ -484,9 +486,9 @@ fn final(x: Enc) !void {
     const nr: u32 = @intCast(n);
     const one = .{ 1024, 1, 1 };
     const K: u32 = @intCast(st.maxBlocks(c));
-    try x.begin(.norm);
+    try x.begin(.final);
     x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), b(s.nr) }, .{ n, 1, 1 }, one, true);
-    x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = 1, .stride = st.prompt_rows, .scale = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(c.hidden)))) }, &.{ b(s.blocks), b(s.nr), t(m.weights.out_query), b(s.fin) }, .{ n, 1, 1 }, one, true);
+    x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = 1, .stride = @intCast(s.prefill_rows), .scale = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(c.hidden)))) }, &.{ b(s.blocks), b(s.nr), t(m.weights.out_query), b(s.fin) }, .{ n, 1, 1 }, one, true);
     x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .flags = f32_in, .eps = c.eps }, &.{ b(s.fin), t(m.weights.norm), b(s.finals) }, .{ n, 1, 1 }, one, true);
     try x.end();
 }

@@ -65,11 +65,16 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
             return null;
         };
     }
+    // rows of a prompt chunk at most: read once, and the load's scratch and budget and the host's prefill step follow it
+    const prefill_rows = fl.state.parsePrefillRows(if (std.c.getenv("INKLING_PREFILL_ROWS")) |v| std.mem.span(v) else null) catch {
+        problem.* = try std.fmt.allocPrint(a, "INKLING_PREFILL_ROWS is not a prompt chunk size: give a multiple of {d} from {d} to {d}, or unset it for {d}", .{ fl.state.prefill_unit, fl.state.prefill_unit, fl.state.max_prefill_rows, fl.state.default_prefill_rows });
+        return null;
+    };
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     // with drafts, the model also loads the draft head's weights (mtp.safetensors) when the folder has them: they are among the
     // checkpoint's shards, so the budget below counts them
-    const model = fl.Model.load(gpa, io, o.dir, .{ .drafts = o.drafts, .draft_bits = bits }) catch |err| {
+    const model = fl.Model.load(gpa, io, o.dir, .{ .drafts = o.drafts, .draft_bits = bits, .prefill_rows = prefill_rows }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 EXL3 engine cannot load this checkpoint ({s}){s}", .{ @errorName(err), if (o.drafts) "; with drafts on it also loads mtp.safetensors, which --no-drafts skips" else "" });
         return null;
     };
@@ -143,7 +148,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, if (h.wrap) |*w| w.backend() else h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = 1, .context_window = @intCast(window), .prefill_step = fl.state.prompt_rows, .structures = true, .logprobs = true });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = 1, .context_window = @intCast(window), .prefill_step = model.prefill_rows, .structures = true, .logprobs = true });
     try fl.residency.hold(h);
     errdefer fl.residency.drop(h);
     // Where the weights exceed the residency set's cap they stay outside it; the busy probe then keeps only the scratch
