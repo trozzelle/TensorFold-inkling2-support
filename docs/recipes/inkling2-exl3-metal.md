@@ -61,19 +61,25 @@ Measured on an M5 Ultra (256 GB):
 
 | | |
 |---|---|
-| Prompt | about 66 tok/s (8,192 tokens in 125 s) |
-| Decode, one stream | 9.0 tok/s after a 512-token prompt (110 ms of GPU time a token); 9.8 tok/s served (256-token replies, 2.3 s to the first token for a 116-token prompt) |
+| Prompt | about 65 tok/s (8,202 tokens in 126 s to the first token) |
+| Decode, one stream, served | 38.8 tok/s with a 116-token prompt (256-token replies, 2.2 s to the first token); 37.9 tok/s after an 8,202-token prompt |
+| Decode, sampled (temperature 0.7, top_p 0.95) | about 32 tok/s |
 
-The experts run through the core EXL3 projection, which is what limits decode speed.
+Decode steps of up to 16 rows take a decode path: the experts run a rate-grouped EXL3 chain (adapted from Sushi), and
+attention, norms and the attention-input matvecs have their own kernels. A step takes about 25 ms of GPU time. Prompt
+rows still take the per-operation kernels, which is what limits prompt speed.
 
 ## Fidelity
 
 Teacher-forced on a 62,526-token held-out set against the MXFP8 release as teacher:
-- **KL:** 0.0325.
-- **Comparison:** the same pack's experts in an MLX forward score KL 0.0341. TensorFold's is 0.0016 lower (95% CI
-  −0.0035 … −0.0001).
+- **KL:** 0.0325 on the prompt path; 0.0336 with every row after the first 16 fed through the decode path in 16-row
+  windows.
+- **Comparison:** the same pack's experts in an MLX forward score KL 0.0341. TensorFold's is 0.0016 lower on the
+  prompt path (95% CI −0.0035 … −0.0001) and 0.0005 lower on the decode path (95% CI −0.0020 … +0.0011).
 - **Top-1 agreement:** 95.5%.
-- **Per layer:** hidden states stay within 1.3× the difference between two correct bf16 implementations.
+- **Per layer:** hidden states stay within 1.3× the difference between two correct bf16 implementations (1.21× on the
+  decode path).
+- **Decode windows:** a window of up to 16 rows gives the same bits as the same rows decoded one at a time.
 
 ## Limits
 
