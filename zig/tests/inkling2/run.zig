@@ -41,8 +41,10 @@ const usage =
     \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat]   decode steps each followed by the greedy draw: median
     \\                                                         wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw)
     \\tf-inkling-run <model> prefill <ids.json> [--chunk N] [--layers L] [--spans] [--drafts]   the prompt in chunks of N rows through the serving
-    \\                                                         prompt path: one JSON line with prompt_ms, tok_s and the GPU ms by class (dense, norm,
-    \\                                                         attention_prepare, attention, route, experts, activation, final, taps, absorb)
+    \\                                                         prompt path: one JSON line with prompt_ms, tok_s, the GPU ms by class (dense, norm,
+    \\                                                         attention_prepare, attention, route, experts, activation, final, taps, absorb), the command
+    \\                                                         buffers used and the longest one's GPU ms, and a digest of the last row's hidden state
+    \\                                                         (the same at any chunk size: rows are independent)
     \\                                                         --chunk: the prefill rows (below); --layers: the first L layers alone, no final stage or
     \\                                                         logits; --spans: also a line a chunk with its position, for attention's growth with it;
     \\                                                         --drafts: as served with the draft head (INKLING_DRAFT_* as greedy --drafts reads them):
@@ -694,6 +696,9 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     var totals: [class_count]f64 = @splat(0);
     var gpu: f64 = 0;
     var encode: f64 = 0;
+    var buffers: u32 = 0;
+    var longest: f64 = 0;
+    var last: usize = 0;
     var at: usize = 0;
     var chunk: usize = 0;
     const t0 = now();
@@ -705,15 +710,25 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
         var secs: [class_count]f64 = undefined;
         for (rec.aggregates(), &secs) |a, *x| x.* = a.gpu_seconds;
         var chunk_gpu = tm.gpu;
+        var chunk_buffers = tm.buffers;
+        var chunk_longest = tm.longest;
         if (absorber) |a| {
             secs[absorb_class] = try a.take(s.ptaps, at, n);
             chunk_gpu += secs[absorb_class];
+            // the head's absorb is a command buffer of its own, when it keeps any of the chunk's rows
+            if (secs[absorb_class] > 0) {
+                chunk_buffers += 1;
+                chunk_longest = @max(chunk_longest, secs[absorb_class]);
+            }
         }
         for (secs, &totals) |x, *y| y.* += x;
         gpu += chunk_gpu;
         encode += tm.encode;
+        buffers += chunk_buffers;
+        longest = @max(longest, chunk_longest);
+        last = n;
         if (opt.spans) {
-            std.debug.print("{{\"chunk\": {d}, \"pos\": {d}, \"rows\": {d}, \"gpu_ms\": {d:.1}, \"classes\": ", .{ chunk, at, n, chunk_gpu * 1e3 });
+            std.debug.print("{{\"chunk\": {d}, \"pos\": {d}, \"rows\": {d}, \"gpu_ms\": {d:.1}, \"buffers\": {d}, \"max_buffer_ms\": {d:.1}, \"classes\": ", .{ chunk, at, n, chunk_gpu * 1e3, chunk_buffers, chunk_longest * 1e3 });
             printClasses(&secs);
             std.debug.print("}}\n", .{});
         }
@@ -721,7 +736,10 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
         at += n;
     }
     const prompt_s = @as(f64, @floatFromInt(now() - t0)) / 1e9;
-    std.debug.print("{{\"prompt_tokens\": {d}, \"chunk\": {d}, \"layers\": {d}, \"drafts\": {}, \"prompt_ms\": {d:.1}, \"tok_s\": {d:.2}, \"gpu_ms\": {d:.1}, \"encode_ms\": {d:.1}, \"classes\": ", .{ T, m.prefill_rows, m.layers, opt.drafts, prompt_s * 1e3, @as(f64, @floatFromInt(T)) / prompt_s, gpu * 1e3, encode * 1e3 });
+    // the last row's hidden state after the last layer: a row's bits do not depend on the chunk it was fed in
+    const row_bytes = @as(usize, c.hidden) * 2;
+    const digest = std.hash.Wyhash.hash(0, s.h.slice(u8, last * row_bytes)[(last - 1) * row_bytes ..][0..row_bytes]);
+    std.debug.print("{{\"prompt_tokens\": {d}, \"chunk\": {d}, \"layers\": {d}, \"drafts\": {}, \"prompt_ms\": {d:.1}, \"tok_s\": {d:.2}, \"gpu_ms\": {d:.1}, \"encode_ms\": {d:.1}, \"buffers\": {d}, \"max_buffer_ms\": {d:.1}, \"h_digest\": \"{x}\", \"classes\": ", .{ T, m.prefill_rows, m.layers, opt.drafts, prompt_s * 1e3, @as(f64, @floatFromInt(T)) / prompt_s, gpu * 1e3, encode * 1e3, buffers, longest * 1e3, digest });
     printClasses(&totals);
     std.debug.print("}}\n", .{});
 }

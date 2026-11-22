@@ -70,9 +70,14 @@ checks that each row's result is independent of the rows beside it, and that a N
 - `INKLING_PREFILL_ROWS` sets the rows of a prompt chunk at most (a multiple of 64 from 64 to 8,192; default 512). The
   scratch is made for that many rows, so a larger chunk takes more of the load limit, and a prompt is fed in pieces of
   that many. Every kernel keeps rows independent, so the chunk size changes no bits.
+- A chunk's layers go to the GPU in several command buffers, committed as they are encoded and run in order, because the
+  GPU kills a command buffer that runs for long (a kill at 15.6 s has been seen) and a 4,096-row chunk takes about a
+  minute. Each buffer holds at most 3,072 rows times layers, about a second of today's GPU time: a layer at a time from
+  2,048 rows up, six layers at 512. The bits are the same as from one buffer.
 - `tf-inkling-run MODEL prefill ids.json [--chunk N] [--layers L] [--spans] [--drafts]` feeds a prompt through the
-  serving prompt path and prints its time and its GPU time by class (`--spans` adds a line a chunk; `--drafts` adds
-  the draft head's taps and absorb). `INKLING_PREFILL_ROWS` sets the chunk of its other modes too.
+  serving prompt path and prints its time, its GPU time by class, the command buffers it used and the longest one's GPU
+  time, and a digest of the last row's hidden state (the same at any chunk size) (`--spans` adds a line a chunk;
+  `--drafts` adds the draft head's taps and absorb). `INKLING_PREFILL_ROWS` sets the chunk of its other modes too.
 
 ## Drafts
 

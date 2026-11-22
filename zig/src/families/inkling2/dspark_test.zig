@@ -715,6 +715,51 @@ test "inkling2 prefill rows: the model's setting sizes the scratch and the load'
     try t.expectEqual(try state.scratchBytes(c, 0, 128), try budget.held(f.model, 0) - f.model.checkpoint.residentBytes());
 }
 
+test "inkling2 prefill commits: a chunk's layers go to the GPU in command buffers of bounded rows times layers" {
+    // a 4,096-row chunk takes a layer a buffer, and so does anything bigger; a smaller one takes more layers, a small one all
+    for ([_]usize{ 8192, 4096, 2048 }) |rows| try t.expectEqual(@as(usize, 1), fwd.commitEvery(rows, 48));
+    try t.expectEqual(@as(usize, 3), fwd.commitEvery(1024, 48));
+    try t.expectEqual(@as(usize, 6), fwd.commitEvery(512, 48));
+    try t.expectEqual(@as(usize, 24), fwd.commitEvery(128, 48));
+    for ([_]usize{ 64, 16, 1 }) |rows| try t.expect(fwd.commitEvery(rows, 48) >= 48);
+    // never more command buffers than a queue should hold, whatever the rows, layers and repeats
+    for ([_]usize{ 1, 64, 512, 4096, 8192 }) |rows| {
+        for ([_]usize{ 1, 2, 47, 48, 49, 96, 500, 2047 }) |total| {
+            const every = fwd.commitEvery(rows, total);
+            try t.expect(every >= 1);
+            try t.expect((total + every - 1) / every <= fwd.max_buffers);
+        }
+    }
+}
+
+test "inkling2 prefill commits: a forward reports the command buffers it used and the longest one's GPU time" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const c = &f.model.config.text;
+    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    defer cache.deinit();
+    var scratch = try state.Scratch.init(f.device, c, 256, 64);
+    defer scratch.deinit();
+    var ids: [64]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(5 + i);
+    // the fixture has no layers: the embedding is the whole forward, one command buffer
+    var tm: fwd.Timing = .{};
+    try fwd.run(f.model, &scratch, &cache, &ids, .{ .logits = .none, .prompt = true, .timing = &tm });
+    try t.expectEqual(@as(u32, 1), tm.buffers);
+    try t.expect(tm.gpu > 0);
+    try t.expectEqual(tm.gpu, tm.longest);
+    // the buffers and the GPU time add up over forwards; the longest is the longest of them all
+    var again = tm;
+    try fwd.run(f.model, &scratch, &cache, &ids, .{ .logits = .none, .prompt = true, .timing = &again });
+    try t.expectEqual(@as(u32, 2), again.buffers);
+    try t.expect(again.gpu > tm.gpu and again.longest >= tm.longest and again.longest <= again.gpu);
+}
+
 test "inkling2 dspark: a drafted load's facts fix the depth or leave it to the rule, with the timed window costs and the logprob rows kept" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

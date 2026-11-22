@@ -35,12 +35,58 @@ fn t(x: wts.Tensor) B {
 /// `prompt` marks rows that feed a prompt: they always take the one-kernel-per-op path, whatever their count; other
 /// forwards of at most `window_rows` rows take the decode path (fused norms, stacked attention-input matvec, split-K
 /// attention).
-/// `spans` records each stage group's GPU time by class (the `profile` and `prefill` modes); `repeat` runs the loaded layers
-/// that many times in the one command buffer (profile only: the cache's position stays, so the repeats re-read the same rows).
+/// `spans` records each stage group's GPU time by class (the `profile` and `prefill` modes), across the forward's command buffers;
+/// `repeat` runs the loaded layers that many times in the one forward (profile only: the cache's position stays, so the repeats
+/// re-read the same rows).
 pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1 };
-/// `encode` and `gpu` add up over forwards; `committed`, `started`, `ended` and `woke` are the last forward's clocks in
-/// `seconds()`'s timebase: the host's commit, the GPU's start and end, and the host's return from the wait.
-pub const Timing = struct { encode: f64 = 0, gpu: f64 = 0, committed: f64 = 0, started: f64 = 0, ended: f64 = 0, woke: f64 = 0 };
+/// `encode`, `gpu` and `buffers` (the command buffers used) add up over forwards, and `longest` is the longest single command
+/// buffer's GPU seconds so far; `committed`, `started`, `ended` and `woke` are the last forward's clocks in `seconds()`'s
+/// timebase: the host's first commit, the GPU's start of the first command buffer and end of the last, and the host's return from
+/// the wait.
+pub const Timing = struct { encode: f64 = 0, gpu: f64 = 0, committed: f64 = 0, started: f64 = 0, ended: f64 = 0, woke: f64 = 0, buffers: u32 = 0, longest: f64 = 0 };
+/// Rows times layers one command buffer of the chunk path holds at most. A prompt row takes about 0.3 ms a layer today (8,202
+/// tokens through 48 layers in 126 s on a Mac Studio), so this is about a second of GPU time. The GPU kills a command buffer that
+/// runs past its timeout (a kill at 15.6 s has been seen), and a 4,096-row chunk in one command buffer would take about a minute.
+const buffer_row_layers = 3072;
+/// Command buffers one forward uses at most: a queue holds 64 that are not yet complete, and creating one past that waits for
+/// another to finish.
+pub const max_buffers = 48;
+
+/// Layers a chunk-path forward of `rows` rows commits after, of `total` layers: as many as keep a command buffer within
+/// `buffer_row_layers` (at least one), and enough that no more than `max_buffers` buffers make the forward. At or past `total`
+/// the forward is one command buffer.
+pub fn commitEvery(rows: usize, total: usize) usize {
+    const by_rows = @max(1, buffer_row_layers / rows);
+    const by_count = (total + max_buffers - 1) / max_buffers;
+    return @max(by_rows, by_count);
+}
+
+/// The command buffers a forward committed before its last, in order, and the host's clock at the first commit.
+const Committed = struct {
+    bufs: [max_buffers]mtl.CommandBuffer = undefined,
+    n: usize = 0,
+    first: f64 = 0,
+
+    fn commit(c: *Committed, cb: mtl.CommandBuffer) void {
+        std.debug.assert(c.n < c.bufs.len);
+        if (c.n == 0) c.first = seconds();
+        cb.commit();
+        c.bufs[c.n] = cb;
+        c.n += 1;
+    }
+
+    fn all(c: *const Committed) []const mtl.CommandBuffer {
+        return c.bufs[0..c.n];
+    }
+};
+
+fn checked(f: mtl.CommandBuffer) !void {
+    if (f.failure()) |msg| {
+        std.log.err("inkling2 forward: {s}", .{msg});
+        return error.GpuFailed;
+    }
+}
+
 /// Most spans one layer opens (a global layer with dynamic convolutions is the most), so a recorder's capacity is
 /// `spans_per_layer * layers * repeat` plus the final's.
 pub const spans_per_layer = 32;
@@ -231,9 +277,10 @@ const Enc = struct {
     }
 };
 
-/// `ids` at positions cache.len.. through the loaded layers (cache.len unmoved): the command buffer waited. A decode step
+/// `ids` at positions cache.len.. through the loaded layers (cache.len unmoved): the last command buffer waited. A decode step
 /// commits its first `m.first_chunk` layers in a command buffer of their own and encodes the rest meanwhile, so the GPU
-/// starts while the host is still encoding; the queue runs the two in order, the one's results the other's inputs.
+/// starts while the host is still encoding. A chunk's layers go in command buffers of bounded rows times layers (`commitEvery`),
+/// each committed as soon as it is encoded. The queue runs the buffers in order, the one's results the other's inputs.
 pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, out: Out) !void {
     const c = &m.config.text;
     const n = ids.len;
@@ -249,21 +296,25 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     defer pool.pop();
     const t0 = if (out.timing != null) seconds() else 0;
     var cb = m.queue.commandBuffer();
-    var head: ?mtl.CommandBuffer = null; // the step's first command buffer, when it is committed before the rest is encoded
-    var head_commit: f64 = 0;
+    var done: Committed = .{}; // the command buffers committed before `cb`, when the forward is in several
     var enc = cb.compute(.serial);
+    var open = true; // `enc` is not yet ended
     const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .spans = out.spans };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
         enc.end();
         return err;
     };
     errdefer if (out.spans) |sp| sp.cancelEncoding(&enc) catch {};
+    // past a commit the GPU is running work on the scratch: an error hands nothing back until that has finished
+    errdefer for (done.all()) |f| f.wait();
+    errdefer if (open and out.spans == null) enc.end();
     x.resources();
     const H: usize = c.hidden;
     const nr: u32 = @intCast(n);
     x.glue(.embed, .{ .rows = nr, .width = c.hidden, .eps = c.eps }, &.{ b(s.ids), t(m.weights.embed.t), t(m.weights.embed_norm), b(s.h) }, .{ n, 1, 1 }, .{ 1024, 1, 1 }, true);
     const total = @as(usize, m.layers) * out.repeat;
     const split: usize = if (decode and out.spans == null and m.first_chunk < total) m.first_chunk else 0;
+    const every: usize = if (decode) 0 else commitEvery(n, total);
     for (0..total) |li| {
         const i = li % m.layers;
         if (out.taps != null or out.feature_taps != null) for (tap_layers, 0..) |l, k| if (l == i) {
@@ -279,13 +330,14 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
             };
         }
         if (out.dump) |d| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(d, i * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
-        if (li + 1 == split) {
-            enc.end();
-            head_commit = seconds();
-            cb.commit();
-            head = cb;
+        if (li + 1 == split or (every != 0 and li + 1 < total and (li + 1) % every == 0)) {
+            if (out.spans) |sp| try sp.endCommand(&enc) else enc.end();
+            open = false;
+            done.commit(cb);
             cb = m.queue.commandBuffer();
+            if (out.spans) |sp| try sp.continueCommand(cb);
             enc = cb.compute(.serial);
+            open = true;
             x.resources();
         }
     }
@@ -302,23 +354,36 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
         try x.end();
     }
     if (out.spans) |sp| try sp.finishEncoding(&enc) else enc.end();
+    open = false;
     if (out.timing) |tm| {
-        tm.committed = if (head != null) head_commit else seconds();
+        tm.committed = if (done.n > 0) done.first else seconds();
         tm.encode += seconds() - t0;
     }
     const warm = decode and m.warm_wait and out.spans == null;
-    if (head == null) head_commit = if (warm) seconds() else 0;
+    const committed_at = if (done.n > 0) done.first else if (warm) seconds() else 0;
     cb.commit();
     // spans are a profile's: its steps are waited for as before
-    if (warm) waitWarm(cb, s.expected[n], head_commit) else cb.wait();
+    if (warm) waitWarm(cb, s.expected[n], committed_at) else cb.wait();
     if (out.timing) |tm| tm.woke = seconds();
-    for ([_]?mtl.CommandBuffer{ head, cb }) |one| if (one) |f| if (f.failure()) |msg| {
-        std.log.err("inkling2 forward: {s}", .{msg});
-        return error.GpuFailed;
+    // the buffers before the last completed before it; the status keeps this from waiting for what is done
+    for (done.all()) |f| switch (f.status()) {
+        .completed, .@"error" => {},
+        else => f.wait(),
     };
-    const began = (head orelse cb).gpuStart();
+    for (done.all()) |f| try checked(f);
+    try checked(cb);
+    const began = (if (done.n > 0) done.bufs[0] else cb).gpuStart();
     if (out.timing) |tm| {
-        tm.gpu += cb.gpuSeconds() + if (head) |f| f.gpuSeconds() else 0;
+        var gpu = cb.gpuSeconds();
+        var longest = gpu;
+        for (done.all()) |f| {
+            const one = f.gpuSeconds();
+            gpu += one;
+            longest = @max(longest, one);
+        }
+        tm.gpu += gpu;
+        tm.buffers += @intCast(done.n + 1);
+        tm.longest = @max(tm.longest, longest);
         tm.started = began;
         tm.ended = cb.gpuEnd();
     }

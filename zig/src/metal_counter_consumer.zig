@@ -78,25 +78,9 @@ pub const Consumer = struct {
                 recorder.discardAfterCompletion() catch {};
             } else recorder.cancelEncoding(&encoder) catch {};
         }
-        const scales = [_]f32{ 2, 1, 0.5 };
-        const biases = [_]f32{ 1, -3, 2 };
         for (classes, 0..) |kind, i| {
             try recorder.beginSpan(&encoder, kind);
-            const input = if (i % 2 == 0) self.a else self.b;
-            const output = if (i % 2 == 0) self.b else self.a;
-            encoder.setPipeline(self.pipeline);
-            encoder.setBuffer(input, 0, 0);
-            encoder.setBuffer(output, 0, 1);
-            encoder.setValue(element_count, 2);
-            encoder.setValue(scales[i], 3);
-            encoder.setValue(biases[i], 4);
-            encoder.useResource(input, mtl.ResourceUsage.read);
-            encoder.useResource(output, mtl.ResourceUsage.write);
-            encoder.useResource(self.indirect, mtl.ResourceUsage.read);
-            if (i == 1) {
-                encoder.dispatchIndirect(self.indirect, 0, mtl.Size.of(256, 1, 1));
-            } else encoder.dispatchThreads(mtl.Size.of(element_count, 1, 1), mtl.Size.of(256, 1, 1));
-            encoder.barrier();
+            self.encodeOperator(encoder, i);
             try recorder.endSpan(&encoder);
         }
         try recorder.finishEncoding(&encoder);
@@ -111,6 +95,71 @@ pub const Consumer = struct {
         self.gate.set(gate_value);
         cb.wait();
         if (cb.failure() != null) return error.CounterConsumerGpuFailure;
+        _ = try recorder.readAfterCompletion();
+        for (self.b.slice(f32, element_count), 0..) |value, i| {
+            const expected = initial((i + 3) % element_count) + 1;
+            if (@as(u32, @bitCast(value)) != @as(u32, @bitCast(expected))) return error.CounterConsumerOutputMismatch;
+        }
+    }
+
+    /// Operator `i` of the dependent chain, `a` to `b` and back, on `encoder`.
+    fn encodeOperator(self: *const Consumer, encoder: mtl.ComputeEncoder, i: usize) void {
+        const scales = [_]f32{ 2, 1, 0.5 };
+        const biases = [_]f32{ 1, -3, 2 };
+        const input = if (i % 2 == 0) self.a else self.b;
+        const output = if (i % 2 == 0) self.b else self.a;
+        encoder.setPipeline(self.pipeline);
+        encoder.setBuffer(input, 0, 0);
+        encoder.setBuffer(output, 0, 1);
+        encoder.setValue(element_count, 2);
+        encoder.setValue(scales[i], 3);
+        encoder.setValue(biases[i], 4);
+        encoder.useResource(input, mtl.ResourceUsage.read);
+        encoder.useResource(output, mtl.ResourceUsage.write);
+        encoder.useResource(self.indirect, mtl.ResourceUsage.read);
+        if (i == 1) {
+            encoder.dispatchIndirect(self.indirect, 0, mtl.Size.of(256, 1, 1));
+        } else encoder.dispatchThreads(mtl.Size.of(element_count, 1, 1), mtl.Size.of(256, 1, 1));
+        encoder.barrier();
+    }
+
+    /// `execute` with the operators spread over `buffers` command buffers, each committed as soon as it is encoded and held at
+    /// the start by an event until the one before has run (the probe's buffers are untracked, so the queue does not order them):
+    /// the recording carries on across them and the only CPU wait is the last one's.
+    pub fn executeChained(self: *Consumer, recorder: *counters.Recorder, buffers: usize) !void {
+        std.debug.assert(buffers >= 1 and buffers <= classes.len);
+        for (self.a.slice(f32, element_count), 0..) |*value, i| value.* = initial(i);
+        @memset(self.b.slice(f32, element_count), std.math.nan(f32));
+        const first_gate = self.next_gate;
+        self.next_gate += buffers;
+        var all: [classes.len]mtl.CommandBuffer = undefined;
+        var made: usize = 1;
+        var cb = self.queue.commandBuffer();
+        all[0] = cb;
+        cb.waitFor(self.gate, first_gate);
+        try recorder.beginCommand(cb);
+        var encoder = cb.compute(.serial);
+        for (classes, 0..) |kind, i| {
+            try recorder.beginSpan(&encoder, kind);
+            self.encodeOperator(encoder, i);
+            try recorder.endSpan(&encoder);
+            if (made < buffers and i + 1 == made * classes.len / buffers) {
+                try recorder.endCommand(&encoder);
+                cb.signal(self.gate, first_gate + made);
+                cb.commit();
+                cb = self.queue.commandBuffer();
+                all[made] = cb;
+                cb.waitFor(self.gate, first_gate + made);
+                made += 1;
+                try recorder.continueCommand(cb);
+                encoder = cb.compute(.serial);
+            }
+        }
+        try recorder.finishEncoding(&encoder);
+        cb.commit();
+        self.gate.set(first_gate);
+        cb.wait();
+        for (all[0..made]) |one| if (one.failure() != null) return error.CounterConsumerGpuFailure;
         _ = try recorder.readAfterCompletion();
         for (self.b.slice(f32, element_count), 0..) |value, i| {
             const expected = initial((i + 3) % element_count) + 1;
@@ -246,4 +295,95 @@ test "completed recorder reuses bounded samples and read results do not double c
     try std.testing.expectEqual(@as(usize, 3), second.len);
     try std.testing.expect(second[0].begin_timestamp >= prior_end);
     for (classes) |kind| try std.testing.expectEqual(@as(u64, 1), recorder.aggregates()[@backingInt(kind)].calls);
+}
+
+test "a recording carries on across command buffers committed one after the other and reads every span once they finish" {
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const device = try supportedDevice();
+    defer device.deinit();
+    var consumer = try Consumer.init(device);
+    defer consumer.deinit();
+    var recorder = try counters.Recorder.init(std.testing.allocator, device, .{ .enabled = true, .max_spans = classes.len });
+    defer recorder.deinit() catch unreachable;
+    for (1..classes.len + 1) |buffers| {
+        try consumer.executeChained(&recorder, buffers);
+        const spans = try recorder.readAfterCompletion();
+        try std.testing.expectEqual(classes.len, spans.len);
+        for (spans, classes) |span, kind| {
+            try std.testing.expectEqual(kind, span.kind);
+            try std.testing.expect(span.gpu_seconds > 0 and std.math.isFinite(span.gpu_seconds));
+            try std.testing.expectEqual(@as(u64, 1), recorder.aggregates()[@backingInt(kind)].calls);
+        }
+        for (spans[1..], spans[0 .. spans.len - 1]) |next, prev| try std.testing.expect(next.begin_timestamp >= prev.end_timestamp);
+    }
+}
+
+test "a recorder that records nothing still ends a command buffer and carries on in the next, with the bits as they were" {
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const device = try supportedDevice();
+    defer device.deinit();
+    var consumer = try Consumer.init(device);
+    defer consumer.deinit();
+    var plain = try counters.Recorder.init(std.testing.allocator, device, .{});
+    defer plain.deinit() catch unreachable;
+    for (1..classes.len + 1) |buffers| {
+        try consumer.executeChained(&plain, buffers);
+        try std.testing.expectEqual(@as(usize, 0), (try plain.readAfterCompletion()).len);
+    }
+}
+
+test "a recording leaves a command buffer only between spans, once, for an uncommitted buffer" {
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const device = try supportedDevice();
+    defer device.deinit();
+    var consumer = try Consumer.init(device);
+    defer consumer.deinit();
+    const queue = consumer.queue;
+    var recorder = try counters.Recorder.init(std.testing.allocator, device, .{ .enabled = true, .max_spans = 2 });
+    defer recorder.deinit() catch unreachable;
+    const first = queue.commandBuffer();
+    // nothing is recording yet
+    try std.testing.expectError(error.CounterNotRecording, recorder.continueCommand(first));
+    try recorder.beginCommand(first);
+    var encoder = first.compute(.serial);
+    errdefer recorder.cancelEncoding(&encoder) catch {};
+    // the buffer is still the recording's: it cannot be given another before it ends, and not inside a span
+    try std.testing.expectError(error.CounterNotRecording, recorder.continueCommand(first));
+    try recorder.beginSpan(&encoder, .dense);
+    consumer.encodeOperator(encoder, 0);
+    try std.testing.expectError(error.UnclosedCounterSpan, recorder.endCommand(&encoder));
+    try recorder.endSpan(&encoder);
+    try recorder.endCommand(&encoder);
+    // between buffers: no encoder to end or finish, and no way to start a span
+    try std.testing.expectError(error.CounterNotRecording, recorder.endCommand(&encoder));
+    try std.testing.expectError(error.CounterNotRecording, recorder.finishEncoding(&encoder));
+    try std.testing.expectError(error.CounterNotRecording, recorder.beginSpan(&encoder, .copy));
+    // a buffer that was committed cannot carry the recording on
+    const spent = queue.commandBuffer();
+    var spent_encoder = spent.compute(.serial);
+    spent_encoder.end();
+    spent.commit();
+    spent.wait();
+    try std.testing.expectError(error.CounterCommandAlreadySubmitted, recorder.continueCommand(spent));
+    // an uncommitted one can, once
+    const next = queue.commandBuffer();
+    try recorder.continueCommand(next);
+    try std.testing.expectError(error.CounterNotRecording, recorder.continueCommand(next));
+    encoder = next.compute(.serial);
+    try recorder.beginSpan(&encoder, .copy);
+    consumer.encodeOperator(encoder, 2);
+    try recorder.endSpan(&encoder);
+    try recorder.finishEncoding(&encoder);
+    first.commit();
+    next.commit();
+    next.wait();
+    if (first.failure() != null or next.failure() != null) return error.CounterConsumerGpuFailure;
+    const spans = try recorder.readAfterCompletion();
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
+    try std.testing.expectEqual(counters.Class.dense, spans[0].kind);
+    try std.testing.expectEqual(counters.Class.copy, spans[1].kind);
+    try recorder.discardAfterCompletion();
 }
