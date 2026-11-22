@@ -129,6 +129,35 @@ fn gemm(init: std.process.Init) !void {
         const tflops = 2.0 * @as(f64, @floatFromInt(m * g.n * g.k)) / (ms * 1e-3) / 1e12;
         std.debug.print("{{\"gemm\": \"{s}\", \"m\": {d}, \"n\": {d}, \"k\": {d}, \"ms\": {d:.3}, \"tflops\": {d:.1}}}\n", .{ name, m, g.n, g.k, ms, tflops });
     };
+    try gemmRows(device, q, init.gpa);
+}
+
+const RowsBench = struct { pipes: *const ik.dense_prefill.Pipes, x: mtl.Buffer, w: mtl.Buffer, y: mtl.Buffer, m: usize, n: usize, k: usize, out: ik.dense_prefill.Out };
+
+fn rowsBody(g: *const RowsBench, e: mtl.ComputeEncoder, _: usize) void {
+    ik.dense_prefill.gemmRows(e, g.pipes, .{ .buf = g.x }, .{ .buf = g.w, .n = g.n, .k = g.k }, .{ .buf = g.y }, g.out, g.m, g.n);
+}
+
+/// The forward's dense prompt GEMM (dense_prefill.gemmRows) at the dense shapes, with the router's f32 rows and the
+/// dynamic convolutions' 32 columns; "ms" is one launch.
+fn gemmRows(device: mtl.Device, q: mtl.Queue, gpa: std.mem.Allocator) !void {
+    var pipes = try ik.dense_prefill.Pipes.init(device, gpa);
+    defer pipes.deinit();
+    const shapes = [_][3]usize{ .{ 6144, 4608, 0 }, .{ 1024, 4608, 0 }, .{ 768, 4608, 0 }, .{ 48, 4608, 0 }, .{ 4608, 6144, 0 }, .{ 384, 4608, 1 }, .{ 32, 4608, 0 } };
+    const names = [_][]const u8{ "q|gate", "k|v", "r", "sink", "o", "router f32", "dyn conv" };
+    for (shapes, names) |sh, name| for ([_]usize{ 512, 2048, 4096 }) |m| {
+        var g = RowsBench{ .pipes = &pipes, .x = undefined, .w = undefined, .y = undefined, .m = m, .n = sh[0], .k = sh[1], .out = if (sh[2] == 1) .f32 else .bf16 };
+        const esz: usize = if (sh[2] == 1) 4 else 2;
+        g.x = try device.buffer(m * g.k * 2, mtl.ResourceOptions.shared);
+        g.w = try device.buffer(g.n * g.k * 2, mtl.ResourceOptions.shared);
+        g.y = try device.buffer(m * g.n * esz, mtl.ResourceOptions.shared);
+        defer for ([_]mtl.Buffer{ g.x, g.w, g.y }) |b| b.deinit();
+        fill(g.x, m * g.k, 1);
+        fill(g.w, g.n * g.k, 2);
+        const ms = try timed(q, 8, &g, rowsBody);
+        const tflops = 2.0 * @as(f64, @floatFromInt(m * g.n * g.k)) / (ms * 1e-3) / 1e12;
+        std.debug.print("{{\"dense_prefill\": \"{s}\", \"m\": {d}, \"n\": {d}, \"k\": {d}, \"ms\": {d:.3}, \"tflops\": {d:.1}}}\n", .{ name, m, g.n, g.k, ms, tflops });
+    };
 }
 
 const Mv = struct { pipe: [6]mtl.Pipeline, x: mtl.Buffer, y: mtl.Buffer };

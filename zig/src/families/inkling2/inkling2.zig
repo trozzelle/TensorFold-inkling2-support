@@ -15,6 +15,7 @@ pub const budget = @import("budget.zig");
 pub const residency = @import("residency.zig");
 pub const backend = @import("backend.zig");
 pub const greedy = @import("greedy.zig");
+pub const dense_prefill = @import("dense_prefill.zig");
 
 test {
     _ = config;
