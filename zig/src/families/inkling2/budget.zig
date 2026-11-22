@@ -8,6 +8,10 @@ const Model = @import("model.zig").Model;
 pub const default_share = 0.75;
 /// Kept free inside the limit for the command buffers, the keepalive and the host.
 pub const margin: u64 = 2 << 30;
+/// The longest context a load advertises when none is asked for: the longest a release has been run at.
+pub const default_window_most = 131072;
+/// Kept prompt states take at most this share of the caches' room when --prompt-cache-gib is unset.
+pub const default_states: u64 = 8 << 30;
 
 /// The limit in decimal GB that INKLING_LOAD_LIMIT_GB's text names (null: unset or blank).
 pub fn parseLimit(text: ?[]const u8) error{BadLoadLimit}!?f64 {
@@ -69,6 +73,7 @@ test "inkling2 budget: the longest context counts the partials that grow with it
     try std.testing.expect(st.cacheBytes(&c, n + 1, layers, 4096) <= room - st.partBytes(&c, n + 1));
     // a context past the ring pays for the global layers alone: 262,144 tokens fit in 10 GiB
     try std.testing.expect(n >= 262144);
+    try std.testing.expect(default_window_most <= longest(&c, layers, 23 << 30, 1 << 20, 4096));
     try std.testing.expectEqual(@as(usize, 0), longest(&c, layers, 0, 1000, 4096));
     try std.testing.expectEqual(@as(usize, 1000), longest(&c, layers, 1 << 40, 1000, 4096));
 }

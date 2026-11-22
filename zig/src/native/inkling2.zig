@@ -21,10 +21,13 @@ const Host = struct {
     clock: lanes.backend.WallClock,
     core: lanes.Engine,
     host: api.LaneHost,
+    cache: ?api.prompt_cache.Store = null, // kept prompt states, in what the streams' caches leave of the budget
+    cache_cap: u64 = 0, // --prompt-cache-gib's bytes (default_states when unset)
 
     fn close(ctx: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(ctx));
         h.host.stop();
+        if (h.cache) |*store| store.deinit();
         h.core.deinit();
         h.config.deinit(h.gpa);
         fl.residency.drop(h);
@@ -49,6 +52,10 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = "--parallel: the Inkling 2 EXL3 engine serves one stream; give --parallel 1";
         return null;
     }
+    if (o.prompt_cache_gib) |g| if (!std.math.isFinite(g) or g < 0) {
+        problem.* = "--prompt-cache-gib: give a number of GiB at least 0 (0 turns the prompt cache off)";
+        return null;
+    };
     // how a round drafts and how wide the draft layers' weights are: only a load with drafts reads them, once
     var drafting: fl.dspark.Drafting = .{ .depth = .default };
     var bits: fl.dspark_weights.Bits = .default;
@@ -113,7 +120,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         return null;
     };
     const fits = fl.budget.longest(c, c.layers, room, c.max_context, model.prefill_rows);
-    const window: i64 = o.context orelse @intCast(fits);
+    const window: i64 = o.context orelse @intCast(@min(fits, fl.budget.default_window_most));
     if (window < 1 or window > fits) {
         problem.* = try std.fmt.allocPrint(a, "--context {d}: this Mac's Inkling 2 caches fit {d} tokens under its load limit (75% of RAM, or --load-limit-gb, or INKLING_LOAD_LIMIT_GB)", .{ window, fits });
         free(model, draft); // after the message, so a failed allocation leaves them to the errdefers
@@ -121,7 +128,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     }
     // the partials of this window come off what the caches may hold
     const budget = room - fl.state.partBytes(c, @as(usize, @intCast(window)) + 1);
-    std.log.info("inkling2: {d:.1} GiB of weights, {d:.1} GiB for caches, context up to {d} tokens", .{ gib(weights), gib(budget), window });
+    std.log.info("inkling2: {d:.1} GiB of weights, {d:.1} GiB for caches, context up to {d} tokens (the caches fit {d})", .{ gib(weights), gib(budget), window, fits });
     std.log.info("inkling2: prompt chunks of {d} rows on the {s} path, {d:.2} GiB of scratch", .{ model.prefill_rows, @tagName(model.promptPath()), gib(try fl.state.scratchBytes(c, 0, model.chunking())) });
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
@@ -150,6 +157,24 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.core = lanes.Engine.init(gpa, &h.config, if (h.wrap) |*w| w.backend() else h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = 1, .context_window = @intCast(window), .prefill_step = model.prefill_rows, .structures = true, .logprobs = true });
+    h.cache = null;
+    // kept states take what the streams leave, at most this: by default well under the room, which a load has never filled
+    h.cache_cap = if (o.prompt_cache_gib) |g| blk: {
+        const cap_bytes = g * (1 << 30);
+        break :blk if (cap_bytes >= @as(f64, @floatFromInt(budget))) budget else @intFromFloat(cap_bytes);
+    } else @min(budget, fl.budget.default_states);
+    if (h.cache_cap > 0) {
+        const M = fl.backend.Metal;
+        // a prompt row's bits do not depend on its chunk: any row is a place to keep or resume a state, and a pass cuts only at
+        // its marks and its own chunk rows
+        const rules: api.prompt_cache.Rules = .{ .lookahead = 0, .planned = false, .min_prompt = 0, .chunk = @intCast(model.prefill_rows), .chunk_starts = false };
+        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h.metal, .vtable = &.{ .bytes = M.snapBytes, .save = M.snapSave, .restore = M.snapRestore, .drop = M.snapDrop } }, rules, @min(h.cache_cap, budget));
+        h.host.cache = &h.cache.?;
+        h.host.info_.prompt_cache = true;
+        h.metal.room = .{ .ctx = h, .fit = fitCache };
+        std.log.info("inkling2: kept prompt states take up to {d:.1} GiB of the caches' room", .{gib(@min(h.cache_cap, budget))});
+    } else std.log.info("inkling2: prompt cache off", .{});
+    errdefer if (h.cache) |*store| store.deinit();
     try fl.residency.hold(h);
     errdefer fl.residency.drop(h);
     // Where the weights exceed the residency set's cap they stay outside it; the busy probe then keeps only the scratch
@@ -157,6 +182,20 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick, .probe = mtl.keepalive.Target.busy };
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+/// Metal.room's fit: the kept states' budget is what the streams leave, at most the cap; the least valuable go first.
+fn fitCache(ctx: *anyopaque, bytes: u64, restoring: ?*anyopaque, prompt: []const u32) void {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    const store = if (h.cache) |*owned| owned else return;
+    store.budget = @min(h.cache_cap, bytes);
+    const Left = struct {
+        s: *const api.prompt_cache.Store,
+        pub fn fits(l: @This()) bool {
+            return l.s.held <= l.s.budget;
+        }
+    };
+    _ = store.giveBack(restoring, prompt, Left{ .s = store });
 }
 
 fn gib(bytes: u64) f64 {
@@ -174,4 +213,82 @@ fn costsText(buf: []u8, costs: []const lanes.config.Cost) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     for (costs, 0..) |cost, i| w.print("{s}{d}: {d:.1}", .{ if (i == 0) "" else ", ", cost.width, cost.ms }) catch break;
     return w.buffered();
+}
+
+const CacheFixture = struct {
+    live: usize = 0,
+    fn bytes(_: *anyopaque, at: u32) u64 {
+        return 100 + at;
+    }
+    fn save(ptr: *anyopaque, _: ?*anyopaque, at: u32) !api.prompt_cache.Saved {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const held = try std.testing.allocator.create(u32);
+        held.* = at;
+        self.live += 1;
+        return held;
+    }
+    fn restore(_: *anyopaque, _: ?*anyopaque, _: api.prompt_cache.Saved) !void {}
+    fn drop(ptr: *anyopaque, saved: api.prompt_cache.Saved) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        std.testing.allocator.destroy(@as(*u32, @ptrCast(@alignCast(saved))));
+        self.live -= 1;
+    }
+    fn snapshots(self: *@This()) api.prompt_cache.Snapshots {
+        return .{ .ptr = self, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop } };
+    }
+};
+
+test "inkling2 host: cache callback updates the owned store rather than a temporary value" {
+    var f: CacheFixture = .{};
+    var h: Host = undefined;
+    h.cache_cap = 500;
+    h.cache = api.prompt_cache.Store.init(std.testing.allocator, f.snapshots(), .{ .min_prompt = 0 }, 500);
+    defer h.cache.?.deinit();
+    fitCache(&h, 200, null, &.{});
+    try std.testing.expectEqual(@as(u64, 200), h.cache.?.budget);
+    fitCache(&h, 800, null, &.{});
+    try std.testing.expectEqual(@as(u64, 500), h.cache.?.budget);
+}
+
+test "inkling2 host: cache callback evicts from the real store and preserves the restored entry" {
+    var f: CacheFixture = .{};
+    var h: Host = undefined;
+    h.cache_cap = 1000;
+    h.cache = api.prompt_cache.Store.init(std.testing.allocator, f.snapshots(), .{ .min_prompt = 0 }, 1000);
+    defer h.cache.?.deinit();
+    const store = &h.cache.?;
+    try std.testing.expect(store.keep(&.{ 1, 1, 1, 1, 9 }, 4, null, &.{}, &.{}));
+    try std.testing.expect(store.keep(&.{ 2, 2, 2, 2, 2, 2, 9 }, 6, null, &.{}, &.{}));
+    try std.testing.expectEqual(@as(u64, 210), store.held);
+    const kept = store.entries.items[0].saved;
+    fitCache(&h, 110, kept, &.{ 1, 1, 1, 1, 9 });
+    try std.testing.expectEqual(@as(u64, 110), store.budget);
+    try std.testing.expectEqual(@as(u64, 104), store.held);
+    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+    try std.testing.expect(store.entries.items[0].saved == kept);
+    try std.testing.expectEqual(@as(usize, 1), f.live);
+    try std.testing.expectEqual(@as(u64, 1), store.counts.evicted);
+    fitCache(&h, 110, kept, &.{ 1, 1, 1, 1, 9 });
+    try std.testing.expectEqual(@as(u64, 1), store.counts.evicted);
+    fitCache(&h, 0, null, &.{});
+    try std.testing.expectEqual(@as(u64, 0), store.held);
+    try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), f.live);
+    try std.testing.expectEqual(@as(u64, 2), store.counts.evicted);
+}
+
+test "inkling2 host: cache callback with no configured cache leaves no state to mutate" {
+    var h: Host = undefined;
+    h.cache = null;
+    fitCache(&h, 0, null, &.{});
+    try std.testing.expect(h.cache == null);
+}
+
+test "inkling2 host: bad prompt cache cap is refused before loading" {
+    var problem: []const u8 = "";
+    for ([_]f64{ -1, std.math.nan(f64), std.math.inf(f64) }) |bad| {
+        const o: api.Open = .{ .dir = "no-weights", .model_type = "inkling2", .prompt_cache_gib = bad };
+        try std.testing.expectEqual(null, try open(std.testing.allocator, std.testing.allocator, std.testing.io, o, &problem));
+        try std.testing.expectStringStartsWith(problem, "--prompt-cache-gib:");
+    }
 }
