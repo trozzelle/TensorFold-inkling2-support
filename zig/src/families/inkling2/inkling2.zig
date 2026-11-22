@@ -13,6 +13,7 @@ pub const Model = model.Model;
 pub const forward = @import("forward.zig");
 pub const budget = @import("budget.zig");
 pub const residency = @import("residency.zig");
+pub const snapshot = @import("snapshot.zig");
 pub const backend = @import("backend.zig");
 pub const greedy = @import("greedy.zig");
 pub const dense_prefill = @import("dense_prefill.zig");
@@ -28,6 +29,7 @@ test {
     _ = expert_pack;
     _ = dspark;
     _ = state;
+    _ = snapshot;
     _ = budget;
     _ = backend;
     _ = @import("draw.zig");
