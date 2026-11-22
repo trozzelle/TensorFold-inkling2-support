@@ -112,7 +112,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = "--load-limit-gb is not a load limit: give a number of GB above 0, or leave it out for 75% of RAM";
         return null;
     };
-    const fits = fl.budget.longest(c, c.layers, room, c.max_context);
+    const fits = fl.budget.longest(c, c.layers, room, c.max_context, model.prefill_rows);
     const window: i64 = o.context orelse @intCast(fits);
     if (window < 1 or window > fits) {
         problem.* = try std.fmt.allocPrint(a, "--context {d}: this Mac's Inkling 2 caches fit {d} tokens under its load limit (75% of RAM, or --load-limit-gb, or INKLING_LOAD_LIMIT_GB)", .{ window, fits });

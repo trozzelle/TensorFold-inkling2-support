@@ -197,7 +197,7 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
     const full = m.layers == c.layers;
     const row = rowBytes(c);
     const tap_row: usize = ik.state.feature_taps * H;
-    var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers);
+    var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers, m.prefill_rows);
     defer cache.deinit();
     var leg: Leg = .{
         .kv = try gpa.alloc(u16, L * 2 * T * row / 2),
@@ -270,16 +270,18 @@ fn readCache(m: *const ik.Model, cache: *ik.state.Cache, T: usize, leg: *Leg) !v
     defer pool.pop();
     const row = rowBytes(&m.config.text);
     const row16 = row / 2;
-    const staging = try m.device.buffer(@max(cache.kv_layer, cache.conv.length()), mtl.ResourceOptions.shared);
+    const max_layer_bytes = ik.state.cachePositions(cache.capacity) * ik.state.kvBytes(&m.config.text);
+    const staging = try m.device.buffer(@max(max_layer_bytes, cache.conv.length()), mtl.ResourceOptions.shared);
     defer staging.deinit();
-    const half16 = cache.kv_layer / 2 / 2;
     for (0..cache.layers) |l| {
+        const kv_layer = @as(usize, cache.ring(l)) * ik.state.kvBytes(&m.config.text);
+        const half16 = kv_layer / 2 / 2;
         const cb = m.queue.commandBuffer();
         const blit = cb.blit();
-        blit.copy(cache.kv, cache.keys(l), staging, 0, cache.kv_layer);
+        blit.copy(cache.kv, cache.keys(l), staging, 0, kv_layer);
         blit.end();
         try finish(cb);
-        const words = staging.slice(u16, cache.kv_layer / 2);
+        const words = staging.slice(u16, kv_layer / 2);
         for ([_]usize{ 0, half16 }, 0..) |base, kind| {
             @memcpy(leg.kv[(2 * l + kind) * T * row16 ..][0 .. T * row16], words[base..][0 .. T * row16]);
             for (words[base + T * row16 .. base + half16], 0..) |x, i| if (x != nan_word) {

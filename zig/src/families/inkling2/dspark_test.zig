@@ -693,7 +693,7 @@ test "inkling2 prefill rows: the model's setting sizes the scratch and the load'
     };
     defer f.deinit();
     const c = &f.model.config.text;
-    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    var cache = try state.Cache.init(f.device, c, 256, c.layers, state.default_prefill_rows);
     defer cache.deinit();
     var ids: [129]u32 = undefined;
     for (&ids, 0..) |*x, i| x.* = @intCast(5 + i);
@@ -743,7 +743,7 @@ test "inkling2 prefill commits: a forward reports the command buffers it used an
     };
     defer f.deinit();
     const c = &f.model.config.text;
-    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    var cache = try state.Cache.init(f.device, c, 256, c.layers, state.default_prefill_rows);
     defer cache.deinit();
     var scratch = try state.Scratch.init(f.device, c, 256, .{ .rows = 64, .path = f.model.promptPath() });
     defer scratch.deinit();
@@ -774,7 +774,7 @@ test "inkling2 prompt path: the chunk kernels where the load has them, the per-r
     };
     defer f.deinit();
     const c = &f.model.config.text;
-    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    var cache = try state.Cache.init(f.device, c, 256, c.layers, state.default_prefill_rows);
     defer cache.deinit();
     var ids: [64]u32 = undefined;
     for (&ids, 0..) |*x, i| x.* = @intCast(5 + i);

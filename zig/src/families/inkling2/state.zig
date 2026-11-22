@@ -1,5 +1,6 @@
-//! A stream's caches (each layer's keys and values by position, the convolutions' input rings, the last logits) and a
-//! forward's scratch. Every layer keeps its whole context: sliding layers mask rather than evict.
+//! A stream's caches (each layer's keys and values, the convolutions' input rings, the last logits) and a forward's
+//! scratch. Global layers keep every position; sliding layers keep a ring of their window, a prompt chunk and one
+//! 64-key block more, so old rows are evicted as the sequence advances.
 const std = @import("std");
 const mtl = @import("metal");
 const cfg = @import("config.zig");
@@ -131,9 +132,25 @@ pub fn cachePositions(capacity: usize) usize {
     return std.mem.alignForward(usize, capacity, attention_prefill.key_block);
 }
 
-/// Bytes a stream of `capacity` positions holds over `layers` layers.
-pub fn cacheBytes(c: *const cfg.Text, capacity: usize, layers: usize) usize {
-    return layers * (cachePositions(capacity) * kvBytes(c) + convBytes(c)) + @as(usize, c.vocab) * 2;
+/// Slots of a sliding layer's ring for a load whose prompt chunks hold `rows` rows at most: its window, a chunk (a chunk's
+/// keys are all written before its attention reads) and one more 64-key block (the chunk attention reads whole blocks, so up
+/// to 63 keys below a window), to a multiple of the decode attention's block: no block of either kernel wraps.
+pub fn slidingRing(c: *const cfg.Text, rows: usize) usize {
+    return std.mem.alignForward(usize, @as(usize, c.window) + rows + attention_prefill.key_block, key_block);
+}
+
+/// Slots layer `i` holds for a stream of `capacity` positions: every position on a global layer; on a sliding layer its
+/// ring, or every position where the stream is shorter than the ring.
+pub fn layerSlots(c: *const cfg.Text, i: usize, capacity: usize, rows: usize) usize {
+    const full = cachePositions(capacity);
+    return if (cfg.isGlobal(@intCast(i))) full else @min(full, slidingRing(c, rows));
+}
+
+/// Bytes a stream of `capacity` positions holds over the first `layers` layers, for prompt chunks of `rows` rows.
+pub fn cacheBytes(c: *const cfg.Text, capacity: usize, layers: usize, rows: usize) usize {
+    var total: usize = layers * convBytes(c) + @as(usize, c.vocab) * 2;
+    for (0..layers) |i| total += layerSlots(c, i, capacity, rows) * kvBytes(c);
+    return total;
 }
 
 /// A stream's latest tapped rows for its drafter: cache positions [start, start + rows), a row `feature_taps` hidden rows
@@ -144,11 +161,14 @@ pub const Cache = struct {
     kv: mtl.Buffer,
     conv: mtl.Buffer,
     logits: mtl.Buffer, // the prompt's last row's bf16 logits, kept for the first draw
-    /// Positions the stream's context may reach (`len` stops there); the buffers hold `cachePositions(capacity)`.
+    /// Positions the stream's context may reach (`len` stops there); each layer holds `slots[l]` slots.
     capacity: usize,
     layers: usize,
     len: usize = 0,
-    kv_layer: usize,
+    layer_at: [cfg.max_layers]usize,
+    slots: [cfg.max_layers]u32,
+    row: usize,
+    rows: usize,
     conv_layer: usize,
     widths: [4]usize,
     follow: ?mtl.ResidencySet.Follow = null,
@@ -156,28 +176,51 @@ pub const Cache = struct {
     /// The prompt's last tapped row, kept for the first draft (the prompt chunk's buffer serves the next one).
     last_tap: ?mtl.Buffer = null,
 
-    pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, layers: usize) !Cache {
-        var out = Cache{ .kv = undefined, .conv = undefined, .logits = undefined, .capacity = capacity, .layers = layers, .kv_layer = cachePositions(capacity) * kvBytes(c), .conv_layer = convBytes(c), .widths = convWidths(c) };
-        out.kv = try device.buffer(@max(out.kv_layer * layers, 16), mtl.ResourceOptions.private);
+    pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, layers: usize, rows: usize) !Cache {
+        const kv_row = kvBytes(c);
+        var out = Cache{
+            .kv = undefined,
+            .conv = undefined,
+            .logits = undefined,
+            .capacity = capacity,
+            .layers = layers,
+            .layer_at = @splat(0),
+            .slots = @splat(0),
+            .row = kv_row / 2,
+            .rows = rows,
+            .conv_layer = convBytes(c),
+            .widths = convWidths(c),
+        };
+        var kv_total: usize = 0;
+        for (0..layers) |i| {
+            const s = layerSlots(c, i, capacity, rows);
+            out.layer_at[i] = kv_total;
+            out.slots[i] = @intCast(s);
+            kv_total += s * kv_row;
+        }
+        out.kv = try device.buffer(@max(kv_total, 16), mtl.ResourceOptions.private);
         errdefer out.kv.deinit();
-        out.conv = try device.buffer(out.conv_layer * layers, mtl.ResourceOptions.private);
+        out.conv = try device.buffer(@max(out.conv_layer * layers, 16), mtl.ResourceOptions.private);
         errdefer out.conv.deinit();
         out.logits = try device.buffer(@as(usize, c.vocab) * 2, mtl.ResourceOptions.shared);
         return out;
     }
 
-    /// Byte offsets in `kv`: layer l's keys [cachePositions(capacity), kv, dim], then its values.
+    /// Byte offsets in `kv`: layer l's keys [slots[l], kv, dim], then its values; position p lives at slot p % ring(l).
     pub fn keys(self: *const Cache, l: usize) usize {
-        return l * self.kv_layer;
+        return self.layer_at[l];
     }
     pub fn values(self: *const Cache, l: usize) usize {
-        return l * self.kv_layer + self.kv_layer / 2;
+        return self.layer_at[l] + @as(usize, self.slots[l]) * self.row;
+    }
+    pub fn ring(self: *const Cache, l: usize) u32 {
+        return self.slots[l];
     }
 
     /// Byte offset in `conv` of layer l's ring `which` (0 k, 1 v, 2 attention output, 3 MLP output): [ring, width].
     pub fn ringAt(self: *const Cache, l: usize, which: usize) usize {
         var at = l * self.conv_layer;
-        for (self.widths[0..which]) |w| at += ring * w * 2;
+        for (self.widths[0..which]) |w| at += @import("state.zig").ring * w * 2;
         return at;
     }
 
@@ -399,7 +442,7 @@ pub const Scratch = struct {
 };
 
 /// Inkling 2 Small's text config, as the size checks need it.
-const small = cfg.Text{ .hidden = 4608, .layers = 48, .vocab = 201024, .unpadded_vocab = 200058, .local = .{ .q = 48, .kv = 8, .dim = 128 }, .global = .{ .q = 48, .kv = 8, .dim = 128 }, .window = 1024, .d_rel = 16, .rel_extent = 1024, .log_floor = 8192, .log_alpha = 0.1, .eps = 1e-6, .qk_clip = 22.627, .rel_clip = 8, .block = 6, .experts = 384, .topk = 8, .expert_inter = 2304, .route_scale = 8, .gate_cap = 4, .up_cap = 25, .logit_cap = 30, .max_context = 1048576 };
+pub const small = cfg.Text{ .hidden = 4608, .layers = 48, .vocab = 201024, .unpadded_vocab = 200058, .local = .{ .q = 48, .kv = 8, .dim = 128 }, .global = .{ .q = 48, .kv = 8, .dim = 128 }, .window = 1024, .d_rel = 16, .rel_extent = 1024, .log_floor = 8192, .log_alpha = 0.1, .eps = 1e-6, .qk_clip = 22.627, .rel_clip = 8, .block = 6, .experts = 384, .topk = 8, .expert_inter = 2304, .route_scale = 8, .gate_cap = 4, .up_cap = 25, .logit_cap = 30, .max_context = 1048576 };
 
 test "inkling2 state: tiles pad each expert to 8 rows; a cache's bytes; the split attention's partials" {
     try std.testing.expectEqual(@as(usize, 64), tileRows(8, 384));
@@ -407,7 +450,7 @@ test "inkling2 state: tiles pad each expert to 8 rows; a cache's bytes; the spli
     const c = small;
     try std.testing.expectEqual(@as(usize, 8), maxBlocks(&c));
     // 100 positions are held as 128, whole blocks of 64
-    try std.testing.expectEqual(@as(usize, 48 * (128 * 4096 + 32 * 11264 * 2) + 201024 * 2), cacheBytes(&c, 100, 48));
+    try std.testing.expectEqual(@as(usize, 48 * (128 * 4096 + 32 * 11264 * 2) + 201024 * 2), cacheBytes(&c, 100, 48, default_prefill_rows));
     // 16 rows x 48 heads x one slot a 256-key block: 32k positions are 128 blocks, 51 MB
     try std.testing.expectEqual(@as(usize, 51_118_080), partBytes(&c, 32768));
     try std.testing.expectEqual(partBytes(&c, 256), partBytes(&c, 1));
@@ -419,10 +462,32 @@ test "inkling2 state: a cache holds whole blocks of 64 positions, so a chunk's l
     for ([_]usize{ 1, 63, 64 }) |capacity| try std.testing.expectEqual(@as(usize, 64), cachePositions(capacity));
     for ([_]usize{ 65, 100, 128 }) |capacity| try std.testing.expectEqual(@as(usize, 128), cachePositions(capacity));
     try std.testing.expectEqual(@as(usize, 8256), cachePositions(8193));
-    try std.testing.expectEqual(cacheBytes(&small, 65, 48), cacheBytes(&small, 128, 48));
-    try std.testing.expect(cacheBytes(&small, 64, 48) < cacheBytes(&small, 65, 48));
+    try std.testing.expectEqual(cacheBytes(&small, 65, 48, default_prefill_rows), cacheBytes(&small, 128, 48, default_prefill_rows));
+    try std.testing.expect(cacheBytes(&small, 64, 48, default_prefill_rows) < cacheBytes(&small, 65, 48, default_prefill_rows));
     // every context's last position lies inside the positions held
     for ([_]usize{ 1, 63, 64, 65, 4095, 4096, 8193 }) |capacity| try std.testing.expect(cachePositions(capacity) >= capacity and cachePositions(capacity) % 64 == 0);
+}
+
+test "inkling2 state: a sliding layer holds its window, a chunk and a block more; a global layer every position" {
+    try std.testing.expectEqual(@as(usize, 5376), slidingRing(&small, 4096));
+    try std.testing.expectEqual(@as(usize, 1792), slidingRing(&small, 512));
+    try std.testing.expectEqual(@as(usize, 1280), slidingRing(&small, 64));
+    try std.testing.expectEqual(@as(usize, 9472), slidingRing(&small, 8192));
+    // every chunk size a load may take: a chunk never overwrites a key its own first tile reads
+    var rows: usize = prefill_unit;
+    while (rows <= max_prefill_rows) : (rows += prefill_unit) {
+        const r = slidingRing(&small, rows);
+        try std.testing.expect(r % key_block == 0 and r >= @as(usize, small.window) + rows + 63);
+    }
+    // layer 5 is global, layer 0 sliding
+    try std.testing.expectEqual(@as(usize, 131072), layerSlots(&small, 5, 131072, 4096));
+    try std.testing.expectEqual(@as(usize, 5376), layerSlots(&small, 0, 131072, 4096));
+    // a stream shorter than the ring holds its positions, as before
+    try std.testing.expectEqual(@as(usize, 2048), layerSlots(&small, 0, 2000, 4096));
+    // 8 global layers at 4 KiB a position, 40 rings, the convolution rings and the kept logits
+    const want = 8 * 131072 * 4096 + 40 * 5376 * 4096 + 48 * convBytes(&small) + 201024 * 2;
+    try std.testing.expectEqual(@as(usize, want), cacheBytes(&small, 131072, 48, 4096));
+    try std.testing.expect(cacheBytes(&small, 131072, 48, 4096) < 5 << 30);
 }
 
 test "inkling2 state: the drafter's taps are eight hidden rows a row, a decode window's and a prompt chunk's" {
@@ -571,13 +636,13 @@ test "inkling2 state: a cache's layers hold whole blocks of 64 positions, the va
         else => return err,
     };
     defer device.deinit();
-    var cache = try Cache.init(device, &small, 100, 2);
+    var cache = try Cache.init(device, &small, 100, 2, default_prefill_rows);
     defer cache.deinit();
     try std.testing.expectEqual(@as(usize, 100), cache.capacity);
-    try std.testing.expectEqual(128 * kvBytes(&small), cache.kv_layer);
-    try std.testing.expectEqual(2 * cache.kv_layer, cache.kv.length());
-    try std.testing.expectEqual(cache.kv_layer, cache.keys(1) - cache.keys(0));
-    try std.testing.expectEqual(cache.kv_layer / 2, cache.values(1) - cache.keys(1));
+    try std.testing.expectEqual(@as(u32, 128), cache.ring(0));
+    try std.testing.expectEqual(2 * 128 * kvBytes(&small), cache.kv.length());
+    try std.testing.expectEqual(@as(usize, cache.slots[0]) * kvBytes(&small), cache.keys(1) - cache.keys(0));
+    try std.testing.expectEqual(@as(usize, cache.slots[1]) * cache.row, cache.values(1) - cache.keys(1));
     // the last position of the context is inside the keys, and the block it ends in is whole
     try std.testing.expect(cache.values(0) >= cachePositions(cache.capacity) * kvBytes(&small) / 2);
 }

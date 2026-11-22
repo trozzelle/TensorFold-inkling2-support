@@ -102,7 +102,7 @@ pub const Metal = struct {
     /// A 16-token prompt on a throwaway cache: the first request skips the GPU's first touch of every weight.
     pub fn warm(self: *Metal) !void {
         const c = &self.model.config.text;
-        var cache = try st.Cache.init(self.model.device, c, 32, c.layers);
+        var cache = try st.Cache.init(self.model.device, c, 32, c.layers, self.scratch.prefill_rows);
         defer cache.deinit();
         var ids: [st.window_rows]u32 = undefined;
         for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37);
@@ -113,7 +113,7 @@ pub const Metal = struct {
     /// the rows tapped as a drafted round's are once the features are prepared: what the depth rule prices a round's window by.
     pub fn measure(self: *Metal) !void {
         const c = &self.model.config.text;
-        var cache = try st.Cache.init(self.model.device, c, 32, c.layers);
+        var cache = try st.Cache.init(self.model.device, c, 32, c.layers, self.scratch.prefill_rows);
         defer cache.deinit();
         var ids: [measured_widths]u32 = undefined;
         for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37);
@@ -199,13 +199,13 @@ pub const Metal = struct {
         if (ids.len == 0 or ids.len + stream.max_new > self.options.capacity or self.caches.contains(stream)) return error.InvalidInkling2Prompt;
         const c = &self.model.config.text;
         const capacity = ids.len + stream.max_new + 1;
-        const need = st.cacheBytes(c, capacity, c.layers);
+        const need = st.cacheBytes(c, capacity, c.layers, self.scratch.prefill_rows);
         if (self.held + need > self.options.budget) return error.Inkling2CachesFull;
         self.held += need;
         errdefer self.held -= need;
         const cache = try self.gpa.create(st.Cache);
         errdefer self.gpa.destroy(cache);
-        cache.* = try st.Cache.init(self.model.device, c, capacity, c.layers);
+        cache.* = try st.Cache.init(self.model.device, c, capacity, c.layers, self.scratch.prefill_rows);
         errdefer cache.deinit();
         cache.setResident(self.follow);
         try self.caches.put(self.gpa, stream, cache);
@@ -344,7 +344,7 @@ pub const Metal = struct {
         const self = cast(ptr);
         if (self.caches.fetchRemove(stream)) |entry| {
             const c = &self.model.config.text;
-            self.held -= st.cacheBytes(c, entry.value.capacity, c.layers);
+            self.held -= st.cacheBytes(c, entry.value.capacity, c.layers, self.scratch.prefill_rows);
             entry.value.deinit();
             self.gpa.destroy(entry.value);
         }

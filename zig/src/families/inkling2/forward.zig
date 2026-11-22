@@ -327,6 +327,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     const c = &m.config.text;
     const n = ids.len;
     if (n == 0 or n > s.prefill_rows or (out.logits == .all and n > st.window_rows)) return error.Inkling2RowsExceeded;
+    if (out.prompt and n > cache.rows) return error.Inkling2CacheRingShort;
     if (cache.len + n > cache.capacity) return error.Inkling2ContextFull;
     const decode = !out.prompt and n <= st.window_rows;
     // the decode path's split attention keeps one partial for each 256-key block of the cache so far
@@ -519,7 +520,7 @@ fn layer(x: Enc, i: u32) !void {
     try x.conv(w.v_conv, b(s.v), xv, b(s.vc), i, 1, kvw, hd.kv);
     const keys = bo(cache.kv, cache.keys(i));
     const values = bo(cache.kv, cache.values(i));
-    const ring: u32 = @intCast(st.cachePositions(cache.capacity));
+    const ring = cache.ring(i);
     try x.begin(.attention_prepare);
     x.glue(.prep, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .flags = if (glob) global else 0, .ring = ring, .eps = c.eps, .cap = c.qk_clip, .thr = c.rel_clip, .alpha = c.log_alpha, .floor_n = @floatFromInt(c.log_floor) }, &.{ b(s.q), b(s.kc), b(s.vc), b(s.r), t(w.q_scale), t(w.rel_scale), b(s.qn), keys, values, b(s.reln) }, .{ 2 * hd.q + 2 * hd.kv, n, 1 }, .{ 32, 1, 1 }, true);
     // the decode path's attention forms the relative bias itself from reln and the projection, and so do the chunk kernels (as a table

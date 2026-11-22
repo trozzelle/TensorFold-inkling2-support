@@ -184,7 +184,7 @@ fn layersMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const c = &m.config.text;
     const n = ids.value.len;
     const capacity = n + 1;
-    var cache = try ik.state.Cache.init(m.device, c, capacity, L);
+    var cache = try ik.state.Cache.init(m.device, c, capacity, L, m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
@@ -223,7 +223,7 @@ fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     const c = &m.config.text;
     const capacity = longest + 1;
-    var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers);
+    var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers, m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
@@ -266,7 +266,7 @@ fn exactMode(init: std.process.Init, args: []const [:0]const u8) !void {
     for (&outs) |*o| o.* = try init.gpa.alloc(u16, cont * H * 2);
     defer for (outs) |o| init.gpa.free(o);
     for (0..2) |way| {
-        var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers);
+        var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
         defer cache.deinit();
         const rows: usize = if (way == 0) 1 else ik.state.window_rows;
         try ik.forward.run(m, &s, &cache, all[0..at], .{ .finals = full, .logits = .none, .prompt = true });
@@ -310,7 +310,7 @@ fn greedyMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     const c = &m.config.text;
     const capacity = ids.value.len + steps + 1;
-    var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers);
+    var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers, m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
@@ -387,7 +387,7 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
         var tokens: std.ArrayList(u32) = .empty;
         defer tokens.deinit(init.gpa);
         try tokens.appendSlice(init.gpa, ids.value);
-        var cache = try ik.state.Cache.init(m.device, c, T + 1, L);
+        var cache = try ik.state.Cache.init(m.device, c, T + 1, L, m.prefill_rows);
         defer cache.deinit();
         const t0 = now();
         var row: usize = 0;
@@ -458,7 +458,7 @@ fn ftapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const row: usize = ik.state.feature_taps * @as(usize, c.hidden);
     var s = try ik.state.Scratch.init(m.device, c, T + 1, m.chunking());
     defer s.deinit();
-    var cache = try ik.state.Cache.init(m.device, c, T + 1, c.layers);
+    var cache = try ik.state.Cache.init(m.device, c, T + 1, c.layers, m.prefill_rows);
     defer cache.deinit();
     const taps = try init.gpa.alloc(u16, T * row);
     defer init.gpa.free(taps);
@@ -497,7 +497,7 @@ fn profileMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const c = &m.config.text;
     const full = m.layers == c.layers;
     const capacity = pos + rows * steps + 1;
-    var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers);
+    var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
@@ -564,7 +564,7 @@ fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const c = &m.config.text;
     const full = m.layers == c.layers;
     const capacity = pos + rows * steps + 1;
-    var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers);
+    var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
@@ -676,7 +676,7 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     const c = &m.config.text;
     const full = m.layers == c.layers;
-    var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers);
+    var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers, m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, @max(T + 1, ik.state.window_rows), m.chunking());
     defer s.deinit();
@@ -685,7 +685,7 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const taps: ?ik.forward.B = if (absorber != null) .{ .buf = s.ptaps } else null;
     // the weights' first pass is slower than the next ones: the server takes it before a first request (backend.Metal.warm)
     {
-        var warm = try ik.state.Cache.init(m.device, c, 32, m.layers);
+        var warm = try ik.state.Cache.init(m.device, c, 32, m.layers, m.prefill_rows);
         defer warm.deinit();
         var warm_ids: [ik.state.window_rows]u32 = undefined;
         for (&warm_ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37);
