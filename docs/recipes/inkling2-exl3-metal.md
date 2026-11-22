@@ -5,7 +5,7 @@ TensorFold serves `thinkingmachines/Inkling-2-Small` on one Mac with 256 GB of m
   2 to 4 bits;
 - everything else in the source checkpoint's bf16.
 
-Text only, one stream; drafts come from the checkpoint's DSpark draft head. No prompt cache or image tower yet.
+Text only, one stream; drafts come from the checkpoint's DSpark draft head, with an in-memory prompt cache for multi-turn reuse. No image tower yet.
 
 ## Model directory
 
@@ -42,10 +42,12 @@ checks that each row's result is independent of the rows beside it, and that a N
 - The load limit covers weights, scratch and caches. The default is 75% of RAM, which leaves no room for caches
   beside this pack on a 256 GB Mac.
   - `--load-limit-gb` sets the limit; `INKLING_LOAD_LIMIT_GB` is the fallback.
-  - At 236 GB, 23.0 GiB is left for caches with the draft head (192.1 GiB of weights and 2.67 GiB of prompt-chunk
-    scratch at the default 4,096 rows), roughly 120k tokens. A 512-row chunk takes 0.37 GiB of scratch instead.
-- Caches take 192 KiB a token, because every layer keeps its whole context, plus 33 MiB of convolution rings a
-  stream.
+  - At 236 GB, 22.9 GiB is left for caches with the draft head (192.1 GiB of weights and 2.67 GiB of prompt-chunk
+    scratch at the default 4,096 rows): enough for about 693k tokens of context. A 512-row chunk takes 0.37 GiB of
+    scratch instead.
+- Sliding layers (40 of 48, 1,024-token window) keep a ring of keys and values sized to `alignForward(window + prefill_rows + 64, 256)` slots (5,376 slots at the default 4,096-row chunk, 1,792 at 512), while the 8 global layers keep every position. Past the ring, context grows at 32 KiB a token (plus ~1.5 KiB of split-attention partials), over 0.87 GiB of sliding rings and convolution state at the default chunk (a 131,072-token stream takes 5.05 GiB).
+- When `--context` is unset, the server advertises up to 131,072 tokens (or less if fewer fit); `--context` accepts any length up to what the caches fit, which the startup line reports.
+- Prompt cache (`--prompt-cache-gib`, default 8 GiB; `0` turns it off): kept states hold the global layers' first `at` keys and values, the sliding layers' live window aligned to a 64-key block, the convolution rings, and (with drafts on) the draft head's five context rings (20.3 MiB), taking 32 KiB a token plus up to 223 MiB (about 1.2 GiB at 32k tokens). States are saved at prompt-pass marks and restored into any cache capacity with identical output bits; a follow-up turn prefills the previous reply and the new message from the history mark. Streams take cache memory first and kept states evict before any stream is refused.
 - Started by launchd (a router run as a LaunchDaemon or LaunchAgent), the server needs two things:
   - `ProcessType` `Interactive` in the job's plist. Without it, launchd clamps the job and its children to
     background priority, a decode step's wait wakes tens of milliseconds late, and drafted decode drops to about
@@ -100,8 +102,8 @@ checks that each row's result is independent of the rows beside it, and that a N
 - `tf-inkling-run MODEL layers ids.json out.bin L [--window] [--chunk N]` and `tf-inkling-run MODEL finals index.txt
   out_dir [--window] [--chunk N]` feed their ids as prompt chunks of N rows (the prefill rows when not given), so they exercise the chunk
   path's arithmetic; `--window` feeds them the way a decode-time client does instead.
-- `tf-inkling-run MODEL partition ids.json CUT... [--layers L] [--drafts]` feeds a prompt twice, in chunks of the prefill
-  rows and in chunks of the lengths given (the prefill rows for what is left), each leg on a scratch and a cache poisoned
+- `tf-inkling-run MODEL partition ids.json CUT... [--restore AT]... [--layers L] [--drafts]` feeds a prompt twice, in chunks of the prefill
+  rows and in chunks of the lengths given (the prefill rows for what is left), plus one leg per `--restore AT` that saves a prompt state at `AT` and resumes on a fresh poisoned cache, each leg on a scratch and a cache poisoned
   with NaN past the rows in use, and compares the legs bit for bit: every layer's keys and values, the convolution rings,
   every row's last-layer output and expert picks and, on the whole model, the taps, the last row's finals and the kept
   logits (with `--drafts`, the first hold's proposals). It exits non-zero on a difference, on a NaN in a result and on a
@@ -130,6 +132,10 @@ Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a b
 |---|---|
 | Prompt (prefill), 8k-token prompts, drafts on | 2,057-2,090 tok/s (median of three requests on each of three prompts of 8,191-8,193 tokens; about 3.9 s to the first token), up from about 65-71 tok/s on the per-operation kernels |
 | Prompt, direct start, 8,192 tokens | 2,119 tok/s (3,867 ms: experts 2,325 ms, dense projections 675 ms, norms 422 ms, attention 298 ms, the rest about 100 ms) |
+| Prompt, direct start, 131,008 tokens, drafts on | 1,618 tok/s (80.95 s wall, 78.35 s GPU, max command buffer 216 ms) |
+| Resumed 32k follow-up / regenerate / edit / reask (served, prompt cache on) | 0.51 s / 0.20 s / 0.50 s / 2.45 s TTFT (vs 16.7-17.3 s cache off; bit-identical replies, 1.00x decode rate) |
+| Decode after 32,704 tokens (direct start) | 56.3 tok/s with drafts; 37.1 tok/s plain |
+| Decode after 131,008 tokens (direct start) | 45.7 tok/s with drafts; 31.9 tok/s plain |
 | Decode with drafts, three gate prompts | 60.6 tok/s (61.6 before the chunk path) |
 | Decode with drafts (default) | 61.4 tok/s (65.2 on the bench prompt) |
 | Decode with drafts, every draft verified at depth 4 | 57.1 tok/s |
@@ -160,7 +166,6 @@ kernels (the path a GPU without tensor units still takes); the chunk path was th
 ## Limits
 
 - One stream; `--parallel` above 1 is refused.
-- Drafts come from the draft head for one stream; there is no prompt cache, so a repeated prompt is computed again.
 - `--vision` is refused.
 - The server does not yet split Inkling's reply channels: a thinking reply's `reasoning_content` starts with the
   raw channel markers (`<|message_model|><|content_thinking|>`). Send
