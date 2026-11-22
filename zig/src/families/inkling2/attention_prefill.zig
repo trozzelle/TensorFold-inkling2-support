@@ -23,11 +23,11 @@ pub const key_block = 64;
 
 const row_q = heads * dim;
 
-/// ik_pattn's arguments: the call's rows, the first row's position in the sequence, 1 on a global layer.
-pub const Args = extern struct { rows: u32, p0: u32, global: u32 };
+/// ik_pattn's arguments: the call's rows, the first row's position in the sequence, 1 on a global layer, slots in the layer's cache.
+pub const Args = extern struct { rows: u32, p0: u32, global: u32, ring: u32 };
 
 comptime {
-    std.debug.assert(@sizeOf(Args) == 12);
+    std.debug.assert(@sizeOf(Args) == 16);
 }
 
 /// A buffer and the byte offset of a view in it.
@@ -113,15 +113,15 @@ pub fn encodeChunk(e: mtl.ComputeEncoder, p: *const Pipes, a: Args, io: Io, reln
     std.debug.assert(piece > 0 and piece % 32 == 0);
     var at: usize = 0;
     while (at < a.rows) : (at += piece) {
-        const sub: Args = .{ .rows = @intCast(@min(piece, a.rows - at)), .p0 = a.p0 + @as(u32, @intCast(at)), .global = a.global };
+        const sub: Args = .{ .rows = @intCast(@min(piece, a.rows - at)), .p0 = a.p0 + @as(u32, @intCast(at)), .global = a.global, .ring = a.ring };
         encodeBias(e, p.bias, sub, down(reln, heads * rel_dims * 2, at), proj, table);
         const part: Io = .{ .q = down(io.q, row_q * 2, at), .k = io.k, .v = io.v, .sink = down(io.sink, heads * 2, at), .gate = down(io.gate, row_q * 2, at), .out = down(io.out, row_q * 2, at) };
         encodeAttn(e, p.attn, sub, part, table);
     }
 }
 
-test "attention prefill: the table is a bf16 a head and distance, and ik_pattn's arguments are three words" {
+test "attention prefill: the table is a bf16 a head and distance, and ik_pattn's arguments are four words" {
     try std.testing.expectEqual(@as(usize, 48 * 1024 * 2), tableBytes(1));
     try std.testing.expectEqual(@as(usize, 4096 * 48 * 1024 * 2), tableBytes(4096));
-    try std.testing.expectEqual(@as(usize, 12), @sizeOf(Args));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Args));
 }

@@ -105,8 +105,8 @@ fn blocksOf(pos: u32, rows: u32, window: u32) struct { f0: u32, n: u32 } {
     return .{ .f0 = f0, .n = (pos + rows - 1) / KEYS - f0 + 1 };
 }
 
-fn argsOf(rows: u32, pos: u32, window: u32, f0: u32, n: u32) h.Args {
-    return .{ .rows = rows, .heads = Hq, .kv = KV, .dim = D, .pos = pos, .window = window, .extent = E, .blocks = n, .queries = f0, .scale = @floatCast(1 / @sqrt(@as(f64, D))) };
+fn argsOf(rows: u32, pos: u32, window: u32, f0: u32, n: u32, ring: u32) h.Args {
+    return .{ .rows = rows, .heads = Hq, .kv = KV, .dim = D, .pos = pos, .window = window, .extent = E, .ring = ring, .blocks = n, .queries = f0, .scale = @floatCast(1 / @sqrt(@as(f64, D))) };
 }
 
 /// The partial kernel alone over `rows` rows that start at input row `row` and position `pos`, with blocks f0 .. f0 + n:
@@ -117,7 +117,7 @@ fn runPart(g: *const h.Gpu, x: Inputs, name: [:0]const u8, table: mtl.Buffer, ro
     @memset(x.part.slice(f32, rows * Hq * n * SLOT), std.math.nan(f32));
     @memset(x.out(row, rows), 0xff);
     const q: h.Bind = .{ .buf = x.qn, .off = row * Hq * D * 2 };
-    const a = argsOf(rows, pos, window, f0, n);
+    const a = argsOf(rows, pos, window, f0, n, CAP);
     const grid: [3]usize = .{ KV, rows, n };
     const group: [3]usize = .{ 32, PART_SIMDGROUPS, 1 };
     if (std.mem.eql(u8, name, "ik_attn_part")) {
@@ -130,7 +130,7 @@ fn runPart(g: *const h.Gpu, x: Inputs, name: [:0]const u8, table: mtl.Buffer, ro
 /// ik_attn_part, then ik_attn_merge, over the same rows and blocks.
 fn attend(g: *const h.Gpu, x: Inputs, row: usize, rows: u32, pos: u32, window: u32, f0: u32, n: u32) !void {
     try runPart(g, x, "ik_attn_part", x.pb, row, rows, pos, window, f0, n);
-    const a = argsOf(rows, pos, window, f0, n);
+    const a = argsOf(rows, pos, window, f0, n, CAP);
     try g.run("ik_attn_merge", a, &.{ .{ .buf = x.part }, .{ .buf = x.sink, .off = row * Hq * 2 }, .{ .buf = x.gate, .off = row * Hq * D * 2 }, .{ .buf = x.att, .off = row * OUT_ROW } }, .{ Hq, rows, 1 }, .{ 32, 1, 1 }, true);
 }
 
@@ -309,9 +309,105 @@ fn caseSplitBias(g: *const h.Gpu, r: std.Random) !void {
     try c.done();
 }
 
+/// A ring gives a linear cache's bytes across wraps, local and global, with non-live ring slots poisoned before each chunk.
+fn caseSplitRing(g: *const h.Gpu, r: std.Random) !void {
+    const R_small: usize = 1280;
+    const T: usize = 3 * R_small + 100;
+    const lin_cap: usize = std.mem.alignForward(usize, T, 64);
+    const max_blocks: usize = (lin_cap + KEYS - 1) / KEYS;
+    const nan: u16 = 0x7fc0;
+    const q = try g.buf(ROWS * Hq * D * 2);
+    const k = try g.buf(ROWS * KV * D * 2);
+    const v = try g.buf(ROWS * KV * D * 2);
+    const rr = try g.buf(ROWS * Hq * REL * 2);
+    const qs = try g.buf(Hq * D * 2);
+    const rs = try g.buf(Hq * REL * 2);
+    const qn = try g.buf(ROWS * Hq * D * 2);
+    const reln = try g.buf(ROWS * Hq * REL * 2);
+    const proj = try g.buf(REL * E * 2);
+    const sink = try g.buf(ROWS * Hq * 2);
+    const gate = try g.buf(ROWS * Hq * D * 2);
+    const part = try g.buf(ROWS * Hq * max_blocks * SLOT * 4);
+    const out_lin = try g.buf(ROWS * OUT_ROW);
+    const out_ring = try g.buf(ROWS * OUT_ROW);
+    const lin_k = try g.buf(lin_cap * KV * D * 2);
+    const lin_v = try g.buf(lin_cap * KV * D * 2);
+    const ring_k = try g.buf(lin_cap * KV * D * 2);
+    const ring_v = try g.buf(lin_cap * KV * D * 2);
+    defer for ([_]mtl.Buffer{ q, k, v, rr, qs, rs, qn, reln, proj, sink, gate, part, out_lin, out_ring, lin_k, lin_v, ring_k, ring_v }) |b| b.deinit();
+    _ = h.fill16(qs, Hq * D, r, 1.5);
+    _ = h.fill16(rs, Hq * REL, r, 1.5);
+    _ = h.fill16(proj, REL * E, r, 1.5);
+    const chunks = [_]usize{ 1, 2, 5, 8, 16 };
+    for ([_]bool{ false, true }) |global| {
+        const ring_slots: usize = if (global) lin_cap else R_small;
+        const window: u32 = if (global) 0 else E;
+        var c: h.Check = .{ .name = if (global) "split ring global" else "split ring local" };
+        var pos: usize = 0;
+        var ci: usize = 0;
+        while (pos < T) : (ci += 1) {
+            const n = @min(chunks[ci % chunks.len], T - pos);
+            _ = h.fill16(q, n * Hq * D, r, 2.5);
+            _ = h.fill16(k, n * KV * D, r, 2.5);
+            _ = h.fill16(v, n * KV * D, r, 1.0);
+            _ = h.fill16(rr, n * Hq * REL, r, 1.0);
+            _ = h.fill16(sink, n * Hq, r, 2.0);
+            _ = h.fill16(gate, n * Hq * D, r, 3.0);
+            var poisoned: [R_small]bool = @splat(false);
+            if (!global) {
+                const live_lo = std.mem.alignBackward(usize, pos -| (E - 1), 64);
+                var keep: [R_small]bool = @splat(false);
+                for (live_lo..pos) |p| keep[p % R_small] = true;
+                const rk = ring_k.slice(u16, R_small * KV * D);
+                const rv = ring_v.slice(u16, R_small * KV * D);
+                for (0..R_small) |s| if (!keep[s]) {
+                    poisoned[s] = true;
+                    @memset(rk[s * KV * D ..][0 .. KV * D], nan);
+                    @memset(rv[s * KV * D ..][0 .. KV * D], nan);
+                };
+            }
+            const prep_base: h.Args = .{ .rows = @intCast(n), .heads = Hq, .kv = KV, .dim = D, .pos = @intCast(pos), .flags = if (global) 2 else 0, .eps = 1e-6, .cap = 22.627416997969522, .thr = 8, .alpha = 0.1, .floor_n = 8192 };
+            var prep_lin = prep_base;
+            prep_lin.ring = @intCast(lin_cap);
+            try g.run("ik_prep", prep_lin, &.{ .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = rr }, .{ .buf = qs }, .{ .buf = rs }, .{ .buf = qn }, .{ .buf = lin_k }, .{ .buf = lin_v }, .{ .buf = reln } }, .{ 2 * Hq + 2 * KV, n, 1 }, .{ 32, 1, 1 }, true);
+            var prep_ring = prep_base;
+            prep_ring.ring = @intCast(ring_slots);
+            try g.run("ik_prep", prep_ring, &.{ .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = rr }, .{ .buf = qs }, .{ .buf = rs }, .{ .buf = qn }, .{ .buf = ring_k }, .{ .buf = ring_v }, .{ .buf = reln } }, .{ 2 * Hq + 2 * KV, n, 1 }, .{ 32, 1, 1 }, true);
+            const grid = blocksOf(@intCast(pos), @intCast(n), window);
+            const a_lin = argsOf(@intCast(n), @intCast(pos), window, grid.f0, grid.n, @intCast(lin_cap));
+            try g.run("ik_attn_part", a_lin, &.{ .{ .buf = qn }, .{ .buf = lin_k }, .{ .buf = lin_v }, .{ .buf = reln }, .{ .buf = proj }, .{ .buf = part } }, .{ KV, n, grid.n }, .{ 32, PART_SIMDGROUPS, 1 }, true);
+            try g.run("ik_attn_merge", a_lin, &.{ .{ .buf = part }, .{ .buf = sink }, .{ .buf = gate }, .{ .buf = out_lin } }, .{ Hq, n, 1 }, .{ 32, 1, 1 }, true);
+            const a_ring = argsOf(@intCast(n), @intCast(pos), window, grid.f0, grid.n, @intCast(ring_slots));
+            try g.run("ik_attn_part", a_ring, &.{ .{ .buf = qn }, .{ .buf = ring_k }, .{ .buf = ring_v }, .{ .buf = reln }, .{ .buf = proj }, .{ .buf = part } }, .{ KV, n, grid.n }, .{ 32, PART_SIMDGROUPS, 1 }, true);
+            try g.run("ik_attn_merge", a_ring, &.{ .{ .buf = part }, .{ .buf = sink }, .{ .buf = gate }, .{ .buf = out_ring } }, .{ Hq, n, 1 }, .{ 32, 1, 1 }, true);
+            const bytes = n * OUT_ROW;
+            finite(&c, out_ring.slice(u8, bytes));
+            c.same(out_ring.slice(u8, bytes), out_lin.slice(u8, bytes));
+            if (!global) {
+                var written: [R_small]bool = @splat(false);
+                for (pos..pos + n) |p| written[p % R_small] = true;
+                const rk = ring_k.slice(u16, R_small * KV * D);
+                const rv = ring_v.slice(u16, R_small * KV * D);
+                for (0..R_small) |s| if (poisoned[s] and !written[s]) {
+                    c.n += 1;
+                    for (rk[s * KV * D ..][0 .. KV * D], rv[s * KV * D ..][0 .. KV * D]) |kv_x, vv_x| {
+                        if (kv_x != nan or vv_x != nan) {
+                            c.bad += 1;
+                            break;
+                        }
+                    }
+                };
+            }
+            pos += n;
+        }
+        try c.done();
+    }
+}
+
 pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseSplitRef(g, r);
     try caseSplitWindow(g, r);
     try caseSplitBlocks(g, r);
     try caseSplitBias(g, r);
+    try caseSplitRing(g, r);
 }

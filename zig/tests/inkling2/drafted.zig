@@ -32,7 +32,7 @@ pub fn greedy(init: std.process.Init, model_dir: []const u8, ids: []const u32, s
     defer drafter.deinit();
     // one stream's cache, for the prompt and the tokens after it
     const capacity = ids.len + steps;
-    const metal = try ik.backend.Metal.init(gpa, m, .{ .capacity = capacity, .budget = ik.state.cacheBytes(c, capacity + 1, c.layers) });
+    const metal = try ik.backend.Metal.init(gpa, m, .{ .capacity = capacity, .budget = ik.state.cacheBytes(c, capacity + 1, c.layers, m.prefill_rows) });
     defer metal.deinit();
     try metal.warm();
     var drafted = try ik.dspark.wrap(gpa, metal.backend(), drafter);

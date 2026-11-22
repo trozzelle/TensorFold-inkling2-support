@@ -6,7 +6,7 @@ using namespace metal;
 // forward.zig's Args, field for field.
 struct ik_args {
   uint rows, width, heads, kv, dim, pos, blocks, queries;
-  uint stride, flags, window, extent;
+  uint stride, flags, window, extent, ring;
   float eps, scale, cap, alpha, floor_n, thr;
 };
 

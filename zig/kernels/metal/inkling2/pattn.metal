@@ -36,9 +36,10 @@ constant constexpr float kScale = 0.08838834764831845f; // 1 / sqrt(DH)
 using PT = half;
 using PT4 = half4;
 
-// rows: the call's rows; p0: the first row's position in the sequence; global: 1 on a global layer, 0 on a local one.
+// rows: the call's rows; p0: the first row's position in the sequence; global: 1 on a global layer, 0 on a local one;
+// ring: slots the layer's cache holds (position p lives at p % ring).
 struct IkPattnArgs {
-  uint rows, p0, global;
+  uint rows, p0, global, ring;
 };
 
 // Row max (MAX) or sum over a fragment's 32 columns into r[0], r[1] (rows home.y, home.y + 8).
@@ -175,7 +176,7 @@ inline void ik_pa_run(constant IkPattnArgs& a, const device bfloat* Q, const dev
   bias.tile(r0, q_rows, qh, first_pos, sg, lane, home);
   for (int kb = lo / BKT; kb <= last_pos / BKT; kb++) {
     const int kpos = kb * BKT + int(sg) * KS;
-    const device bfloat* kblk = kc + long(kpos) * LD;
+    const device bfloat* kblk = kc + long(kpos % int(a.ring)) * LD;
     frag<float> s[4];
     TF_UNROLL
     for (short i = 0; i < 4; i++) s[i] = frag<float>(0);
@@ -240,7 +241,7 @@ inline void ik_pa_run(constant IkPattnArgs& a, const device bfloat* Q, const dev
       const int kp = kb * BKT + 16 * kk;
       if (kp > last_pos) break; // keys past the tile's rows: masked, and their cache rows may hold anything
       const int valid = min(16, last_pos + 1 - kp); // a value row never written would poison the tile as 0 x NaN
-      const device bfloat* vblk = vc + long(kp) * LD;
+      const device bfloat* vblk = vc + long(kp % int(a.ring)) * LD;
       frag<bfloat> v0, v1;
       TF_UNROLL
       for (short d = 0; d < 4; d += 2) {

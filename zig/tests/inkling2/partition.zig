@@ -2,9 +2,10 @@
 //! chunks of given lengths, and the two legs' results compared bit for bit.
 //!
 //! A row's results must not depend on the chunk it was fed in. Each leg starts on a cache whose keys, values, convolution rings and
-//! kept logits are NaN; before every chunk the whole scratch is NaN and so are the cache's rows from the chunk's first on; after it
-//! the 64 rows past the chunk's end must still be NaN. A kernel that reads past the rows it was given, or leaves a row unwritten,
-//! turns what is compared to NaN and fails the run, as does a write past the rows, as does any bit that differs between the legs.
+//! kept logits are NaN; before every chunk the whole scratch is NaN and so is every cache slot no later row can read; after each
+//! chunk its rows are read out by position through the slot map and every slot that stayed poisoned must still be NaN. A kernel that
+//! reads outside the live rows, or leaves a row unwritten, turns what is compared to NaN and fails the run, as does a write outside
+//! the chunk's rows, as does any bit that differs between the legs.
 //!
 //! Compared: every layer's keys and values of every row, every convolution ring, every row's last-layer output and expert picks;
 //! on the whole model also every row's taps (the draft head's features, finals among them), the last row's finals and the logits
@@ -17,18 +18,18 @@ const ik = tf.inkling2;
 const settings = @import("settings.zig");
 const Absorber = @import("absorber.zig").Absorber;
 
-/// Rows of the cache past a chunk's end that must stay untouched by it: a 64-key block of attention reaches this far.
-const reach = 64;
 /// The bytes of the poison: bf16, f16 and f32 words made of them are NaN, and an index made of them is out of range.
 const nan_byte: u8 = 0xff;
 const nan_word: u16 = 0xffff;
 const depth = ik.dspark.max_depth;
 
-const Options = struct { cuts: []const u32, layers: ?u32 = null, drafts: bool = false };
+const Options = struct { cuts: []const u32, restores: []const u32 = &.{}, layers: ?u32 = null, drafts: bool = false };
 
 fn parseOptions(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
     var cuts: std.ArrayList(u32) = .empty;
     errdefer cuts.deinit(gpa);
+    var restores: std.ArrayList(u32) = .empty;
+    errdefer restores.deinit(gpa);
     var o: Options = .{ .cuts = &.{} };
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -38,6 +39,12 @@ fn parseOptions(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
             i += 1;
             if (i == args.len) return error.ExpectedAValueAfterTheOption;
             o.layers = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--restore")) {
+            i += 1;
+            if (i == args.len) return error.ExpectedAValueAfterTheOption;
+            const at = try std.fmt.parseInt(u32, args[i], 10);
+            if (at == 0) return error.RestorePositionOutOfRange;
+            try restores.append(gpa, at);
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             return error.UnknownPartitionOption;
         } else {
@@ -50,6 +57,8 @@ fn parseOptions(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
     if (o.layers == 0) return error.ExpectedPositiveLayers;
     if (o.drafts and o.layers != null) return error.DraftsNeedTheWholeModel;
     o.cuts = try cuts.toOwnedSlice(gpa);
+    errdefer gpa.free(o.cuts);
+    o.restores = try restores.toOwnedSlice(gpa);
     return o;
 }
 
@@ -121,46 +130,98 @@ fn rowBytes(c: *const ik.config.Text) usize {
     return ik.state.kvBytes(c) / 2;
 }
 
-/// The cache's rows from `from` to its end, of every layer's keys and values, to NaN bytes; `start` also the convolution rings and
-/// the kept logits.
-fn poisonCache(m: *const ik.Model, cache: *ik.state.Cache, from: usize, start: bool) !void {
+/// The first position of layer `l` a row at `at` can read: 0 on a global layer; on a sliding one the 64-key block of its
+/// window's first key.
+fn liveFrom(c: *const ik.config.Text, l: usize, at: usize) usize {
+    return if (ik.config.isGlobal(@intCast(l))) 0 else std.mem.alignBackward(usize, at -| (@as(usize, c.window) - 1), 64);
+}
+
+/// Byte offset in the cache's kv buffer of position `p` of layer `l`'s keys (`values`: its values).
+fn rowAt(cache: *const ik.state.Cache, l: usize, p: usize, values: bool, row: usize) usize {
+    return (if (values) cache.values(l) else cache.keys(l)) + (p % cache.ring(l)) * row;
+}
+
+fn fillSlotRange(blit: mtl.BlitEncoder, kv: mtl.Buffer, base: usize, lo: usize, hi: usize, row: usize) void {
+    if (hi > lo) blit.fill(kv, base + lo * row, (hi - lo) * row, nan_byte);
+}
+
+/// For every layer, NaN every slot except those of positions `[liveFrom(l, pos), pos)`; `start` also poisons the convolution
+/// rings and the kept logits.
+fn poisonCache(m: *const ik.Model, cache: *ik.state.Cache, pos: usize, start: bool) !void {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
-    const row = rowBytes(&m.config.text);
-    const held = ik.state.cachePositions(cache.capacity);
+    const c = &m.config.text;
+    const row = rowBytes(c);
     const cb = m.queue.commandBuffer();
     const blit = cb.blit();
-    if (held > from) for (0..cache.layers) |l| {
-        blit.fill(cache.kv, cache.keys(l) + from * row, (held - from) * row, nan_byte);
-        blit.fill(cache.kv, cache.values(l) + from * row, (held - from) * row, nan_byte);
-    };
+    for (0..cache.layers) |l| {
+        const slots: usize = cache.ring(l);
+        const lo = liveFrom(c, l, pos);
+        for ([_]usize{ cache.keys(l), cache.values(l) }) |base| {
+            if (pos <= lo) {
+                fillSlotRange(blit, cache.kv, base, 0, slots, row);
+            } else if (pos - lo < slots) {
+                const first = lo % slots;
+                const end = pos % slots;
+                if (first < end) {
+                    fillSlotRange(blit, cache.kv, base, 0, first, row);
+                    fillSlotRange(blit, cache.kv, base, end, slots, row);
+                } else {
+                    fillSlotRange(blit, cache.kv, base, end, first, row);
+                }
+            }
+        }
+    }
     if (start) blit.fill(cache.conv, 0, cache.conv.length(), nan_byte);
     blit.end();
     try finish(cb);
     if (start) @memset(cache.logits.slice(u8, cache.logits.length()), nan_byte);
 }
 
-/// The `reach` rows of every layer's keys and values from `from` are still NaN: the chunk before them wrote nothing there.
-fn checkReach(m: *const ik.Model, cache: *ik.state.Cache, staging: mtl.Buffer, from: usize) !void {
+/// Whether slot `s` of a ring of `slots` holds any position in `[lo, hi)`.
+fn slotInRange(s: usize, slots: usize, lo: usize, hi: usize) bool {
+    if (hi <= lo) return false;
+    if (hi - lo >= slots) return true;
+    const first = lo % slots;
+    const end = hi % slots;
+    return if (first < end) (s >= first and s < end) else (s >= first or s < end);
+}
+
+/// After a chunk of `n` rows at `pos`: copy the chunk's rows `[pos, pos + n)` of every layer's keys and values into `leg.kv`
+/// by position, check they are finite, and confirm every slot outside `[liveFrom(l, pos), pos + n)` mod ring is still NaN.
+fn readChunkAndCheck(m: *const ik.Model, cache: *ik.state.Cache, staging: mtl.Buffer, pos: usize, n: usize, T: usize, leg: *Leg) !void {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
-    const row = rowBytes(&m.config.text);
-    const held = ik.state.cachePositions(cache.capacity);
-    if (from >= held) return;
-    const rows = @min(reach, held - from);
-    const cb = m.queue.commandBuffer();
-    const blit = cb.blit();
+    const c = &m.config.text;
+    const row = rowBytes(c);
+    const row16 = row / 2;
     for (0..cache.layers) |l| {
-        blit.copy(cache.kv, cache.keys(l) + from * row, staging, (2 * l) * rows * row, rows * row);
-        blit.copy(cache.kv, cache.values(l) + from * row, staging, (2 * l + 1) * rows * row, rows * row);
+        const slots: usize = cache.ring(l);
+        const kv_layer = slots * 2 * row;
+        const cb = m.queue.commandBuffer();
+        const blit = cb.blit();
+        blit.copy(cache.kv, cache.keys(l), staging, 0, kv_layer);
+        blit.end();
+        try finish(cb);
+        const words = staging.slice(u16, kv_layer / 2);
+        const half16 = slots * row16;
+        const lo = liveFrom(c, l, pos);
+        for ([_]usize{ 0, half16 }, 0..) |base, kind| {
+            const dst = leg.kv[(2 * l + kind) * T * row16 ..];
+            for (pos..pos + n) |p| {
+                const s = p % slots;
+                @memcpy(dst[p * row16 ..][0..row16], words[base + s * row16 ..][0..row16]);
+            }
+            try allFinite("a layer's keys and values", dst[pos * row16 ..][0 .. n * row16], row16);
+            for (0..slots) |s| {
+                if (slotInRange(s, slots, lo, pos + n)) continue;
+                for (words[base + s * row16 ..][0..row16]) |x| if (x != nan_word) {
+                    std.debug.print("partition: the chunk [{d}, {d}) wrote outside its rows: layer {d}, {s}, slot {d}\n", .{ pos, pos + n, l, if (kind == 0) "keys" else "values", s });
+                    return error.AChunkWrotePastItsRows;
+                };
+            }
+        }
     }
-    blit.end();
-    try finish(cb);
-    for (staging.slice(u16, 2 * cache.layers * rows * row / 2), 0..) |x, i| if (x != nan_word) {
-        const at = i / (row / 2); // the row of 2 * layers * rows
-        std.debug.print("partition: the chunk ending at row {d} wrote past its rows: layer {d}, {s}, row {d}\n", .{ from, at / (2 * rows), if (at / rows % 2 == 0) "keys" else "values", from + at % rows });
-        return error.AChunkWrotePastItsRows;
-    };
 }
 
 fn finite16(x: u16) bool {
@@ -188,8 +249,9 @@ fn tapsFinite(m: *const ik.Model, taps: []const u16, rows: usize) !void {
     };
 }
 
-/// One leg: the prompt in chunks of `lengths`, every result kept.
-fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.forward.Taps, ids: []const u32, lengths: []const usize, draft: ?settings.Draft) !Leg {
+/// One leg: the prompt in chunks of `lengths`, every result kept. When `restore_at` is positive, `[0, restore_at)` runs first on
+/// its own cache, saves a snapshot and restores it into a fresh poisoned cache before `lengths` run over `[restore_at, T)`.
+fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.forward.Taps, ids: []const u32, restore_at: usize, lengths: []const usize, draft: ?settings.Draft) !Leg {
     const c = &m.config.text;
     const H: usize = c.hidden;
     const T = ids.len;
@@ -197,7 +259,29 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
     const full = m.layers == c.layers;
     const row = rowBytes(c);
     const tap_row: usize = ik.state.feature_taps * H;
-    var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers);
+    var snap: ?ik.snapshot.Snap = null;
+    defer if (snap) |*sp| sp.free();
+    if (restore_at > 0) {
+        var src = try ik.state.Cache.init(m.device, c, restore_at + 1, m.layers, m.prefill_rows);
+        defer src.deinit();
+        const src_abs: ?Absorber = if (draft) |d| try Absorber.init(gpa, m, d, ids) else null;
+        defer if (src_abs) |a| a.deinit();
+        var pos: usize = 0;
+        while (pos < restore_at) {
+            const n = @min(restore_at - pos, m.prefill_rows);
+            try ik.forward.run(m, s, &src, ids[pos..][0..n], .{
+                .logits = .none,
+                .prompt = true,
+                .feature_taps = if (src_abs != null) .{ .buf = s.ptaps } else null,
+            });
+            if (src_abs) |a| _ = try a.take(s.ptaps, pos, n);
+            src.len += n;
+            pos += n;
+        }
+        snap = try ik.snapshot.save(m.device, m.queue, c, &src);
+        if (src_abs) |a| try a.drafter.keepLane(a.stream, &snap.?);
+    }
+    var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers, m.prefill_rows);
     defer cache.deinit();
     var leg: Leg = .{
         .kv = try gpa.alloc(u16, L * 2 * T * row / 2),
@@ -211,12 +295,21 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
         leg.finals = try gpa.alloc(u16, H);
         leg.logits = try gpa.alloc(u16, c.vocab);
     }
-    const staging = try m.device.buffer(@max(2 * L * reach * row, 16), mtl.ResourceOptions.shared);
+    var max_layer_bytes: usize = cache.conv.length();
+    for (0..cache.layers) |l| max_layer_bytes = @max(max_layer_bytes, @as(usize, cache.ring(l)) * 2 * row);
+    const staging = try m.device.buffer(@max(max_layer_bytes, 16), mtl.ResourceOptions.shared);
     defer staging.deinit();
     const absorber: ?Absorber = if (draft) |d| try Absorber.init(gpa, m, d, ids) else null;
     defer if (absorber) |a| a.deinit();
     try poisonCache(m, &cache, 0, true);
-    var at: usize = 0;
+    if (snap) |*sp| {
+        try ik.snapshot.restore(m.queue, c, sp, &cache);
+        if (absorber) |a| {
+            a.stream.reuse.saved = sp;
+            a.stream.cached = @intCast(restore_at);
+        }
+    }
+    var at: usize = restore_at;
     for (lengths) |n| {
         const last = at + n == T;
         try poisonScratch(m, s, &.{ tp.h, tp.eids });
@@ -252,43 +345,22 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
                 }
             }
         }
-        try checkReach(m, &cache, staging, at + n);
+        try readChunkAndCheck(m, &cache, staging, at, n, T, &leg);
         cache.len += n;
         at += n;
     }
-    for (leg.picks) |p| if (p >= c.experts) {
+    for (0..L) |l| for (leg.picks[(l * T + restore_at) * c.topk ..][0 .. (T - restore_at) * c.topk]) |p| if (p >= c.experts) {
         std.debug.print("partition: an expert pick outside the table: {d}\n", .{p});
         return error.PoisonReachedAResult;
     };
-    try readCache(m, &cache, T, &leg);
+    try readConv(m, &cache, staging, T, &leg);
     return leg;
 }
 
-/// The cache's rows 0 .. T of every layer and its rings into `leg`, the rows past T checked to be NaN still.
-fn readCache(m: *const ik.Model, cache: *ik.state.Cache, T: usize, leg: *Leg) !void {
+/// The cache's convolution rings into `leg`.
+fn readConv(m: *const ik.Model, cache: *ik.state.Cache, staging: mtl.Buffer, T: usize, leg: *Leg) !void {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
-    const row = rowBytes(&m.config.text);
-    const row16 = row / 2;
-    const staging = try m.device.buffer(@max(cache.kv_layer, cache.conv.length()), mtl.ResourceOptions.shared);
-    defer staging.deinit();
-    const half16 = cache.kv_layer / 2 / 2;
-    for (0..cache.layers) |l| {
-        const cb = m.queue.commandBuffer();
-        const blit = cb.blit();
-        blit.copy(cache.kv, cache.keys(l), staging, 0, cache.kv_layer);
-        blit.end();
-        try finish(cb);
-        const words = staging.slice(u16, cache.kv_layer / 2);
-        for ([_]usize{ 0, half16 }, 0..) |base, kind| {
-            @memcpy(leg.kv[(2 * l + kind) * T * row16 ..][0 .. T * row16], words[base..][0 .. T * row16]);
-            for (words[base + T * row16 .. base + half16], 0..) |x, i| if (x != nan_word) {
-                std.debug.print("partition: layer {d}'s {s} wrote past the prompt: row {d}\n", .{ l, if (kind == 0) "keys" else "values", T + i / row16 });
-                return error.AChunkWrotePastItsRows;
-            };
-        }
-        try allFinite("a layer's keys and values", leg.kv[2 * l * T * row16 ..][0 .. 2 * T * row16], row16);
-    }
     const cb = m.queue.commandBuffer();
     const blit = cb.blit();
     blit.copy(cache.conv, 0, staging, 0, cache.conv.length());
@@ -323,19 +395,20 @@ fn ringOffset(c: *const ik.config.Text, l: usize, which: usize) usize {
     return at;
 }
 
-/// Every difference between the legs over `T` rows, printed by what differs; the count, zero when the legs agree to the bit.
-fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, T: usize) usize {
+/// Every difference between the legs over rows `[from, T)`, printed by what differs; the count, zero when the legs agree to the bit.
+fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, from: usize, T: usize, compare_props: bool) usize {
     const c = &m.config.text;
     const H: usize = c.hidden;
     const L: usize = m.layers;
     const row16 = rowBytes(c) / 2;
     var total: usize = 0;
     var kv: Differ = .{ .what = "keys and values" };
-    for (0..L * 2 * T) |r| {
+    for (0..L) |l| for (0..2) |kind| for (from..T) |p| {
         kv.rows += 1;
+        const r = (2 * l + kind) * T + p;
         if (!std.mem.eql(u16, a.kv[r * row16 ..][0..row16], b.kv[r * row16 ..][0..row16]))
-            kv.note(" layer {d} {s} row {d}", .{ r / (2 * T), if (r / T % 2 == 0) "keys" else "values", r % T });
-    }
+            kv.note(" layer {d} {s} row {d}", .{ l, if (kind == 0) "keys" else "values", p });
+    };
     kv.report();
     total += kv.differ;
     var rings: Differ = .{ .what = "convolution rings" };
@@ -350,24 +423,25 @@ fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, T: usize) usize {
     rings.report();
     total += rings.differ;
     var h: Differ = .{ .what = "last-layer outputs" };
-    for (0..T) |r| {
+    for (from..T) |r| {
         h.rows += 1;
         if (!std.mem.eql(u16, a.h[r * H ..][0..H], b.h[r * H ..][0..H])) h.note(" row {d}", .{r});
     }
     h.report();
     total += h.differ;
     var picks: Differ = .{ .what = "expert picks" };
-    for (0..L * T) |r| {
+    for (0..L) |l| for (from..T) |p| {
         picks.rows += 1;
-        if (!std.mem.eql(u32, a.picks[r * c.topk ..][0..c.topk], b.picks[r * c.topk ..][0..c.topk])) picks.note(" layer {d} row {d}", .{ r / T, r % T });
-    }
+        const r = l * T + p;
+        if (!std.mem.eql(u32, a.picks[r * c.topk ..][0..c.topk], b.picks[r * c.topk ..][0..c.topk])) picks.note(" layer {d} row {d}", .{ l, p });
+    };
     picks.report();
     total += picks.differ;
     if (a.taps) |ta| {
         const tb = b.taps.?;
         var taps: Differ = .{ .what = "taps" };
         const width = ik.state.feature_taps * H;
-        for (0..T) |r| {
+        for (from..T) |r| {
             taps.rows += 1;
             if (!std.mem.eql(u16, ta[r * width ..][0..width], tb[r * width ..][0..width])) {
                 var k: usize = 0;
@@ -387,10 +461,14 @@ fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, T: usize) usize {
         total += logits.differ;
     }
     if (a.props) |pa| {
-        var props: Differ = .{ .what = "the first hold's proposals", .rows = depth };
-        for (pa, b.props.?, 0..) |x, y, i| if (x != y) props.note(" proposal {d}: {d} against {d}", .{ i, x, y });
-        props.report();
-        total += props.differ;
+        if (compare_props) {
+            var props: Differ = .{ .what = "the first hold's proposals", .rows = depth };
+            for (pa, b.props.?, 0..) |x, y, i| if (x != y) props.note(" proposal {d}: {d} against {d}", .{ i, x, y });
+            props.report();
+            total += props.differ;
+        } else {
+            std.debug.print("{{\"compared\": \"the first hold's proposals\", \"proposals\": \"not compared\"}}\n", .{});
+        }
     }
     return total;
 }
@@ -399,8 +477,10 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
     const gpa = init.gpa;
     const opt = try parseOptions(gpa, args);
     defer gpa.free(opt.cuts);
+    defer gpa.free(opt.restores);
     const T = ids.len;
     if (T == 0) return error.ExpectedAPrompt;
+    for (opt.restores) |at| if (at >= T) return error.RestorePositionOutOfRange;
     const draft: ?settings.Draft = if (opt.drafts) try settings.draft() else null;
     const m = try ik.Model.load(gpa, init.io, model_dir, .{
         .layers = opt.layers,
@@ -425,11 +505,29 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
     };
     defer tp.h.deinit();
     defer tp.eids.deinit();
-    var a = try runLeg(gpa, m, &s, tp, ids, default_chunks, draft);
+    var a = try runLeg(gpa, m, &s, tp, ids, 0, default_chunks, draft);
     defer a.deinit(gpa);
-    var b = try runLeg(gpa, m, &s, tp, ids, cut_chunks, draft);
-    defer b.deinit(gpa);
-    const differ = compare(m, &a, &b, T);
-    std.debug.print("{{\"partition\": \"{s}\", \"prompt_tokens\": {d}, \"layers\": {d}, \"prompt_path\": \"{s}\", \"prefill_rows\": {d}, \"default_chunks\": {d}, \"cut_chunks\": {d}, \"first_cuts\": {any}, \"differ\": {d}}}\n", .{ if (differ == 0) "identical" else "differs", T, m.layers, @tagName(m.promptPath()), rows, default_chunks.len, cut_chunks.len, cut_chunks[0..@min(cut_chunks.len, 16)], differ });
-    if (differ != 0) return error.PartitionDiffers;
+    var differ: usize = 0;
+    {
+        var b = try runLeg(gpa, m, &s, tp, ids, 0, cut_chunks, draft);
+        defer b.deinit(gpa);
+        differ = compare(m, &a, &b, 0, T, true);
+    }
+    const restore_diffs = try gpa.alloc(usize, opt.restores.len);
+    defer gpa.free(restore_diffs);
+    var total_differ = differ;
+    for (opt.restores, 0..) |restore_at, ri| {
+        const tail_chunks = try chunkLengths(gpa, T - restore_at, &.{}, rows);
+        defer gpa.free(tail_chunks);
+        var r = try runLeg(gpa, m, &s, tp, ids, restore_at, tail_chunks, draft);
+        defer r.deinit(gpa);
+        restore_diffs[ri] = compare(m, &a, &r, restore_at, T, true);
+        total_differ += restore_diffs[ri];
+    }
+    std.debug.print("{{\"partition\": \"{s}\", \"prompt_tokens\": {d}, \"layers\": {d}, \"prompt_path\": \"{s}\", \"prefill_rows\": {d}, \"default_chunks\": {d}, \"cut_chunks\": {d}, \"first_cuts\": {any}, \"differ\": {d}, \"restore\": [", .{ if (differ == 0) "identical" else "differs", T, m.layers, @tagName(m.promptPath()), rows, default_chunks.len, cut_chunks.len, cut_chunks[0..@min(cut_chunks.len, 16)], differ });
+    for (opt.restores, restore_diffs, 0..) |restore_at, rd, ri| {
+        std.debug.print("{s}{{\"at\": {d}, \"result\": \"{s}\"}}", .{ if (ri == 0) "" else ", ", restore_at, if (rd == 0) "identical" else "differs" });
+    }
+    std.debug.print("]}}\n", .{});
+    if (total_differ != 0) return error.PartitionDiffers;
 }

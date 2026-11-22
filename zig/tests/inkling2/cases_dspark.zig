@@ -101,6 +101,7 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseCtxPrep(c, r);
     try caseBlockPrep(c, r);
     try caseAttn(c, r);
+    try caseAttnShort(c, r);
     try caseElementwise(c, r);
     try caseProj(c, r);
     try caseGru(c, r);
@@ -418,15 +419,26 @@ fn caseBlockPrep(c: Ctx, r: std.Random) !void {
 
 // ---- ikd_attn_part, ikd_attn_merge ----
 
-/// The ring blocks' first index and the blocks per head (the ring's, then the block's own keys) for a block at `end`.
-fn blocksOf(end: u32) struct { lo: u32, n: u32 } {
-    const lo: u32 = if (end > WINDOW) end - WINDOW else 0;
+const BlockSpan = struct { lo: u32, n: u32 };
+
+/// The ring blocks' first index and the blocks per head (the ring's, then the block's own keys) for a block at `end` with `win`
+/// newest context positions.
+fn blocksOfWindow(end: u32, win: u32) BlockSpan {
+    const lo: u32 = if (end > win) end - win else 0;
     if (end == lo) return .{ .lo = lo, .n = 1 };
     return .{ .lo = lo, .n = (end - 1) / KEYS - lo / KEYS + 2 };
 }
 
+fn blocksOf(end: u32) BlockSpan {
+    return blocksOfWindow(end, WINDOW);
+}
+
+fn attnArgsWindow(end: u32, win: u32) AttnArgs {
+    return .{ .heads = Hq, .kv = KV, .end = end, .window = win, .ring = RING, .blocks = blocksOfWindow(end, win).n, .scale = @floatCast(1 / @sqrt(@as(f64, D))) };
+}
+
 fn attnArgs(end: u32) AttnArgs {
-    return .{ .heads = Hq, .kv = KV, .end = end, .window = WINDOW, .ring = RING, .blocks = blocksOf(end).n, .scale = @floatCast(1 / @sqrt(@as(f64, D))) };
+    return attnArgsWindow(end, WINDOW);
 }
 
 /// A ring's host view with its first PAD slots copied past the last, as the context kernel keeps them.
@@ -484,13 +496,12 @@ const Attn = struct {
         std.heap.page_allocator.free(x.orig_v);
     }
 
-    /// The rings hold the attended slots of a block at `end` as filled; every other slot's keys are the largest finite bf16
-    /// (their scores overflow) and its values NaN, mirrored slots included: the kernel reads whole tiles of 8 slots, so keys and
-    /// values past the attended ones must not reach the result.
-    fn stale(x: Attn, end: u32) void {
+    /// The rings hold the attended slots of a block at `end` with `win` context positions as filled; every other slot's keys
+    /// hold `key_poison` and its values `val_poison`, mirrored slots included.
+    fn staleWindow(x: Attn, end: u32, win: u32, key_poison: u16, val_poison: u16) void {
         var live: [RING]bool = @splat(false);
-        for (blocksOf(end).lo..end) |p| live[p % RING] = true;
-        for (0..RING) |s| for ([_][]u16{ x.rkv, x.rvv }, [_][]const u16{ x.orig_k, x.orig_v }, [_]u16{ 0x7f7f, NAN16 }) |dst, src, poison| {
+        for (blocksOfWindow(end, win).lo..end) |p| live[p % RING] = true;
+        for (0..RING) |s| for ([_][]u16{ x.rkv, x.rvv }, [_][]const u16{ x.orig_k, x.orig_v }, [_]u16{ key_poison, val_poison }) |dst, src, poison| {
             const row = s * KV * D;
             if (live[s]) @memcpy(dst[row..][0 .. KV * D], src[row..][0 .. KV * D]) else @memset(dst[row..][0 .. KV * D], poison);
         };
@@ -498,13 +509,24 @@ const Attn = struct {
         _ = mirrored(x.rvv);
     }
 
+    /// The rings hold the attended slots of a block at `end` as filled; every other slot's keys are the largest finite bf16
+    /// (their scores overflow) and its values NaN, mirrored slots included: the kernel reads whole tiles of 8 slots, so keys and
+    /// values past the attended ones must not reach the result.
+    fn stale(x: Attn, end: u32) void {
+        x.staleWindow(end, WINDOW, 0x7f7f, NAN16);
+    }
+
     /// The partials and the output start as NaN, so anything the kernels leave unwritten shows.
-    fn attend(x: Attn, c: Ctx, end: u32) !void {
-        const a = attnArgs(end);
+    fn attendWindow(x: Attn, c: Ctx, end: u32, win: u32) !void {
+        const a = attnArgsWindow(end, win);
         @memset(x.part.slice(f32, ROWS * Hq * a.blocks * SLOT), std.math.nan(f32));
         @memset(x.att.slice(u16, ROWS * Hq * D), NAN16);
         try c.go("ikd_attn_part", &.{ bytes(&a), bs(x.q), bs(x.rk), bs(x.rv), bs(x.bk), bs(x.bv), bs(x.part) }, .{ KV, 1, a.blocks }, .{ 192, 1, 1 });
         try c.go("ikd_attn_merge", &.{ bytes(&a), bs(x.part), bs(x.att) }, .{ Hq, ROWS, 1 }, .{ 32, 1, 1 });
+    }
+
+    fn attend(x: Attn, c: Ctx, end: u32) !void {
+        try x.attendWindow(c, end, WINDOW);
     }
 };
 
@@ -584,6 +606,32 @@ fn caseAttn(c: Ctx, r: std.Random) !void {
         ch.same(x.att.slice(u8, ROWS * Hq * D * 2), first);
         if (ch.bad != bad) std.debug.print("  failing: block at {d}\n", .{end});
     }
+    try ch.done();
+}
+
+/// Short context windows (`window` < min(`end`, 1,023)): ring slots outside [end - window, end), mirrored slots included, are NaN;
+/// the output must contain no NaN and equal the same call on a ring holding only those rows.
+fn caseAttnShort(c: Ctx, r: std.Random) !void {
+    const x = try Attn.init(c.g, r);
+    defer x.deinit();
+    const alloc = std.heap.page_allocator;
+    const clean = try alloc.alloc(u8, ROWS * Hq * D * 2);
+    defer alloc.free(clean);
+    var ch: h.Check = .{ .name = "attention short window" };
+    for ([_]u32{ 2000, 5000 }) |end| for ([_]u32{ 3, 30, 300 }) |win| {
+        const bad = ch.bad;
+        x.staleWindow(end, win, 0, 0);
+        try x.attendWindow(c, end, win);
+        @memcpy(clean, x.att.slice(u8, ROWS * Hq * D * 2));
+        x.staleWindow(end, win, NAN16, NAN16);
+        try x.attendWindow(c, end, win);
+        for (x.att.slice(u16, ROWS * Hq * D)) |v| {
+            ch.n += 1;
+            if (std.math.isNan(h.fb(v))) ch.bad += 1;
+        }
+        ch.same(x.att.slice(u8, ROWS * Hq * D * 2), clean);
+        if (ch.bad != bad) std.debug.print("  failing: end {d}, window {d}\n", .{ end, win });
+    };
     try ch.done();
 }
 

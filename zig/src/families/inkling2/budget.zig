@@ -8,6 +8,10 @@ const Model = @import("model.zig").Model;
 pub const default_share = 0.75;
 /// Kept free inside the limit for the command buffers, the keepalive and the host.
 pub const margin: u64 = 2 << 30;
+/// The longest context a load advertises when none is asked for: the longest a release has been run at.
+pub const default_window_most = 131072;
+/// Kept prompt states take at most this share of the caches' room when --prompt-cache-gib is unset.
+pub const default_states: u64 = 8 << 30;
 
 /// The limit in decimal GB that INKLING_LOAD_LIMIT_GB's text names (null: unset or blank).
 pub fn parseLimit(text: ?[]const u8) error{BadLoadLimit}!?f64 {
@@ -37,18 +41,18 @@ pub fn held(model: *const Model, head: u64) !u64 {
 
 /// Bytes a context of `capacity` positions takes besides the weights: a stream's caches and the partials that grow with
 /// it, both for a cache a position past the window, as `backend.prefillFn` makes for a request filling the window.
-fn contextBytes(c: *const cfg.Text, layers: usize, capacity: usize) u64 {
-    return st.cacheBytes(c, capacity + 1, layers) + st.partBytes(c, capacity + 1);
+fn contextBytes(c: *const cfg.Text, layers: usize, capacity: usize, rows: usize) u64 {
+    return st.cacheBytes(c, capacity + 1, layers, rows) + st.partBytes(c, capacity + 1);
 }
 
 /// The longest context one stream's caches and the scratch that grows with it fit in `bytes`, at most `most`.
-pub fn longest(c: *const cfg.Text, layers: usize, bytes: u64, most: usize) usize {
-    if (contextBytes(c, layers, 1) > bytes) return 0;
+pub fn longest(c: *const cfg.Text, layers: usize, bytes: u64, most: usize, rows: usize) usize {
+    if (contextBytes(c, layers, 1, rows) > bytes) return 0;
     var lo: usize = 1;
     var hi: usize = most;
     while (lo < hi) {
         const mid = lo + (hi - lo + 1) / 2;
-        if (contextBytes(c, layers, mid) <= bytes) lo = mid else hi = mid - 1;
+        if (contextBytes(c, layers, mid, rows) <= bytes) lo = mid else hi = mid - 1;
     }
     return lo;
 }
@@ -57,19 +61,21 @@ test "inkling2 budget: the longest context counts the partials that grow with it
     var c = std.mem.zeroes(cfg.Text);
     c.hidden = 4608;
     c.vocab = 201024;
+    c.window = 1024;
     c.local = .{ .q = 48, .kv = 8, .dim = 128 };
     const layers = 48;
-    const room: u64 = 40 << 30;
-    const n = longest(&c, layers, room, 1 << 20);
-    // it fits with its partials and one position more does not; the caches alone would have fit more
-    try std.testing.expect(contextBytes(&c, layers, n) <= room);
-    try std.testing.expect(contextBytes(&c, layers, n + 1) > room);
+    const room: u64 = 10 << 30;
+    const n = longest(&c, layers, room, 1 << 20, 4096);
+    // it fits with its partials and one position more does not
+    try std.testing.expect(contextBytes(&c, layers, n, 4096) <= room);
+    try std.testing.expect(contextBytes(&c, layers, n + 1, 4096) > room);
     // a request that fills the window passes the backend's check
-    try std.testing.expect(st.cacheBytes(&c, n + 1, layers) <= room - st.partBytes(&c, n + 1));
-    const caches_only = (room - layers * st.convBytes(&c) - @as(u64, c.vocab) * 2) / (layers * st.kvBytes(&c));
-    try std.testing.expect(n < caches_only);
-    try std.testing.expectEqual(@as(usize, 0), longest(&c, layers, 0, 1000));
-    try std.testing.expectEqual(@as(usize, 1000), longest(&c, layers, 1 << 40, 1000));
+    try std.testing.expect(st.cacheBytes(&c, n + 1, layers, 4096) <= room - st.partBytes(&c, n + 1));
+    // a context past the ring pays for the global layers alone: 262,144 tokens fit in 10 GiB
+    try std.testing.expect(n >= 262144);
+    try std.testing.expect(default_window_most <= longest(&c, layers, 23 << 30, 1 << 20, 4096));
+    try std.testing.expectEqual(@as(usize, 0), longest(&c, layers, 0, 1000, 4096));
+    try std.testing.expectEqual(@as(usize, 1000), longest(&c, layers, 1 << 40, 1000, 4096));
 }
 
 test "inkling2 budget: a share of RAM less the weights, a set limit capped at the working set, bad limits refused" {
