@@ -404,10 +404,117 @@ fn caseSplitRing(g: *const h.Gpu, r: std.Random) !void {
     }
 }
 
+/// `ik_attn_part_w` over global windows of 2..16 rows: every row's partial bytes and merged output equal `ik_attn_part` +
+/// `ik_attn_merge` run a row at a time, keys and values past the window's last row are NaN without affecting any output,
+/// and a NaN query or relative-state row stays confined to its own row.
+fn caseSplitWindowShared(g: *const h.Gpu, r: std.Random) !void {
+    const cap: usize = 40064;
+    const max_blocks: usize = (cap + KEYS - 1) / KEYS + 2;
+    const nan: u16 = 0x7fc0;
+    const alloc = std.heap.page_allocator;
+    const qn = try g.buf(ROWS * Hq * D * 2);
+    const keys = try g.buf(cap * KV * D * 2);
+    const vals = try g.buf(cap * KV * D * 2);
+    const reln = try g.buf(ROWS * Hq * REL * 2);
+    const proj = try g.buf(REL * E * 2);
+    const sink = try g.buf(ROWS * Hq * 2);
+    const gate = try g.buf(ROWS * Hq * D * 2);
+    const part = try g.buf(ROWS * Hq * max_blocks * SLOT * 4);
+    const att = try g.buf(ROWS * OUT_ROW);
+    defer for ([_]mtl.Buffer{ qn, keys, vals, reln, proj, sink, gate, part, att }) |b| b.deinit();
+    const qv = h.fill16(qn, ROWS * Hq * D, r, 2.5);
+    const kv = h.fill16(keys, cap * KV * D, r, 2.5);
+    const vv = h.fill16(vals, cap * KV * D, r, 1.0);
+    const relv = h.fill16(reln, ROWS * Hq * REL, r, 1.0);
+    _ = h.fill16(proj, REL * E, r, 1.5);
+    _ = h.fill16(sink, ROWS * Hq, r, 2.0);
+    _ = h.fill16(gate, ROWS * Hq * D, r, 3.0);
+    const ref_part = try alloc.alloc(u8, ROWS * Hq * max_blocks * SLOT * 4);
+    const ref_att = try alloc.alloc(u8, ROWS * OUT_ROW);
+    const saved_k = try alloc.alloc(u16, KEYS * KV * D);
+    const saved_v = try alloc.alloc(u16, KEYS * KV * D);
+    defer for ([_][]u8{ ref_part, ref_att }) |b| alloc.free(b);
+    defer for ([_][]u16{ saved_k, saved_v }) |b| alloc.free(b);
+
+    var c: h.Check = .{ .name = "split window shared global" };
+    for ([_]u32{ 250, 300, 9000, 9210, 40000 }) |pos| {
+        for (2..ROWS + 1) |rows_u| {
+            const rows: u32 = @intCast(rows_u);
+            const bad = c.bad;
+            const grid = blocksOf(pos, rows, 0);
+            const nblocks: u32 = if (pos == 300 and rows == 6) grid.n + 2 else grid.n;
+            const row_part_bytes: usize = Hq * nblocks * SLOT * 4;
+            const part_bytes: usize = rows_u * row_part_bytes;
+            const att_bytes: usize = rows_u * OUT_ROW;
+
+            // Poison keys and values past the window's last row so any out-of-window load shows as NaN.
+            const tail0: usize = pos + rows_u;
+            const tail_n: usize = @min(KEYS, cap - tail0);
+            const ktail = kv[tail0 * KV * D ..][0 .. tail_n * KV * D];
+            const vtail = vv[tail0 * KV * D ..][0 .. tail_n * KV * D];
+            @memcpy(saved_k[0 .. tail_n * KV * D], ktail);
+            @memcpy(saved_v[0 .. tail_n * KV * D], vtail);
+            @memset(ktail, nan);
+            @memset(vtail, nan);
+            defer {
+                @memcpy(ktail, saved_k[0 .. tail_n * KV * D]);
+                @memcpy(vtail, saved_v[0 .. tail_n * KV * D]);
+            }
+
+            // Reference: ik_attn_part + ik_attn_merge one row at a time with the same block grid.
+            for (0..rows_u) |t| {
+                const a1 = argsOf(1, pos + @as(u32, @intCast(t)), 0, grid.f0, nblocks, @intCast(cap));
+                @memset(part.slice(f32, Hq * nblocks * SLOT), std.math.nan(f32));
+                @memset(att.slice(u8, OUT_ROW), 0xff);
+                try g.run("ik_attn_part", a1, &.{ .{ .buf = qn, .off = t * Hq * D * 2 }, .{ .buf = keys }, .{ .buf = vals }, .{ .buf = reln, .off = t * Hq * REL * 2 }, .{ .buf = proj }, .{ .buf = part } }, .{ KV, 1, nblocks }, .{ 32, PART_SIMDGROUPS, 1 }, true);
+                @memcpy(ref_part[t * row_part_bytes ..][0..row_part_bytes], part.slice(u8, row_part_bytes));
+                try g.run("ik_attn_merge", a1, &.{ .{ .buf = part }, .{ .buf = sink, .off = t * Hq * 2 }, .{ .buf = gate, .off = t * Hq * D * 2 }, .{ .buf = att } }, .{ Hq, 1, 1 }, .{ 32, 1, 1 }, true);
+                @memcpy(ref_att[t * OUT_ROW ..][0..OUT_ROW], att.slice(u8, OUT_ROW));
+            }
+            finite(&c, ref_att[0..att_bytes]);
+
+            // Shared window kernel: grid (KV, 1, nblocks).
+            const aw = argsOf(rows, pos, 0, grid.f0, nblocks, @intCast(cap));
+            @memset(part.slice(f32, rows_u * Hq * nblocks * SLOT), std.math.nan(f32));
+            @memset(att.slice(u8, att_bytes), 0xff);
+            try g.run("ik_attn_part_w", aw, &.{ .{ .buf = qn }, .{ .buf = keys }, .{ .buf = vals }, .{ .buf = reln }, .{ .buf = proj }, .{ .buf = part } }, .{ KV, 1, nblocks }, .{ 32, 6, 1 }, true);
+            c.same(part.slice(u8, part_bytes), ref_part[0..part_bytes]);
+            try g.run("ik_attn_merge", aw, &.{ .{ .buf = part }, .{ .buf = sink }, .{ .buf = gate }, .{ .buf = att } }, .{ Hq, rows, 1 }, .{ 32, 1, 1 }, true);
+            finite(&c, att.slice(u8, att_bytes));
+            c.same(att.slice(u8, att_bytes), ref_att[0..att_bytes]);
+
+            // NaN query and relative-state containment on full 16-row windows (covering both row tiles).
+            if (rows == ROWS and (pos == 300 or pos == 9210)) {
+                for ([_]usize{ 1, 9 }) |bad_row| {
+                    const q_at = bad_row * Hq * D;
+                    const kept_q = qv[q_at];
+                    qv[q_at] = nan;
+                    @memset(part.slice(f32, rows_u * Hq * nblocks * SLOT), std.math.nan(f32));
+                    try g.run("ik_attn_part_w", aw, &.{ .{ .buf = qn }, .{ .buf = keys }, .{ .buf = vals }, .{ .buf = reln }, .{ .buf = proj }, .{ .buf = part } }, .{ KV, 1, nblocks }, .{ 32, 6, 1 }, true);
+                    try g.run("ik_attn_merge", aw, &.{ .{ .buf = part }, .{ .buf = sink }, .{ .buf = gate }, .{ .buf = att } }, .{ Hq, rows, 1 }, .{ 32, 1, 1 }, true);
+                    qv[q_at] = kept_q;
+                    for (0..rows_u) |t| if (t != bad_row) c.same(att.slice(u8, att_bytes)[t * OUT_ROW ..][0..OUT_ROW], ref_att[t * OUT_ROW ..][0..OUT_ROW]);
+                }
+                const rel_at = Hq * REL + 3 * REL;
+                const kept_r = relv[rel_at];
+                relv[rel_at] = nan;
+                @memset(part.slice(f32, rows_u * Hq * nblocks * SLOT), std.math.nan(f32));
+                try g.run("ik_attn_part_w", aw, &.{ .{ .buf = qn }, .{ .buf = keys }, .{ .buf = vals }, .{ .buf = reln }, .{ .buf = proj }, .{ .buf = part } }, .{ KV, 1, nblocks }, .{ 32, 6, 1 }, true);
+                try g.run("ik_attn_merge", aw, &.{ .{ .buf = part }, .{ .buf = sink }, .{ .buf = gate }, .{ .buf = att } }, .{ Hq, rows, 1 }, .{ 32, 1, 1 }, true);
+                relv[rel_at] = kept_r;
+                for (0..rows_u) |t| if (t != 1) c.same(att.slice(u8, att_bytes)[t * OUT_ROW ..][0..OUT_ROW], ref_att[t * OUT_ROW ..][0..OUT_ROW]);
+            }
+            if (c.bad != bad) std.debug.print("  failing: pos {d}, {d} rows\n", .{ pos, rows });
+        }
+    }
+    try c.done();
+}
+
 pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseSplitRef(g, r);
     try caseSplitWindow(g, r);
     try caseSplitBlocks(g, r);
     try caseSplitBias(g, r);
     try caseSplitRing(g, r);
+    try caseSplitWindowShared(g, r);
 }

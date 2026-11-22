@@ -1224,6 +1224,8 @@ fn splitMode(_: std.process.Init, args: []const [:0]const u8) !void {
     defer lib.deinit();
     const part_pipe = try mtl.Pipeline.init(device, lib, "ik_attn_part", false);
     defer part_pipe.deinit();
+    const part_w_pipe = try mtl.Pipeline.init(device, lib, "ik_attn_part_w", false);
+    defer part_w_pipe.deinit();
     const merge_pipe = try mtl.Pipeline.init(device, lib, "ik_attn_merge", false);
     defer merge_pipe.deinit();
     const Hq: usize = 48;
@@ -1256,44 +1258,48 @@ fn splitMode(_: std.process.Init, args: []const [:0]const u8) !void {
     for (key_counts[0..nk]) |kc| {
         for ([_]bool{ false, true }) |global| {
             const window: u32 = if (global) 0 else E;
-            for ([_]usize{ 1, 2, 4, 8 }) |rows| {
+            for ([_]usize{ 1, 2, 4, 6, 8 }) |rows| {
                 const pos: u32 = @intCast(kc - rows);
                 const first: u32 = if (window > 0 and pos + 1 > window) pos + 1 - window else 0;
                 const f0 = first / ik.state.key_block;
                 const blocks = (pos + @as(u32, @intCast(rows)) - 1) / ik.state.key_block - f0 + 1;
-                const a: ik.forward.Args = .{ .rows = @intCast(rows), .heads = Hq, .kv = KV, .dim = D, .pos = pos, .window = window, .extent = E, .blocks = blocks, .queries = f0, .scale = scale };
-                var us: [7]f64 = undefined;
-                for (0..9) |round| {
-                    const cb = q.commandBuffer();
-                    const e = cb.compute(.serial);
-                    for (0..calls) |_| {
-                        e.setPipeline(part_pipe);
-                        e.setValue(a, 0);
-                        e.setBuffer(qn, 0, 1);
-                        e.setBuffer(keys, 0, 2);
-                        e.setBuffer(vals, 0, 3);
-                        e.setBuffer(reln, 0, 4);
-                        e.setBuffer(proj, 0, 5);
-                        e.setBuffer(part, 0, 6);
-                        e.dispatchGroups(mtl.Size.of(KV, rows, blocks), mtl.Size.of(32, 24, 1));
-                        e.setPipeline(merge_pipe);
-                        e.setValue(a, 0);
-                        e.setBuffer(part, 0, 1);
-                        e.setBuffer(sink, 0, 2);
-                        e.setBuffer(gate, 0, 3);
-                        e.setBuffer(att, 0, 4);
-                        e.dispatchGroups(mtl.Size.of(Hq, rows, 1), mtl.Size.of(32, 1, 1));
+                const a: ik.forward.Args = .{ .rows = @intCast(rows), .heads = Hq, .kv = KV, .dim = D, .pos = pos, .window = window, .extent = E, .ring = @intCast(max_keys), .blocks = blocks, .queries = f0, .scale = scale };
+                const variants: usize = if (global and rows > 1) 2 else 1;
+                for (0..variants) |vi| {
+                    const shared = vi == 1;
+                    var us: [7]f64 = undefined;
+                    for (0..9) |round| {
+                        const cb = q.commandBuffer();
+                        const e = cb.compute(.serial);
+                        for (0..calls) |_| {
+                            e.setPipeline(if (shared) part_w_pipe else part_pipe);
+                            e.setValue(a, 0);
+                            e.setBuffer(qn, 0, 1);
+                            e.setBuffer(keys, 0, 2);
+                            e.setBuffer(vals, 0, 3);
+                            e.setBuffer(reln, 0, 4);
+                            e.setBuffer(proj, 0, 5);
+                            e.setBuffer(part, 0, 6);
+                            e.dispatchGroups(mtl.Size.of(KV, if (shared) 1 else rows, blocks), mtl.Size.of(32, if (shared) 6 else 24, 1));
+                            e.setPipeline(merge_pipe);
+                            e.setValue(a, 0);
+                            e.setBuffer(part, 0, 1);
+                            e.setBuffer(sink, 0, 2);
+                            e.setBuffer(gate, 0, 3);
+                            e.setBuffer(att, 0, 4);
+                            e.dispatchGroups(mtl.Size.of(Hq, rows, 1), mtl.Size.of(32, 1, 1));
+                        }
+                        e.end();
+                        cb.commit();
+                        cb.wait();
+                        if (cb.failure()) |msg| {
+                            std.log.err("split: {s}", .{msg});
+                            return error.GpuFailed;
+                        }
+                        if (round >= 2) us[round - 2] = (cb.gpuEnd() - cb.gpuStart()) * 1e6 / @as(f64, @floatFromInt(calls));
                     }
-                    e.end();
-                    cb.commit();
-                    cb.wait();
-                    if (cb.failure()) |msg| {
-                        std.log.err("split: {s}", .{msg});
-                        return error.GpuFailed;
-                    }
-                    if (round >= 2) us[round - 2] = (cb.gpuEnd() - cb.gpuStart()) * 1e6 / @as(f64, @floatFromInt(calls));
+                    std.debug.print("{{\"split\": {{\"keys\": {d}, \"rows\": {d}, \"global\": {}, \"shared\": {}, \"us_per_layer\": {d:.2}}}}}\n", .{ kc, rows, global, shared, median(&us) });
                 }
-                std.debug.print("{{\"split\": {{\"keys\": {d}, \"rows\": {d}, \"global\": {}, \"us_per_layer\": {d:.2}}}}}\n", .{ kc, rows, global, median(&us) });
             }
         }
     }

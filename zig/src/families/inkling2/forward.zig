@@ -136,6 +136,8 @@ const MvsArgs = extern struct { rows: u32, nseg: u32, total: u32 };
 const Seg = struct { x: B, w: wts.Dense, y: B };
 /// ik_attn_part's threadgroup: 24 simdgroups, 8 key groups of 32 keys (a 256-key block) by 3 pairs of q heads (a key head's six).
 const part_group = [3]usize{ 32, 24, 1 };
+/// ik_attn_part_w's threadgroup: 6 simdgroups, one per q head in a key head's group, sharing each 32-key slice in threadgroup memory.
+const part_w_group = [3]usize{ 32, 6, 1 };
 
 /// out = in W^T on `e` for `rows` rows of the bf16 [d.n, d.k] matrix `d` (torch's Linear layout), in slabs of at most 32:
 /// the row-count kernel of the slab, whose bits do not depend on the slab. `in` rows are d.k wide, `out` rows d.n.
@@ -590,7 +592,14 @@ fn layer(x: Enc, i: u32) !void {
         const f0 = first / st.key_block;
         const blocks = (pos + nr - 1) / st.key_block - f0 + 1;
         const a: Args = .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .ring = ring, .blocks = blocks, .queries = f0, .scale = scale };
-        x.glue(.attn_part, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, n, blocks }, part_group, true);
+        // Shared-KV global window attention wins once there are enough 256-key blocks to saturate the GPU; shorter contexts
+        // keep per-row threadgroups for full occupancy.
+        const shared_part = glob and !x.legacy.window_attention and ((n >= 3 and blocks >= 96) or (n >= 2 and blocks >= 256));
+        if (shared_part) {
+            x.glue(.attn_part_w, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, 1, blocks }, part_w_group, true);
+        } else {
+            x.glue(.attn_part, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, n, blocks }, part_group, true);
+        }
         x.glue(.attn_merge, a, &.{ b(s.part), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
     } else if (x.tensor) {
         // the table of the chunk's relative biases is built in the stage and read by the tiled attention, 32 query rows of a head
