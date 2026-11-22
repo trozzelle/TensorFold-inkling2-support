@@ -52,9 +52,10 @@ const usage =
     \\                                                         --drafts: as served with the draft head (INKLING_DRAFT_* as greedy --drafts reads them):
     \\                                                         every chunk taps its rows and runs the final stage on all of them, and the head absorbs
     \\                                                         the prompt's rows but the last
-    \\tf-inkling-run <model> partition <ids.json> <cut>... [--layers L] [--drafts]   the prompt twice through the serving prompt path: in chunks of
+    \\tf-inkling-run <model> partition <ids.json> <cut>... [--restore AT]... [--layers L] [--drafts]   the prompt twice through the serving prompt path: in chunks of
     \\                                                         the prefill rows, and in chunks of the lengths given (the cuts, then the prefill rows for
-    \\                                                         the rest), each leg with its scratch and its cache poisoned with NaN past the rows in use,
+    \\                                                         the rest), plus one leg per --restore AT that saves at AT and resumes on a fresh poisoned cache,
+    \\                                                         each leg with its scratch and its cache poisoned with NaN past the rows in use,
     \\                                                         then compares the legs bit for bit: every layer's keys and values, the convolution rings,
     \\                                                         every row's last layer output and expert picks and, on the whole model, the taps, the last
     \\                                                         row's finals and logits and, with --drafts, the first hold's proposals. Exits non-zero

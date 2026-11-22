@@ -23,11 +23,13 @@ const nan_byte: u8 = 0xff;
 const nan_word: u16 = 0xffff;
 const depth = ik.dspark.max_depth;
 
-const Options = struct { cuts: []const u32, layers: ?u32 = null, drafts: bool = false };
+const Options = struct { cuts: []const u32, restores: []const u32 = &.{}, layers: ?u32 = null, drafts: bool = false };
 
 fn parseOptions(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
     var cuts: std.ArrayList(u32) = .empty;
     errdefer cuts.deinit(gpa);
+    var restores: std.ArrayList(u32) = .empty;
+    errdefer restores.deinit(gpa);
     var o: Options = .{ .cuts = &.{} };
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -37,6 +39,12 @@ fn parseOptions(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
             i += 1;
             if (i == args.len) return error.ExpectedAValueAfterTheOption;
             o.layers = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--restore")) {
+            i += 1;
+            if (i == args.len) return error.ExpectedAValueAfterTheOption;
+            const at = try std.fmt.parseInt(u32, args[i], 10);
+            if (at == 0) return error.RestorePositionOutOfRange;
+            try restores.append(gpa, at);
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             return error.UnknownPartitionOption;
         } else {
@@ -49,6 +57,8 @@ fn parseOptions(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
     if (o.layers == 0) return error.ExpectedPositiveLayers;
     if (o.drafts and o.layers != null) return error.DraftsNeedTheWholeModel;
     o.cuts = try cuts.toOwnedSlice(gpa);
+    errdefer gpa.free(o.cuts);
+    o.restores = try restores.toOwnedSlice(gpa);
     return o;
 }
 
@@ -239,8 +249,9 @@ fn tapsFinite(m: *const ik.Model, taps: []const u16, rows: usize) !void {
     };
 }
 
-/// One leg: the prompt in chunks of `lengths`, every result kept.
-fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.forward.Taps, ids: []const u32, lengths: []const usize, draft: ?settings.Draft) !Leg {
+/// One leg: the prompt in chunks of `lengths`, every result kept. When `restore_at` is positive, `[0, restore_at)` runs first on
+/// its own cache, saves a snapshot and restores it into a fresh poisoned cache before `lengths` run over `[restore_at, T)`.
+fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.forward.Taps, ids: []const u32, restore_at: usize, lengths: []const usize, draft: ?settings.Draft) !Leg {
     const c = &m.config.text;
     const H: usize = c.hidden;
     const T = ids.len;
@@ -248,6 +259,20 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
     const full = m.layers == c.layers;
     const row = rowBytes(c);
     const tap_row: usize = ik.state.feature_taps * H;
+    var snap: ?ik.snapshot.Snap = null;
+    defer if (snap) |*sp| sp.free();
+    if (restore_at > 0) {
+        var src = try ik.state.Cache.init(m.device, c, restore_at + 1, m.layers, m.prefill_rows);
+        defer src.deinit();
+        var pos: usize = 0;
+        while (pos < restore_at) {
+            const n = @min(restore_at - pos, m.prefill_rows);
+            try ik.forward.run(m, s, &src, ids[pos..][0..n], .{ .logits = .none, .prompt = true });
+            src.len += n;
+            pos += n;
+        }
+        snap = try ik.snapshot.save(m.device, m.queue, c, &src);
+    }
     var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers, m.prefill_rows);
     defer cache.deinit();
     var leg: Leg = .{
@@ -269,7 +294,11 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
     const absorber: ?Absorber = if (draft) |d| try Absorber.init(gpa, m, d, ids) else null;
     defer if (absorber) |a| a.deinit();
     try poisonCache(m, &cache, 0, true);
-    var at: usize = 0;
+    if (snap) |*sp| {
+        try ik.snapshot.restore(m.queue, c, sp, &cache);
+        sp.free();
+    }
+    var at: usize = restore_at;
     for (lengths) |n| {
         const last = at + n == T;
         try poisonScratch(m, s, &.{ tp.h, tp.eids });
@@ -309,7 +338,7 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
         cache.len += n;
         at += n;
     }
-    for (leg.picks) |p| if (p >= c.experts) {
+    for (0..L) |l| for (leg.picks[(l * T + restore_at) * c.topk ..][0 .. (T - restore_at) * c.topk]) |p| if (p >= c.experts) {
         std.debug.print("partition: an expert pick outside the table: {d}\n", .{p});
         return error.PoisonReachedAResult;
     };
@@ -355,19 +384,20 @@ fn ringOffset(c: *const ik.config.Text, l: usize, which: usize) usize {
     return at;
 }
 
-/// Every difference between the legs over `T` rows, printed by what differs; the count, zero when the legs agree to the bit.
-fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, T: usize) usize {
+/// Every difference between the legs over rows `[from, T)`, printed by what differs; the count, zero when the legs agree to the bit.
+fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, from: usize, T: usize, compare_props: bool) usize {
     const c = &m.config.text;
     const H: usize = c.hidden;
     const L: usize = m.layers;
     const row16 = rowBytes(c) / 2;
     var total: usize = 0;
     var kv: Differ = .{ .what = "keys and values" };
-    for (0..L * 2 * T) |r| {
+    for (0..L) |l| for (0..2) |kind| for (from..T) |p| {
         kv.rows += 1;
+        const r = (2 * l + kind) * T + p;
         if (!std.mem.eql(u16, a.kv[r * row16 ..][0..row16], b.kv[r * row16 ..][0..row16]))
-            kv.note(" layer {d} {s} row {d}", .{ r / (2 * T), if (r / T % 2 == 0) "keys" else "values", r % T });
-    }
+            kv.note(" layer {d} {s} row {d}", .{ l, if (kind == 0) "keys" else "values", p });
+    };
     kv.report();
     total += kv.differ;
     var rings: Differ = .{ .what = "convolution rings" };
@@ -382,24 +412,25 @@ fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, T: usize) usize {
     rings.report();
     total += rings.differ;
     var h: Differ = .{ .what = "last-layer outputs" };
-    for (0..T) |r| {
+    for (from..T) |r| {
         h.rows += 1;
         if (!std.mem.eql(u16, a.h[r * H ..][0..H], b.h[r * H ..][0..H])) h.note(" row {d}", .{r});
     }
     h.report();
     total += h.differ;
     var picks: Differ = .{ .what = "expert picks" };
-    for (0..L * T) |r| {
+    for (0..L) |l| for (from..T) |p| {
         picks.rows += 1;
-        if (!std.mem.eql(u32, a.picks[r * c.topk ..][0..c.topk], b.picks[r * c.topk ..][0..c.topk])) picks.note(" layer {d} row {d}", .{ r / T, r % T });
-    }
+        const r = l * T + p;
+        if (!std.mem.eql(u32, a.picks[r * c.topk ..][0..c.topk], b.picks[r * c.topk ..][0..c.topk])) picks.note(" layer {d} row {d}", .{ l, p });
+    };
     picks.report();
     total += picks.differ;
     if (a.taps) |ta| {
         const tb = b.taps.?;
         var taps: Differ = .{ .what = "taps" };
         const width = ik.state.feature_taps * H;
-        for (0..T) |r| {
+        for (from..T) |r| {
             taps.rows += 1;
             if (!std.mem.eql(u16, ta[r * width ..][0..width], tb[r * width ..][0..width])) {
                 var k: usize = 0;
@@ -419,10 +450,14 @@ fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, T: usize) usize {
         total += logits.differ;
     }
     if (a.props) |pa| {
-        var props: Differ = .{ .what = "the first hold's proposals", .rows = depth };
-        for (pa, b.props.?, 0..) |x, y, i| if (x != y) props.note(" proposal {d}: {d} against {d}", .{ i, x, y });
-        props.report();
-        total += props.differ;
+        if (compare_props) {
+            var props: Differ = .{ .what = "the first hold's proposals", .rows = depth };
+            for (pa, b.props.?, 0..) |x, y, i| if (x != y) props.note(" proposal {d}: {d} against {d}", .{ i, x, y });
+            props.report();
+            total += props.differ;
+        } else {
+            std.debug.print("{{\"compared\": \"the first hold's proposals\", \"proposals\": \"not compared\"}}\n", .{});
+        }
     }
     return total;
 }
@@ -431,8 +466,10 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
     const gpa = init.gpa;
     const opt = try parseOptions(gpa, args);
     defer gpa.free(opt.cuts);
+    defer gpa.free(opt.restores);
     const T = ids.len;
     if (T == 0) return error.ExpectedAPrompt;
+    for (opt.restores) |at| if (at >= T) return error.RestorePositionOutOfRange;
     const draft: ?settings.Draft = if (opt.drafts) try settings.draft() else null;
     const m = try ik.Model.load(gpa, init.io, model_dir, .{
         .layers = opt.layers,
@@ -457,11 +494,29 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
     };
     defer tp.h.deinit();
     defer tp.eids.deinit();
-    var a = try runLeg(gpa, m, &s, tp, ids, default_chunks, draft);
+    var a = try runLeg(gpa, m, &s, tp, ids, 0, default_chunks, draft);
     defer a.deinit(gpa);
-    var b = try runLeg(gpa, m, &s, tp, ids, cut_chunks, draft);
-    defer b.deinit(gpa);
-    const differ = compare(m, &a, &b, T);
-    std.debug.print("{{\"partition\": \"{s}\", \"prompt_tokens\": {d}, \"layers\": {d}, \"prompt_path\": \"{s}\", \"prefill_rows\": {d}, \"default_chunks\": {d}, \"cut_chunks\": {d}, \"first_cuts\": {any}, \"differ\": {d}}}\n", .{ if (differ == 0) "identical" else "differs", T, m.layers, @tagName(m.promptPath()), rows, default_chunks.len, cut_chunks.len, cut_chunks[0..@min(cut_chunks.len, 16)], differ });
-    if (differ != 0) return error.PartitionDiffers;
+    var differ: usize = 0;
+    {
+        var b = try runLeg(gpa, m, &s, tp, ids, 0, cut_chunks, draft);
+        defer b.deinit(gpa);
+        differ = compare(m, &a, &b, 0, T, true);
+    }
+    const restore_diffs = try gpa.alloc(usize, opt.restores.len);
+    defer gpa.free(restore_diffs);
+    var total_differ = differ;
+    for (opt.restores, 0..) |restore_at, ri| {
+        const tail_chunks = try chunkLengths(gpa, T - restore_at, &.{}, rows);
+        defer gpa.free(tail_chunks);
+        var r = try runLeg(gpa, m, &s, tp, ids, restore_at, tail_chunks, draft);
+        defer r.deinit(gpa);
+        restore_diffs[ri] = compare(m, &a, &r, restore_at, T, T - restore_at >= 1023);
+        total_differ += restore_diffs[ri];
+    }
+    std.debug.print("{{\"partition\": \"{s}\", \"prompt_tokens\": {d}, \"layers\": {d}, \"prompt_path\": \"{s}\", \"prefill_rows\": {d}, \"default_chunks\": {d}, \"cut_chunks\": {d}, \"first_cuts\": {any}, \"differ\": {d}, \"restore\": [", .{ if (differ == 0) "identical" else "differs", T, m.layers, @tagName(m.promptPath()), rows, default_chunks.len, cut_chunks.len, cut_chunks[0..@min(cut_chunks.len, 16)], differ });
+    for (opt.restores, restore_diffs, 0..) |restore_at, rd, ri| {
+        std.debug.print("{s}{{\"at\": {d}, \"result\": \"{s}\"}}", .{ if (ri == 0) "" else ", ", restore_at, if (rd == 0) "identical" else "differs" });
+    }
+    std.debug.print("]}}\n", .{});
+    if (total_differ != 0) return error.PartitionDiffers;
 }

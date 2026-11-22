@@ -3,6 +3,7 @@ const std = @import("std");
 const mtl = @import("metal");
 const lanes = @import("lanes");
 const st = @import("state.zig");
+const snapshot = @import("snapshot.zig");
 const fwd = @import("forward.zig");
 const greedy = @import("greedy.zig");
 const draw = @import("draw.zig");
@@ -35,6 +36,12 @@ const Spent = struct {
     }
 };
 
+/// Prompt cache room callback: tells the host how many bytes of the cache budget streams leave for kept states.
+pub const Room = struct {
+    ctx: *anyopaque,
+    fit: *const fn (ctx: *anyopaque, bytes: u64, restoring: ?*anyopaque, prompt: []const u32) void,
+};
+
 pub const Metal = struct {
     gpa: std.mem.Allocator,
     model: *Model,
@@ -42,6 +49,7 @@ pub const Metal = struct {
     scratch: st.Scratch,
     caches: std.AutoHashMapUnmanaged(*lanes.Stream, *st.Cache) = .empty,
     follow: ?mtl.ResidencySet.Follow = null,
+    room: ?Room = null,
     held: u64 = 0,
     tokens: []u32,
     next: u64 = 0,
@@ -175,21 +183,29 @@ pub const Metal = struct {
         cache.tap = .{ .buf = cache.last_tap, .start = cache.len + n - 1, .rows = 1 };
     }
 
-    /// ids at the cache's end in prompt chunks, the last chunk's last logits kept for the first draw. With the features
-    /// prepared each chunk is tapped, and `holdTaps` hands its rows on.
+    /// ids at the cache's end in prompt chunks, cutting at the stream's reuse marks, the last chunk's last logits kept
+    /// for the first draw. With the features prepared each chunk is tapped, and `holdTaps` hands its rows on.
     fn feed(self: *Metal, cache: *st.Cache, ids: []const u32, stream: *lanes.Stream) !void {
+        const base = cache.len; // a resumed pass starts past the kept state's rows
         var at: usize = 0;
         while (at < ids.len) {
             if (stream.isCancelled()) return error.Cancelled;
-            const n = @min(ids.len - at, self.scratch.prefill_rows);
-            const last = at + n == ids.len;
+            var end = @min(ids.len, at + self.scratch.prefill_rows);
+            // a mark ends a chunk, so the state there can be kept; the server's per-message chunk starts are not cut at: a row's
+            // bits do not depend on its chunk, and each cut costs a small chunk
+            for (stream.reuse.marks) |x| if (x > base + at and x < base + end) {
+                end = x - base;
+            };
+            const n = end - at;
+            const last = end == ids.len;
             const to: ?fwd.B = if (self.tapped) .{ .buf = self.scratch.ptaps } else null;
-            try fwd.run(self.model, &self.scratch, cache, ids[at..][0..n], .{ .logits = if (last) .last else .none, .prompt = true, .feature_taps = to });
+            try fwd.run(self.model, &self.scratch, cache, ids[at..end], .{ .logits = if (last) .last else .none, .prompt = true, .feature_taps = to });
             if (to != null) try self.holdTaps(cache, stream, n, last);
             if (last) @memcpy(cache.logits.slice(u16, self.model.config.text.vocab), self.scratch.logits.slice(u16, self.model.config.text.vocab));
             cache.len += n;
             lanes.prefill_widths.completed(self.gpa, stream, n);
-            at += n;
+            at = end;
+            if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(cache.len)) != null) if (stream.reuse.hook) |k| k.at(k.ptr, stream, @intCast(cache.len));
         }
     }
 
@@ -203,6 +219,12 @@ pub const Metal = struct {
         if (self.held + need > self.options.budget) return error.Inkling2CachesFull;
         self.held += need;
         errdefer self.held -= need;
+        if (stream.reuse.saved) |saved| { // a state the stream cannot hold beside its caches: freed now, no restore
+            const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
+            if (self.held + snap.bytes > self.options.budget) snap.free();
+        }
+        // kept states give way first
+        if (self.room) |r| r.fit(r.ctx, self.options.budget - self.held, stream.reuse.saved, ids);
         const cache = try self.gpa.create(st.Cache);
         errdefer self.gpa.destroy(cache);
         cache.* = try st.Cache.init(self.model.device, c, capacity, c.layers, self.scratch.prefill_rows);
@@ -211,8 +233,14 @@ pub const Metal = struct {
         try self.caches.put(self.gpa, stream, cache);
         errdefer _ = self.caches.remove(stream);
         stream.cached = 0;
+        if (stream.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
+            const snap: *const snapshot.Snap = @ptrCast(@alignCast(saved));
+            if (snap.at < ids.len) {
+                if (snapshot.restore(self.model.queue, c, snap, cache)) stream.cached = snap.at else |_| stream.reuse_failed = true;
+            } else stream.reuse_failed = true;
+        }
         if (self.spent != null) self.spent = .{};
-        try self.feed(cache, ids, stream);
+        try self.feed(cache, ids[cache.len..], stream);
     }
 
     /// The drafter's layers, told once before any forward. A forward taps the inputs of `fwd.tap_layers` and the finals
@@ -347,11 +375,38 @@ pub const Metal = struct {
             self.held -= st.cacheBytes(c, entry.value.capacity, c.layers, self.scratch.prefill_rows);
             entry.value.deinit();
             self.gpa.destroy(entry.value);
+            if (self.room) |r| r.fit(r.ctx, self.options.budget - self.held, null, &.{});
         }
         if (self.spent) |s| {
             s.log();
             self.spent = .{};
         }
+    }
+
+    /// The prompt cache's Snapshots functions: a stream's caches at a mark, copied on the GPU.
+    pub fn snapBytes(ptr: *anyopaque, at: u32) u64 {
+        const c = &cast(ptr).model.config.text;
+        return snapshot.bytes(c, c.layers, at);
+    }
+
+    pub fn snapSave(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+        const self = cast(ptr);
+        const cache = try self.cacheOf(@ptrCast(@alignCast(owner orelse return error.NoStream)));
+        if (cache.len != at) return error.SnapshotOutOfStep;
+        const snap = try self.gpa.create(snapshot.Snap);
+        errdefer self.gpa.destroy(snap);
+        snap.* = try snapshot.save(self.model.device, self.model.queue, &self.model.config.text, cache);
+        return snap;
+    }
+
+    pub fn snapRestore(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
+        return error.BackendRestores; // the prompt pass restores, before its first chunk
+    }
+
+    pub fn snapDrop(ptr: *anyopaque, saved: *anyopaque) void {
+        const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
+        snap.free();
+        cast(ptr).gpa.destroy(snap);
     }
 };
 
