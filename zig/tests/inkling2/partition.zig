@@ -2,9 +2,10 @@
 //! chunks of given lengths, and the two legs' results compared bit for bit.
 //!
 //! A row's results must not depend on the chunk it was fed in. Each leg starts on a cache whose keys, values, convolution rings and
-//! kept logits are NaN; before every chunk the whole scratch is NaN and so are the cache's rows from the chunk's first on; after it
-//! the 64 rows past the chunk's end must still be NaN. A kernel that reads past the rows it was given, or leaves a row unwritten,
-//! turns what is compared to NaN and fails the run, as does a write past the rows, as does any bit that differs between the legs.
+//! kept logits are NaN; before every chunk the whole scratch is NaN and so is every cache slot no later row can read; after each
+//! chunk its rows are read out by position through the slot map and every slot that stayed poisoned must still be NaN. A kernel that
+//! reads outside the live rows, or leaves a row unwritten, turns what is compared to NaN and fails the run, as does a write outside
+//! the chunk's rows, as does any bit that differs between the legs.
 //!
 //! Compared: every layer's keys and values of every row, every convolution ring, every row's last-layer output and expert picks;
 //! on the whole model also every row's taps (the draft head's features, finals among them), the last row's finals and the logits
@@ -17,8 +18,6 @@ const ik = tf.inkling2;
 const settings = @import("settings.zig");
 const Absorber = @import("absorber.zig").Absorber;
 
-/// Rows of the cache past a chunk's end that must stay untouched by it: a 64-key block of attention reaches this far.
-const reach = 64;
 /// The bytes of the poison: bf16, f16 and f32 words made of them are NaN, and an index made of them is out of range.
 const nan_byte: u8 = 0xff;
 const nan_word: u16 = 0xffff;
@@ -121,46 +120,98 @@ fn rowBytes(c: *const ik.config.Text) usize {
     return ik.state.kvBytes(c) / 2;
 }
 
-/// The cache's rows from `from` to its end, of every layer's keys and values, to NaN bytes; `start` also the convolution rings and
-/// the kept logits.
-fn poisonCache(m: *const ik.Model, cache: *ik.state.Cache, from: usize, start: bool) !void {
+/// The first position of layer `l` a row at `at` can read: 0 on a global layer; on a sliding one the 64-key block of its
+/// window's first key.
+fn liveFrom(c: *const ik.config.Text, l: usize, at: usize) usize {
+    return if (ik.config.isGlobal(@intCast(l))) 0 else std.mem.alignBackward(usize, at -| (@as(usize, c.window) - 1), 64);
+}
+
+/// Byte offset in the cache's kv buffer of position `p` of layer `l`'s keys (`values`: its values).
+fn rowAt(cache: *const ik.state.Cache, l: usize, p: usize, values: bool, row: usize) usize {
+    return (if (values) cache.values(l) else cache.keys(l)) + (p % cache.ring(l)) * row;
+}
+
+fn fillSlotRange(blit: mtl.BlitEncoder, kv: mtl.Buffer, base: usize, lo: usize, hi: usize, row: usize) void {
+    if (hi > lo) blit.fill(kv, base + lo * row, (hi - lo) * row, nan_byte);
+}
+
+/// For every layer, NaN every slot except those of positions `[liveFrom(l, pos), pos)`; `start` also poisons the convolution
+/// rings and the kept logits.
+fn poisonCache(m: *const ik.Model, cache: *ik.state.Cache, pos: usize, start: bool) !void {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
-    const row = rowBytes(&m.config.text);
-    const held = ik.state.cachePositions(cache.capacity);
+    const c = &m.config.text;
+    const row = rowBytes(c);
     const cb = m.queue.commandBuffer();
     const blit = cb.blit();
-    if (held > from) for (0..cache.layers) |l| {
-        blit.fill(cache.kv, cache.keys(l) + from * row, (held - from) * row, nan_byte);
-        blit.fill(cache.kv, cache.values(l) + from * row, (held - from) * row, nan_byte);
-    };
+    for (0..cache.layers) |l| {
+        const slots: usize = cache.ring(l);
+        const lo = liveFrom(c, l, pos);
+        for ([_]usize{ cache.keys(l), cache.values(l) }) |base| {
+            if (pos <= lo) {
+                fillSlotRange(blit, cache.kv, base, 0, slots, row);
+            } else if (pos - lo < slots) {
+                const first = lo % slots;
+                const end = pos % slots;
+                if (first < end) {
+                    fillSlotRange(blit, cache.kv, base, 0, first, row);
+                    fillSlotRange(blit, cache.kv, base, end, slots, row);
+                } else {
+                    fillSlotRange(blit, cache.kv, base, end, first, row);
+                }
+            }
+        }
+    }
     if (start) blit.fill(cache.conv, 0, cache.conv.length(), nan_byte);
     blit.end();
     try finish(cb);
     if (start) @memset(cache.logits.slice(u8, cache.logits.length()), nan_byte);
 }
 
-/// The `reach` rows of every layer's keys and values from `from` are still NaN: the chunk before them wrote nothing there.
-fn checkReach(m: *const ik.Model, cache: *ik.state.Cache, staging: mtl.Buffer, from: usize) !void {
+/// Whether slot `s` of a ring of `slots` holds any position in `[lo, hi)`.
+fn slotInRange(s: usize, slots: usize, lo: usize, hi: usize) bool {
+    if (hi <= lo) return false;
+    if (hi - lo >= slots) return true;
+    const first = lo % slots;
+    const end = hi % slots;
+    return if (first < end) (s >= first and s < end) else (s >= first or s < end);
+}
+
+/// After a chunk of `n` rows at `pos`: copy the chunk's rows `[pos, pos + n)` of every layer's keys and values into `leg.kv`
+/// by position, check they are finite, and confirm every slot outside `[liveFrom(l, pos), pos + n)` mod ring is still NaN.
+fn readChunkAndCheck(m: *const ik.Model, cache: *ik.state.Cache, staging: mtl.Buffer, pos: usize, n: usize, T: usize, leg: *Leg) !void {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
-    const row = rowBytes(&m.config.text);
-    const held = ik.state.cachePositions(cache.capacity);
-    if (from >= held) return;
-    const rows = @min(reach, held - from);
-    const cb = m.queue.commandBuffer();
-    const blit = cb.blit();
+    const c = &m.config.text;
+    const row = rowBytes(c);
+    const row16 = row / 2;
     for (0..cache.layers) |l| {
-        blit.copy(cache.kv, cache.keys(l) + from * row, staging, (2 * l) * rows * row, rows * row);
-        blit.copy(cache.kv, cache.values(l) + from * row, staging, (2 * l + 1) * rows * row, rows * row);
+        const slots: usize = cache.ring(l);
+        const kv_layer = slots * 2 * row;
+        const cb = m.queue.commandBuffer();
+        const blit = cb.blit();
+        blit.copy(cache.kv, cache.keys(l), staging, 0, kv_layer);
+        blit.end();
+        try finish(cb);
+        const words = staging.slice(u16, kv_layer / 2);
+        const half16 = slots * row16;
+        const lo = liveFrom(c, l, pos);
+        for ([_]usize{ 0, half16 }, 0..) |base, kind| {
+            const dst = leg.kv[(2 * l + kind) * T * row16 ..];
+            for (pos..pos + n) |p| {
+                const s = p % slots;
+                @memcpy(dst[p * row16 ..][0..row16], words[base + s * row16 ..][0..row16]);
+            }
+            try allFinite("a layer's keys and values", dst[pos * row16 ..][0 .. n * row16], row16);
+            for (0..slots) |s| {
+                if (slotInRange(s, slots, lo, pos + n)) continue;
+                for (words[base + s * row16 ..][0..row16]) |x| if (x != nan_word) {
+                    std.debug.print("partition: the chunk [{d}, {d}) wrote outside its rows: layer {d}, {s}, slot {d}\n", .{ pos, pos + n, l, if (kind == 0) "keys" else "values", s });
+                    return error.AChunkWrotePastItsRows;
+                };
+            }
+        }
     }
-    blit.end();
-    try finish(cb);
-    for (staging.slice(u16, 2 * cache.layers * rows * row / 2), 0..) |x, i| if (x != nan_word) {
-        const at = i / (row / 2); // the row of 2 * layers * rows
-        std.debug.print("partition: the chunk ending at row {d} wrote past its rows: layer {d}, {s}, row {d}\n", .{ from, at / (2 * rows), if (at / rows % 2 == 0) "keys" else "values", from + at % rows });
-        return error.AChunkWrotePastItsRows;
-    };
 }
 
 fn finite16(x: u16) bool {
@@ -211,7 +262,9 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
         leg.finals = try gpa.alloc(u16, H);
         leg.logits = try gpa.alloc(u16, c.vocab);
     }
-    const staging = try m.device.buffer(@max(2 * L * reach * row, 16), mtl.ResourceOptions.shared);
+    var max_layer_bytes: usize = cache.conv.length();
+    for (0..cache.layers) |l| max_layer_bytes = @max(max_layer_bytes, @as(usize, cache.ring(l)) * 2 * row);
+    const staging = try m.device.buffer(@max(max_layer_bytes, 16), mtl.ResourceOptions.shared);
     defer staging.deinit();
     const absorber: ?Absorber = if (draft) |d| try Absorber.init(gpa, m, d, ids) else null;
     defer if (absorber) |a| a.deinit();
@@ -252,7 +305,7 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
                 }
             }
         }
-        try checkReach(m, &cache, staging, at + n);
+        try readChunkAndCheck(m, &cache, staging, at, n, T, &leg);
         cache.len += n;
         at += n;
     }
@@ -260,37 +313,14 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
         std.debug.print("partition: an expert pick outside the table: {d}\n", .{p});
         return error.PoisonReachedAResult;
     };
-    try readCache(m, &cache, T, &leg);
+    try readConv(m, &cache, staging, T, &leg);
     return leg;
 }
 
-/// The cache's rows 0 .. T of every layer and its rings into `leg`, the rows past T checked to be NaN still.
-fn readCache(m: *const ik.Model, cache: *ik.state.Cache, T: usize, leg: *Leg) !void {
+/// The cache's convolution rings into `leg`.
+fn readConv(m: *const ik.Model, cache: *ik.state.Cache, staging: mtl.Buffer, T: usize, leg: *Leg) !void {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
-    const row = rowBytes(&m.config.text);
-    const row16 = row / 2;
-    const max_layer_bytes = ik.state.cachePositions(cache.capacity) * ik.state.kvBytes(&m.config.text);
-    const staging = try m.device.buffer(@max(max_layer_bytes, cache.conv.length()), mtl.ResourceOptions.shared);
-    defer staging.deinit();
-    for (0..cache.layers) |l| {
-        const kv_layer = @as(usize, cache.ring(l)) * ik.state.kvBytes(&m.config.text);
-        const half16 = kv_layer / 2 / 2;
-        const cb = m.queue.commandBuffer();
-        const blit = cb.blit();
-        blit.copy(cache.kv, cache.keys(l), staging, 0, kv_layer);
-        blit.end();
-        try finish(cb);
-        const words = staging.slice(u16, kv_layer / 2);
-        for ([_]usize{ 0, half16 }, 0..) |base, kind| {
-            @memcpy(leg.kv[(2 * l + kind) * T * row16 ..][0 .. T * row16], words[base..][0 .. T * row16]);
-            for (words[base + T * row16 .. base + half16], 0..) |x, i| if (x != nan_word) {
-                std.debug.print("partition: layer {d}'s {s} wrote past the prompt: row {d}\n", .{ l, if (kind == 0) "keys" else "values", T + i / row16 });
-                return error.AChunkWrotePastItsRows;
-            };
-        }
-        try allFinite("a layer's keys and values", leg.kv[2 * l * T * row16 ..][0 .. 2 * T * row16], row16);
-    }
     const cb = m.queue.commandBuffer();
     const blit = cb.blit();
     blit.copy(cache.conv, 0, staging, 0, cache.conv.length());
