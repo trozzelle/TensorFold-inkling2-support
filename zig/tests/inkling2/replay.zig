@@ -45,16 +45,20 @@ fn now() f64 {
 }
 
 pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
-    // <model> dspark <taps_dir> <seqs> <out_dir> then any of --depth d, --bits 8|16
+    // <model> dspark <taps_dir> <seqs> <out_dir> then any of --depth d, --bits 8|16, --from-back K
     if (args.len < 6 or args.len % 2 != 0) return error.ExpectedTapsSeqsOutFlags;
     var depth: u32 = steps;
     var bits: ik.dspark_weights.Bits = .default;
+    var from_back: ?usize = null;
     var flag: usize = 6;
     while (flag < args.len) : (flag += 2) {
         if (std.mem.eql(u8, args[flag], "--depth")) {
             depth = try std.fmt.parseInt(u32, args[flag + 1], 10);
         } else if (std.mem.eql(u8, args[flag], "--bits")) {
             bits = try ik.dspark_weights.Bits.parse(args[flag + 1]);
+        } else if (std.mem.eql(u8, args[flag], "--from-back")) {
+            from_back = try std.fmt.parseInt(usize, args[flag + 1], 10);
+            if (from_back.? == 0) return error.ExpectedPositiveFromBack;
         } else return error.ExpectedTapsSeqsOutFlags;
     }
     if (depth == 0 or depth > steps) return error.DepthOneToSeven;
@@ -70,7 +74,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     defer drafter.deinit();
     try drafter.captureLogits();
     std.debug.print("{{\"load_s\": {d:.1}, \"drafter_s\": {d:.1}, \"depth\": {d}, \"bits\": {d}, \"hold_ms\": {d:.3}, \"step_ms\": {d:.3}, \"resident_gib\": {d:.2}, \"head_gib\": {d:.3}}}\n", .{ loaded - t0, now() - loaded, depth, @backingInt(bits), drafter.hold_ms, drafter.step_ms, @as(f64, @floatFromInt(m.checkpoint.residentBytes() + drafter.scratchBytes())) / (1 << 30), @as(f64, @floatFromInt(drafter.residentBytes(1))) / (1 << 30) });
-    for (seqs) |seq| try replay(init, m, drafter, args[3], args[5], seq, depth);
+    for (seqs) |seq| try replay(init, m, drafter, args[3], args[5], seq, depth, from_back);
 }
 
 fn path(gpa: std.mem.Allocator, dir: []const u8, seq: usize, suffix: []const u8) ![]u8 {
@@ -78,7 +82,7 @@ fn path(gpa: std.mem.Allocator, dir: []const u8, seq: usize, suffix: []const u8)
 }
 
 /// One sequence: the prompt, then every generated row, written as `props.bin`, `probs.bin` and `logits.bin` under `out_dir`.
-fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, taps_dir: []const u8, out_dir: []const u8, seq: usize, depth: u32) !void {
+fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, taps_dir: []const u8, out_dir: []const u8, seq: usize, depth: u32, from_back: ?usize) !void {
     const gpa = init.gpa;
     const began = now();
     const meta_path = try path(gpa, taps_dir, seq, "tokens.json");
@@ -118,12 +122,13 @@ fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, tap
     try dv.open(&stream);
     defer dv.release(&stream);
     var holds: usize = 0;
-    var next: usize = 0; // the first row not yet absorbed
+    const start_at: usize = if (from_back) |k| L -| k else 0;
+    var next: usize = start_at; // the first row not yet absorbed
     var p: usize = L - 1;
     while (p < T) : (p += 1) {
         const rows = p + 1 - next;
         const f: lanes.backend.Features = .{ .buffer = @intFromPtr(taps.id), .offset = next * row_bytes, .rows = @intCast(rows), .row_bytes = row_bytes, .space = .device, .dtype = .bf16 };
-        try dv.absorb(&.{.{ .stream = &stream, .features = f, .start = next, .follow = tokens[next + 1 ..][0..rows], .prompt = next == 0 }});
+        try dv.absorb(&.{.{ .stream = &stream, .features = f, .start = next, .follow = tokens[next + 1 ..][0..rows], .prompt = p == L - 1 }});
         try dv.hold(&.{.{ .stream = &stream, .pending = tokens[p + 1], .position = p + 2, .depth = depth }});
         var held: [steps]u32 = undefined;
         try dv.held(&.{&stream}, &.{held[0..depth]});

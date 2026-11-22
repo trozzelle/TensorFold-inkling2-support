@@ -188,4 +188,7 @@ inline float ik_resid_one(bool boundary, bfloat h, bfloat ya) { return (boundary
   z[i] = gid.x >= a.extent ? bfloat(-INFINITY) : bfloat(a.cap * tanh(float(z[i]) / a.cap));
 }
 
+// Empty kernel for dispatch-latency ablation on a given grid.
+[[kernel]] void ik_nop() {}
+
 TF_BF16_MATVECS(ik)
