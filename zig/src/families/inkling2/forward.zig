@@ -418,23 +418,12 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     try checked(cb);
     const began = (if (done.n > 0) done.bufs[0] else cb).gpuStartOr(committed_at);
     if (out.timing) |tm| {
-        // a buffer's span runs from its start, or from the end of the one ahead of it (the first: from its commit) when
-        // Metal reports no start for it
-        var gpu: f64 = 0;
-        var longest: f64 = 0;
-        var after = committed_at;
-        for (done.all()) |f| {
-            const one = f.gpuEnd() - f.gpuStartOr(after);
-            after = f.gpuEnd();
-            gpu += one;
-            longest = @max(longest, one);
-        }
-        const one = cb.gpuEnd() - cb.gpuStartOr(after);
-        gpu += one;
-        longest = @max(longest, one);
-        tm.gpu += gpu;
+        var spans: Spans = .{ .after = committed_at };
+        for (done.all()) |f| spans.add(f.gpuStart(), f.gpuEnd());
+        spans.add(cb.gpuStart(), cb.gpuEnd());
+        tm.gpu += spans.gpu;
         tm.buffers += @intCast(done.n + 1);
-        tm.longest = @max(tm.longest, longest);
+        tm.longest = @max(tm.longest, spans.longest);
         tm.started = began;
         tm.ended = cb.gpuEnd();
     }
@@ -628,4 +617,39 @@ pub fn seconds() f64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.UPTIME_RAW, &ts);
     return @as(f64, @floatFromInt(ts.sec)) + @as(f64, @floatFromInt(ts.nsec)) * 1e-9;
+}
+
+/// GPU seconds of buffers run in order on one queue: one with no reported start runs from `after` (last end or commit).
+const Spans = struct {
+    after: f64,
+    gpu: f64 = 0,
+    longest: f64 = 0,
+
+    fn add(s: *Spans, start: f64, end: f64) void {
+        const one = end - mtl.startOr(start, s.after);
+        s.after = end;
+        s.gpu += one;
+        s.longest = @max(s.longest, one);
+    }
+};
+
+test "inkling2 forward: a buffer with no reported GPU start is timed from its commit or the end of the buffer ahead of it" {
+    const uptime = 86_400.0; // a day of uptime: what end - 0 would have counted
+    // reported starts are taken as they are
+    var reported: Spans = .{ .after = uptime };
+    reported.add(uptime + 0.5, uptime + 2);
+    try std.testing.expectEqual(@as(f64, 1.5), reported.gpu);
+    // the first buffer without a start runs from its commit
+    var first: Spans = .{ .after = uptime };
+    first.add(0, uptime + 2);
+    try std.testing.expectEqual(@as(f64, 2), first.gpu);
+    // in a chain each one without a start runs from the end of the one ahead of it, whatever that one reported
+    var chain: Spans = .{ .after = uptime };
+    chain.add(uptime + 1, uptime + 3);
+    chain.add(0, uptime + 4);
+    chain.add(uptime + 4.5, uptime + 5);
+    chain.add(0, uptime + 7);
+    try std.testing.expectEqual(@as(f64, 2 + 1 + 0.5 + 2), chain.gpu);
+    try std.testing.expectEqual(@as(f64, 2), chain.longest);
+    try std.testing.expect(chain.gpu < 10);
 }

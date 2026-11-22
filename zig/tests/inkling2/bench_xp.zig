@@ -103,13 +103,14 @@ fn timeCalls(q: mtl.Queue, b: *const Bench, n: usize, calls: usize, which: ?usiz
         for (b.uses) |u| e.useResource(u, mtl.ResourceUsage.read);
         for (0..calls) |_| if (which) |w| b.stage(e, n, w) else b.encode(e, n);
         e.end();
+        const committed = mtl.clock.seconds();
         cb.commit();
         cb.wait();
         if (cb.failure()) |msg| {
             std.log.err("xp bench: {s}", .{msg});
             return error.GpuFailed;
         }
-        if (t > 0) ms[t - 1] = (cb.gpuEnd() - cb.gpuStart()) * 1e3 / @as(f64, @floatFromInt(calls));
+        if (t > 0) ms[t - 1] = (cb.gpuEnd() - cb.gpuStartOr(committed)) * 1e3 / @as(f64, @floatFromInt(calls));
     }
     return median(&ms);
 }

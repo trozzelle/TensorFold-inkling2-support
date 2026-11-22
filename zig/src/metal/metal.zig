@@ -16,6 +16,7 @@ pub const CompileOptions = @import("library.zig").CompileOptions;
 pub const Pipeline = @import("library.zig").Pipeline;
 pub const Queue = @import("command.zig").Queue;
 pub const CommandBuffer = @import("command.zig").CommandBuffer;
+pub const startOr = @import("command.zig").startOr;
 pub const ComputeEncoder = @import("command.zig").ComputeEncoder;
 pub const BlitEncoder = @import("command.zig").BlitEncoder;
 pub const SharedEvent = @import("sync.zig").SharedEvent;

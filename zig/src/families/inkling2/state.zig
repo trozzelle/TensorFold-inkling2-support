@@ -13,6 +13,8 @@ pub const window_rows = 16;
 /// once, so more rows share that read, and the scratch grows with them. A row's bits do not depend on the chunk it is in, so the
 /// rows a chunk holds change no bits.
 pub const default_prefill_rows = 4096;
+/// Rows of a per-operation prompt chunk at most when a load names none: the first release's (0.57 GiB, not 4.0).
+pub const per_op_prefill_rows = 512;
 /// A load's chunk rows are a multiple of `prefill_unit` from `prefill_unit` to `max_prefill_rows`.
 pub const prefill_unit = 64;
 pub const max_prefill_rows = 8192;
@@ -22,12 +24,17 @@ pub fn validPrefillRows(rows: usize) bool {
     return rows >= prefill_unit and rows <= max_prefill_rows and rows % prefill_unit == 0;
 }
 
-/// The rows INKLING_PREFILL_ROWS names: null or blank is `default_prefill_rows`, else a whole number `validPrefillRows` accepts.
-pub fn parsePrefillRows(text: ?[]const u8) error{BadPrefillRows}!u32 {
+/// The rows INKLING_PREFILL_ROWS names: null when blank (see `defaultPrefillRows`), else one `validPrefillRows` takes.
+pub fn parsePrefillRows(text: ?[]const u8) error{BadPrefillRows}!?u32 {
     const t = std.mem.trim(u8, text orelse "", " \t");
-    if (t.len == 0) return default_prefill_rows;
+    if (t.len == 0) return null;
     const n = std.fmt.parseInt(u32, t, 10) catch return error.BadPrefillRows;
     return if (validPrefillRows(n)) n else error.BadPrefillRows;
+}
+
+/// Rows of a prompt chunk at most for a load that names none, by the path its chunks take.
+pub fn defaultPrefillRows(path: PromptPath) u32 {
+    return if (path == .per_op) per_op_prefill_rows else default_prefill_rows;
 }
 
 /// How a load runs the rows of a prompt chunk, which decides what its scratch holds.
@@ -428,14 +435,16 @@ test "inkling2 state: the drafter's taps are eight hidden rows a row, a decode w
     try std.testing.expectEqual(@as(usize, 8), feature_taps);
 }
 
-test "inkling2 state: a prompt chunk's rows are a multiple of 64 from 64 to 8192, and 4096 unless the setting names others" {
+test "inkling2 state: a prompt chunk's rows are a multiple of 64 from 64 to 8192, and 4096 (512 per-operation) unless the setting names others" {
     for ([_]usize{ 64, 128, 512, 4096, 8192 }) |rows| try std.testing.expect(validPrefillRows(rows));
     for ([_]usize{ 0, 1, 63, 65, 100, 8192 + 64, 1 << 20 }) |rows| try std.testing.expect(!validPrefillRows(rows));
-    try std.testing.expectEqual(@as(usize, 4096), default_prefill_rows);
-    try std.testing.expectEqual(@as(u32, 4096), try parsePrefillRows(null));
-    try std.testing.expectEqual(@as(u32, 4096), try parsePrefillRows(" \t"));
-    try std.testing.expectEqual(@as(u32, 2048), try parsePrefillRows("2048"));
-    try std.testing.expectEqual(@as(u32, 64), try parsePrefillRows(" 64 "));
+    try std.testing.expectEqual(@as(u32, 4096), defaultPrefillRows(.chunk));
+    try std.testing.expectEqual(@as(u32, 4096), defaultPrefillRows(.chunk_rows));
+    try std.testing.expectEqual(@as(u32, 512), defaultPrefillRows(.per_op));
+    try std.testing.expectEqual(@as(?u32, null), try parsePrefillRows(null));
+    try std.testing.expectEqual(@as(?u32, null), try parsePrefillRows(" \t"));
+    try std.testing.expectEqual(@as(?u32, 2048), try parsePrefillRows("2048"));
+    try std.testing.expectEqual(@as(?u32, 64), try parsePrefillRows(" 64 "));
     for ([_][]const u8{ "0", "63", "100", "8256", "-64", "lots", "2048k", "1e3", "0x40" }) |bad| try std.testing.expectError(error.BadPrefillRows, parsePrefillRows(bad));
 }
 

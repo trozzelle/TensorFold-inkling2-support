@@ -29,8 +29,8 @@ comptime {
 /// `drafts`: also load the DSpark draft head from the folder's mtp.safetensors, when the config has one and the file is there.
 /// `draft_bits`: the width of the draft layers' projections (INKLING_DRAFT_BITS): quantized to 8 bits at load, or the file's bf16.
 /// `prefill_rows`: rows of a prompt chunk at most (INKLING_PREFILL_ROWS), a multiple of 64 from 64 to 8192: a scratch is made for
-/// that many rows and a prompt is fed in pieces of them.
-pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default, prefill_rows: u32 = st.default_prefill_rows };
+/// that many rows and a prompt is fed in pieces of them; null takes `state.defaultPrefillRows` for the load's path.
+pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default, prefill_rows: ?u32 = null };
 
 /// The kernels of the chunk path, which runs a prompt chunk's rows on the tensor units: the dense projections' GEMM, the attention
 /// and the experts' chain. A load has them on a GPU with tensor units, for the shapes they are written for (`chunkGeometry`).
@@ -82,7 +82,7 @@ pub const Model = struct {
     prefill_rows: u32,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Options) !*Model {
-        if (!st.validPrefillRows(opts.prefill_rows)) return error.InvalidInkling2PrefillRows;
+        if (opts.prefill_rows) |rows| if (!st.validPrefillRows(rows)) return error.InvalidInkling2PrefillRows;
         // INKLING_PROMPT_PATH, read once: names a path to compare or to test the fallbacks with; unset it asks nothing
         const request = st.parsePromptPath(if (std.c.getenv("INKLING_PROMPT_PATH")) |v| std.mem.span(v) else null) catch {
             std.log.err("inkling2: INKLING_PROMPT_PATH is not a prompt path: give per_op, rows, rows:LAYER,LAYER or auto", .{});
@@ -93,7 +93,6 @@ pub const Model = struct {
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.gpa = gpa;
-        m.prefill_rows = opts.prefill_rows;
         m.warm_wait = if (std.c.getenv("INKLING_WARM_WAIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.first_chunk = if (std.c.getenv("INKLING_FIRST_CHUNK")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4 else 4;
         const cpath = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -123,6 +122,7 @@ pub const Model = struct {
             std.log.info("inkling2: prompt chunks run on the per-operation kernels: {s}", .{r});
         } else m.chunk = try Chunk.init(m.device, gpa);
         errdefer if (m.chunk) |*chunk| chunk.deinit();
+        m.prefill_rows = opts.prefill_rows orelse st.defaultPrefillRows(if (m.chunk == null) .per_op else .chunk);
         m.checkpoint = ck.Checkpoint.init(gpa);
         errdefer m.checkpoint.deinit();
         var p = if (m.layers == 0) pack.Pack{ .arena = std.heap.ArenaAllocator.init(gpa), .layers = &.{} } else try pack.Pack.read(gpa, io, dir, t.layers, t.experts);
@@ -137,7 +137,7 @@ pub const Model = struct {
         if (m.chunk != null) {
             var per_row: usize = 0;
             for (m.weights.layers) |l| per_row += @intFromBool(!l.xd_ok);
-            if (per_row > 0) std.log.info("inkling2: prompt chunks take the per-row expert projections on {d} of {d} layers: {s}", .{ per_row, m.layers, if (request.rows != 0) "INKLING_PROMPT_PATH asks for them" else "their experts are not all K2 or K3, which the tensor-unit chain needs" });
+            if (per_row > 0) std.log.info("inkling2: prompt chunks take the per-row expert projections on {d} of {d} layers: {s}", .{ per_row, m.layers, if (request.rows != 0) "INKLING_PROMPT_PATH asks for them, for decode windows too" else "their experts are not all K2 or K3, which the tensor-unit chain needs" });
         }
         {
             const lib = try mtl.Library.fromSource(m.device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });

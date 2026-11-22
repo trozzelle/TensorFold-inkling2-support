@@ -67,7 +67,8 @@ checks that each row's result is independent of the rows beside it, and that a N
   prints the median wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw), with a digest
   of the last hidden rows to compare two configurations bit for bit. `tf-inkling-kernels time` times the fused norm
   kernels at the block and query counts of the real layers.
-- `INKLING_PREFILL_ROWS` sets the rows of a prompt chunk at most (a multiple of 64 from 64 to 8,192; default 4,096). The
+- `INKLING_PREFILL_ROWS` sets the rows of a prompt chunk at most (a multiple of 64 from 64 to 8,192; default 4,096, or 512 on the
+  per-operation path below). The
   scratch is made for that many rows, so a larger chunk takes more of the load limit (2.67 GiB at 4,096 rows, 0.37 GiB at
   512, for the published pack), and a prompt is fed in pieces of that many. Every path below keeps a row's bits
   independent of the chunk it is in.
@@ -80,8 +81,8 @@ checks that each row's result is independent of the rows beside it, and that a N
   rows, 0.60 GiB at 512).
 - A GPU without tensor units takes the per-operation prompt path of the first release: matvec slabs, a relative-bias table
   and one-row attention, and the per-row expert projections. It runs at that path's speed (about 65-71 tok/s on an M5
-  Ultra) and with its scratch (4.0 GiB at 4,096 rows, 0.57 GiB at 512, so `INKLING_PREFILL_ROWS=512` is worth setting
-  there). The startup log names the path and its scratch.
+  Ultra) and with its scratch. Unless `INKLING_PREFILL_ROWS` is set it takes the first release's 512-row chunks (0.57 GiB
+  of scratch; 4.0 GiB at 4,096 rows). The startup log names the path, its rows and its scratch.
 - `INKLING_PROMPT_PATH` is a diagnostic: `per_op` runs prompt chunks on the per-operation kernels whatever the GPU, to
   compare the paths or to test that fallback; `rows` (every layer) or `rows:3,7` (those layers) sends layers' experts
   through the per-row projections, in decode windows too, as if the chain could not take them. Unset or `auto` takes what

@@ -35,10 +35,10 @@ pub fn held(model: *const Model, head: u64) !u64 {
     return model.checkpoint.residentBytes() + try st.scratchBytes(&model.config.text, 0, model.chunking()) + head;
 }
 
-/// Bytes a context of `capacity` positions takes besides the weights: a stream's caches, and the scratch that grows with
-/// it (the split attention's partials, sized for a cache a position past the window).
+/// Bytes a context of `capacity` positions takes besides the weights: a stream's caches and the partials that grow with
+/// it, both for a cache a position past the window, as `backend.prefillFn` makes for a request filling the window.
 fn contextBytes(c: *const cfg.Text, layers: usize, capacity: usize) u64 {
-    return st.cacheBytes(c, capacity, layers) + st.partBytes(c, capacity + 1);
+    return st.cacheBytes(c, capacity + 1, layers) + st.partBytes(c, capacity + 1);
 }
 
 /// The longest context one stream's caches and the scratch that grows with it fit in `bytes`, at most `most`.
@@ -64,6 +64,8 @@ test "inkling2 budget: the longest context counts the partials that grow with it
     // it fits with its partials and one position more does not; the caches alone would have fit more
     try std.testing.expect(contextBytes(&c, layers, n) <= room);
     try std.testing.expect(contextBytes(&c, layers, n + 1) > room);
+    // a request that fills the window passes the backend's check
+    try std.testing.expect(st.cacheBytes(&c, n + 1, layers) <= room - st.partBytes(&c, n + 1));
     const caches_only = (room - layers * st.convBytes(&c) - @as(u64, c.vocab) * 2) / (layers * st.kvBytes(&c));
     try std.testing.expect(n < caches_only);
     try std.testing.expectEqual(@as(usize, 0), longest(&c, layers, 0, 1000));

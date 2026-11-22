@@ -35,4 +35,5 @@ test {
     _ = experts_prefill;
     _ = dense_prefill;
     _ = attention_prefill;
+    _ = forward;
 }
