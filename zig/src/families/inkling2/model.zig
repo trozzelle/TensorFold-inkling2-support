@@ -24,6 +24,39 @@ comptime {
     for (members, glue_names) |member, name| std.debug.assert(std.mem.eql(u8, "ik_" ++ member, name));
 }
 
+/// Decode-kernel changes selectable by `INKLING_DECODE_LEGACY` (a comma list read once at load; each named change falls
+/// back to the kernel it replaces) or overridden per forward through `forward.Out.legacy`.
+pub const Legacy = packed struct {
+    window_attention: bool = false,
+
+    pub const known = "window_attention";
+
+    pub fn parse(text: []const u8) !Legacy {
+        var out: Legacy = .{};
+        if (text.len == 0) return out;
+        var it = std.mem.splitScalar(u8, text, ',');
+        while (it.next()) |name| {
+            var matched = false;
+            inline for (@typeInfo(Legacy).@"struct".field_names) |fname| {
+                if (std.mem.eql(u8, name, fname)) {
+                    @field(out, fname) = true;
+                    matched = true;
+                }
+            }
+            if (!matched) return error.UnknownDecodeLegacyName;
+        }
+        return out;
+    }
+
+    pub fn with(base: Legacy, mask: Legacy, enable: bool) Legacy {
+        var out = base;
+        inline for (@typeInfo(Legacy).@"struct".field_names) |fname| {
+            if (@field(mask, fname)) @field(out, fname) = enable;
+        }
+        return out;
+    }
+};
+
 /// `layers`: load only the first layers (the per-layer checks on a Mac that cannot hold the model); 0 loads none, and no
 /// experts: the embedding, the final norm and the unembedding alone, enough to run the draft head over recorded taps.
 /// `drafts`: also load the DSpark draft head from the folder's mtp.safetensors, when the config has one and the file is there.
@@ -80,6 +113,8 @@ pub const Model = struct {
     first_chunk: u32,
     /// Rows of a prompt chunk at most (`Options.prefill_rows`): the load's scratch and budget are sized for them.
     prefill_rows: u32,
+    /// Decode-kernel changes held on their legacy kernels (`INKLING_DECODE_LEGACY`).
+    legacy: Legacy = .{},
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Options) !*Model {
         if (opts.prefill_rows) |rows| if (!st.validPrefillRows(rows)) return error.InvalidInkling2PrefillRows;
@@ -88,6 +123,10 @@ pub const Model = struct {
             std.log.err("inkling2: INKLING_PROMPT_PATH is not a prompt path: give per_op, rows, rows:LAYER,LAYER or auto", .{});
             return error.InvalidInkling2PromptPath;
         };
+        const legacy = Legacy.parse(if (std.c.getenv("INKLING_DECODE_LEGACY")) |v| std.mem.span(v) else "") catch {
+            std.log.err("inkling2: INKLING_DECODE_LEGACY has an unknown name; known: {s}", .{Legacy.known});
+            return error.UnknownDecodeLegacyName;
+        };
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const m = try gpa.create(Model);
@@ -95,6 +134,7 @@ pub const Model = struct {
         m.gpa = gpa;
         m.warm_wait = if (std.c.getenv("INKLING_WARM_WAIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.first_chunk = if (std.c.getenv("INKLING_FIRST_CHUNK")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4 else 4;
+        m.legacy = legacy;
         const cpath = try std.fs.path.join(gpa, &.{ dir, "config.json" });
         defer gpa.free(cpath);
         const json = try std.Io.Dir.cwd().readFileAlloc(io, cpath, gpa, .limited(1 << 22));
@@ -205,4 +245,15 @@ fn chunkGeometry(t: *const cfg.Text) bool {
     return t.local.q == a.heads and t.local.kv == a.kv_heads and t.local.dim == a.dim and t.global.q == a.heads and
         t.global.kv == a.kv_heads and t.global.dim == a.dim and t.d_rel == a.rel_dims and t.window == a.extent and
         t.rel_extent == a.extent and t.hidden % 256 == 0 and (t.local.q * t.local.dim) % 256 == 0;
+}
+
+test "inkling2 model: Legacy.parse handles empty, known names and rejects unknown names" {
+    const empty = try Legacy.parse("");
+    try std.testing.expect(!empty.window_attention);
+    const wa = try Legacy.parse("window_attention");
+    try std.testing.expect(wa.window_attention);
+    const dup = try Legacy.parse("window_attention,window_attention");
+    try std.testing.expect(dup.window_attention);
+    try std.testing.expectError(error.UnknownDecodeLegacyName, Legacy.parse("nope"));
+    try std.testing.expectError(error.UnknownDecodeLegacyName, Legacy.parse("window_attention,nope"));
 }

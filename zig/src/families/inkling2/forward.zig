@@ -10,6 +10,7 @@ const st = @import("state.zig");
 const wts = @import("weights.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
+const Legacy = @import("model.zig").Legacy;
 const dense_prefill = @import("dense_prefill.zig");
 const attention = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
@@ -59,7 +60,7 @@ pub const Ablation = struct {
     now: ?counters.Class = null,
 };
 
-pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1, ablate: ?*Ablation = null };
+pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1, ablate: ?*Ablation = null, legacy: ?Legacy = null };
 /// `encode`, `gpu` and `buffers` (the command buffers used) add up over forwards, and `longest` is the longest single command
 /// buffer's GPU seconds so far; `committed`, `started`, `ended` and `woke` are the last forward's clocks in `seconds()`'s
 /// timebase: the host's first commit, the GPU's start of the first command buffer and end of the last, and the host's return from
@@ -165,6 +166,7 @@ const Enc = struct {
     tensor: bool = false,
     spans: ?*counters.Recorder = null,
     ablate: ?*Ablation = null,
+    legacy: Legacy = .{},
 
     /// The weights' resources, declared on the current encoder (a span's encoder rotation drops them).
     fn resources(x: Enc) void {
@@ -394,7 +396,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     var done: Committed = .{}; // the command buffers committed before `cb`, when the forward is in several
     var enc = cb.compute(.serial);
     var open = true; // `enc` is not yet ended
-    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans, .ablate = out.ablate };
+    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans, .ablate = out.ablate, .legacy = out.legacy orelse m.legacy };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
         enc.end();
         return err;
