@@ -257,7 +257,7 @@ pub fn gemm(e: mtl.ComputeEncoder, p: *const Pipes, which: Proj, l: Layer, s: Xp
     const first: usize = if (which == .w13) 0 else 2;
     for (0..2) |rate| {
         const list = first + rate;
-        e.setPipeline(p.gemm[@intFromEnum(which)][rate]);
+        e.setPipeline(p.gemm[@backingInt(which)][rate]);
         e.setValue(a, 0);
         bind(e, s.prep, 1);
         e.setBuffer(s.wins.buf, s.wins.off + list * winCap(s.rows) * @sizeOf(Win), 2);

@@ -50,4 +50,3 @@ test "inkling2 draft weights: alpha is the bf16 of a softmax over each fuse_weig
         }
     }
 }
-
