@@ -240,6 +240,9 @@ pub const inkling2_glue = @embedFile("core/bf16_matvec.metal") ++ @embedFile("in
 pub const inkling2_dspark = @embedFile("inkling2/dspark.metal");
 /// Inkling 2's dense prompt projections on gemm_nax's tensor-unit GEMM, bf16 or f32 rows out (nax.h inlined at load).
 pub const inkling2_gemm = gemm_nax ++ @embedFile("inkling2/gemm.metal");
+/// Inkling 2's prompt attention on the tensor units: a chunk's rows against the layer's cache, sink, relative bias and
+/// output gate (nax.h inlined at load), its own library.
+pub const inkling2_pattn = @embedFile("inkling2/pattn.metal");
 /// MiniMax-M3's indexer block scores on the tensor units (a prompt chunk's).
 pub const minimax_m3_index_nax = @embedFile("minimax_m3/index_nax.metal");
 /// Flint's glue at the reference's rounding points: embed, norms, q/k rotation, SwiGLU, residual and MoE adds.

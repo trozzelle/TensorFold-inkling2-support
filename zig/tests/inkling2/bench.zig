@@ -25,6 +25,8 @@ const usage =
     \\                                                              the decode chain on recorded rows, every pick weighing 1/8: bf16 files <out>.{gu,y,y_own,moe,moe_own}.bin
     \\                                                              (y: w2 per pick on act.bin, the input `experts` measures; y_own: on the chain's own act),
     \\                                                              and <out>.{proj_y_own,proj_moe_own}.bin: the projections' path on its own act
+    \\tf-inkling-bench pattn [rows]                                 the prompt attention at a chunk of <rows> (4096) rows on local and global layers, chunk starts 0 and <rows>:
+    \\                                                              the relative bias formed in the kernel against read from a table; ms a layer, scaled to 48 layers and two chunks
     \\
 ;
 
@@ -39,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "draft")) return draft(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "dense")) return dense(init, args[2..]);
     if ((args.len == 3 or args.len == 5) and std.mem.eql(u8, args[1], "dspark")) return @import("bench_dspark.zig").run(init, args);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "pattn")) return @import("bench_pattn.zig").run(init, args[2..]);
     if (args.len == 10 and std.mem.eql(u8, args[1], "experts")) return experts(init, args);
     if (args.len == 10 and std.mem.eql(u8, args[1], "xd-dump")) return xdDumpLeg(init, args);
     if (args.len >= 7 and std.mem.eql(u8, args[1], "xd")) return xdLeg(init, args);
