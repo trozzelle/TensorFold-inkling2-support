@@ -28,7 +28,7 @@ const usage =
     \\tf-inkling-run <model> ftaps <ids.json> <out.bin> [at [window]]   every row's serving taps: bf16 [T, 8, H], the inputs of layers
     \\                                                         5, 11, .. 41, then the finals. ids[..at] (default: all) go through in
     \\                                                         prompt chunks, the rest in decode windows of at most `window` rows (16)
-    \\tf-inkling-run <model> dspark <taps_dir> <seqs> <out_dir> [--depth d] [--bits 8|16]   the draft head over recorded taps (taps mode's files), from the
+    \\tf-inkling-run <model> dspark <taps_dir> <seqs> <out_dir> [--depth d] [--bits 8|16] [--from-back K]   the draft head over recorded taps (taps mode's files), from the
     \\                                                         embedding, the unembedding and mtp.safetensors alone: <seqs> is N, A..B (inclusive)
     \\                                                         or a comma list; per sequence out_dir gets seq-NNNNN.props.bin (int32 [T][7],
     \\                                                         -1 where no hold ran), seq-NNNNN.probs.bin (f32 [T][7]: each proposal's top-1
@@ -36,12 +36,15 @@ const usage =
     \\                                                         seq-NNNNN.logits.bin (bf16 [16][7][vocab]: the first 16
     \\                                                         holds' step logits after the softcap and the padded vocabulary's mask);
     \\                                                         --depth: drafts a hold makes (7 when not given); --bits: the draft layers' weights,
-    \\                                                         quantized to 8 bits at load (8 when not given) or bf16
+    \\                                                         quantized to 8 bits at load (8 when not given) or bf16; --from-back K: start absorbing
+    \\                                                         only the prompt's last K rows before the first hold
     \\tf-inkling-run <model> profile <layers> <pos> <rows> <steps> [repeat]   per-class GPU time of decode steps
     \\                                                         (the layers run repeat times a step, default 48/layers)
-    \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat]   decode steps each followed by the greedy draw: median
-    \\                                                         wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw)
-    \\tf-inkling-run <model> prefill <ids.json> [--chunk N] [--layers L] [--repeat R] [--spans] [--drafts]   the prompt in chunks of N rows through the serving
+    \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat] [--ablate CLASS=stub|skip]...   decode steps each followed by the greedy draw: median
+    \\                                                         wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw);
+    \\                                                         --ablate swaps a class's kernels for an empty kernel (stub) or drops them (skip) for
+    \\                                                         timing only (h_digest is not comparable under --ablate)
+    \\tf-inkling-run <model> prefill <ids.json> [--chunk N] [--layers L] [--repeat R] [--spans] [--drafts] [--cuts N,N,...]   the prompt in chunks of N rows through the serving
     \\                                                         prompt path: one JSON line with prompt_ms, tok_s, the GPU ms by class (dense, norm,
     \\                                                         attention_prepare, attention, route, experts, activation, final, taps, absorb), the command
     \\                                                         buffers used and the longest one's GPU ms, and a digest of the last row's hidden state
@@ -51,7 +54,7 @@ const usage =
     \\                                                         --spans: also a line a chunk with its position, for attention's growth with it;
     \\                                                         --drafts: as served with the draft head (INKLING_DRAFT_* as greedy --drafts reads them):
     \\                                                         every chunk taps its rows and runs the final stage on all of them, and the head absorbs
-    \\                                                         the prompt's rows but the last
+    \\                                                         the prompt's rows but the last; --cuts N,N,...: feed initial chunks of those lengths first
     \\tf-inkling-run <model> partition <ids.json> <cut>... [--layers L] [--drafts]   the prompt twice through the serving prompt path: in chunks of
     \\                                                         the prefill rows, and in chunks of the lengths given (the cuts, then the prefill rows for
     \\                                                         the rest), each leg with its scratch and its cache poisoned with NaN past the rows in use,
@@ -546,17 +549,43 @@ fn median(v: []f64) f64 {
     return v[v.len / 2];
 }
 
+fn parseAblate(spec: []const u8, ab: *ik.forward.Ablation) !void {
+    const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return error.BadAblateSpec;
+    const cls = std.meta.stringToEnum(ik.forward.counters.Class, spec[0..eq]) orelse return error.UnknownAblateClass;
+    const mode_str = spec[eq + 1 ..];
+    const mode: ik.forward.Ablation.Mode = if (std.mem.eql(u8, mode_str, "stub")) .stub else if (std.mem.eql(u8, mode_str, "skip")) .skip else return error.BadAblateMode;
+    ab.mode[@backingInt(cls)] = mode;
+}
+
 /// Plain decode steps of `rows` rows at `pos` through the first `layers` layers (each step's layers repeated `repeat`
 /// times), the greedy draw after each as the serving path takes it: the median over the steps after the warm-up of a
 /// step's wall time and of its parts, host entry to commit, commit to the GPU's start, the GPU's run, its end to the
 /// host's wake-up, and the rest to the draw's end. A partial model draws from a row of noise.
 fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (args.len < 7 or args.len > 8) return error.ExpectedLayersPosRowsSteps;
+    if (args.len < 7) return error.ExpectedLayersPosRowsSteps;
     const L = try std.fmt.parseInt(u32, args[3], 10);
     const pos = try std.fmt.parseInt(usize, args[4], 10);
     const rows = try std.fmt.parseInt(usize, args[5], 10);
     const steps = try std.fmt.parseInt(usize, args[6], 10);
-    const repeat: u32 = if (args.len > 7) try std.fmt.parseInt(u32, args[7], 10) else @max(1, 48 / L);
+    var repeat: u32 = @max(1, 48 / L);
+    var ablate: ik.forward.Ablation = .{};
+    var has_ablate = false;
+    var ablate_specs: std.ArrayList([]const u8) = .empty;
+    defer ablate_specs.deinit(init.gpa);
+    var ai: usize = 7;
+    if (ai < args.len and !std.mem.startsWith(u8, args[ai], "--")) {
+        repeat = try std.fmt.parseInt(u32, args[ai], 10);
+        ai += 1;
+    }
+    while (ai < args.len) : (ai += 1) {
+        if (std.mem.eql(u8, args[ai], "--ablate")) {
+            ai += 1;
+            if (ai == args.len) return error.ExpectedAValueAfterTheOption;
+            try parseAblate(args[ai], &ablate);
+            try ablate_specs.append(init.gpa, args[ai]);
+            has_ablate = true;
+        } else return error.UnknownWallOption;
+    }
     if (L == 0 or rows == 0 or rows > ik.state.window_rows or repeat == 0) return error.ExpectedPositiveLayersRowsRepeat;
     if (steps <= profile_warmup) return error.StepsMustExceedWarmup;
     const m = try ik.Model.load(init.gpa, init.io, args[1], try options(L));
@@ -581,7 +610,7 @@ fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
     for (0..steps) |step| {
         var tm: ik.forward.Timing = .{};
         const t0 = ik.forward.seconds();
-        try ik.forward.run(m, &s, &cache, zeros[0..rows], .{ .logits = if (full) .last else .none, .timing = &tm, .repeat = repeat });
+        try ik.forward.run(m, &s, &cache, zeros[0..rows], .{ .logits = if (full) .last else .none, .timing = &tm, .repeat = repeat, .ablate = if (has_ablate) &ablate else null });
         const pick = ik.greedy.argmax(s.logits.slice(u16, c.vocab));
         const t1 = ik.forward.seconds();
         std.mem.doNotOptimizeAway(pick);
@@ -601,7 +630,9 @@ fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const tenth = samples[0].len / 10;
     // the last step's hidden rows, so two configurations of the same steps can be compared bit for bit
     const digest = std.hash.Wyhash.hash(0, s.h.slice(u8, rows * c.hidden * 2));
-    std.debug.print(", \"wall_mean_ms\": {d:.3}, \"wall_min_ms\": {d:.3}, \"wall_p10_ms\": {d:.3}, \"gpu_min_ms\": {d:.3}, \"gpu_p10_ms\": {d:.3}, \"tok_s\": {d:.2}, \"h_digest\": \"{x}\"}}\n", .{ mean, samples[0][0], samples[0][tenth], samples[3][0], samples[3][tenth], 1e3 / med[0], digest });
+    std.debug.print(", \"wall_mean_ms\": {d:.3}, \"wall_min_ms\": {d:.3}, \"wall_p10_ms\": {d:.3}, \"gpu_min_ms\": {d:.3}, \"gpu_p10_ms\": {d:.3}, \"tok_s\": {d:.2}, \"h_digest\": \"{x}\", \"ablate\": [", .{ mean, samples[0][0], samples[0][tenth], samples[3][0], samples[3][tenth], 1e3 / med[0], digest });
+    for (ablate_specs.items, 0..) |sp, i| std.debug.print("{s}\"{s}\"", .{ if (i == 0) "" else ", ", sp });
+    std.debug.print("]}}\n", .{});
 }
 
 const prefill_classes = [_]ik.forward.counters.Class{ .dense, .norm, .attention_prepare, .attention, .route, .experts, .activation, .final, .taps, .absorb };
@@ -616,7 +647,7 @@ fn printClasses(secs: *const [class_count]f64) void {
 }
 
 /// What `prefill` takes after the ids file.
-const PrefillArgs = struct { chunk: ?u32 = null, layers: ?u32 = null, repeat: u32 = 1, spans: bool = false, drafts: bool = false };
+const PrefillArgs = struct { chunk: ?u32 = null, layers: ?u32 = null, repeat: u32 = 1, spans: bool = false, drafts: bool = false, cuts: []const u32 = &.{} };
 
 fn optionValue(args: []const [:0]const u8, at: *usize) !u32 {
     at.* += 1;
@@ -624,8 +655,10 @@ fn optionValue(args: []const [:0]const u8, at: *usize) !u32 {
     return std.fmt.parseInt(u32, args[at.*], 10);
 }
 
-fn prefillArgs(args: []const [:0]const u8) !PrefillArgs {
+fn prefillArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !PrefillArgs {
     var p: PrefillArgs = .{};
+    var cuts: std.ArrayList(u32) = .empty;
+    errdefer cuts.deinit(gpa);
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--spans")) {
@@ -638,10 +671,21 @@ fn prefillArgs(args: []const [:0]const u8) !PrefillArgs {
             p.layers = try optionValue(args, &i);
         } else if (std.mem.eql(u8, args[i], "--repeat")) {
             p.repeat = try optionValue(args, &i);
+        } else if (std.mem.eql(u8, args[i], "--cuts")) {
+            i += 1;
+            if (i == args.len) return error.ExpectedAValueAfterTheOption;
+            var it = std.mem.tokenizeScalar(u8, args[i], ',');
+            while (it.next()) |tok| {
+                const v = try std.fmt.parseInt(u32, tok, 10);
+                if (v == 0) return error.ExpectedPositiveCut;
+                try cuts.append(gpa, v);
+            }
+            if (cuts.items.len == 0) return error.ExpectedPositiveCut;
         } else return error.UnknownPrefillOption;
     }
     if (p.layers == 0 or p.repeat == 0) return error.ExpectedPositiveLayersRepeat;
     if (p.drafts and (p.layers != null or p.repeat != 1)) return error.DraftsNeedTheWholeModel;
+    p.cuts = try cuts.toOwnedSlice(gpa);
     return p;
 }
 
@@ -662,12 +706,13 @@ fn partitionMode(init: std.process.Init, args: []const [:0]const u8) !void {
 /// command buffers' GPU time). A 16-row window runs first, as the server's warm-up does.
 fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len < 4) return error.ExpectedIds;
-    const opt = try prefillArgs(args[4..]);
+    const gpa = init.gpa;
+    const opt = try prefillArgs(gpa, args[4..]);
+    defer gpa.free(opt.cuts);
     const ids = try readIds(init, args[3]);
     defer ids.deinit();
     const T = ids.value.len;
     if (T == 0) return error.ExpectedAPrompt;
-    const gpa = init.gpa;
     const draft: ?settings.Draft = if (opt.drafts) try settings.draft() else null;
     var load = try chunkOptions(opt.layers, opt.chunk);
     load.drafts = opt.drafts;
@@ -704,7 +749,9 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     var chunk: usize = 0;
     const t0 = now();
     while (at < T) : (chunk += 1) {
-        const n = @min(T - at, m.prefill_rows);
+        const want: usize = if (chunk < opt.cuts.len) opt.cuts[chunk] else m.prefill_rows;
+        if (want > m.prefill_rows) return error.CutExceedsPrefillRows;
+        const n = @min(T - at, want);
         var tm: ik.forward.Timing = .{};
         try ik.forward.run(m, &s, &cache, ids.value[at..][0..n], .{ .logits = if (at + n == T and full) .last else .none, .prompt = true, .feature_taps = taps, .timing = &tm, .spans = &rec, .repeat = opt.repeat });
         _ = try rec.readAfterCompletion();
