@@ -39,8 +39,8 @@ pub const Layer = struct {
     bias: Tensor,
     w13: exl3.Experts,
     w2: exl3.Experts,
-    /// Whether every expert of w13 and w2 can take the decode chain (`xdOk`); otherwise the decode path keeps
-    /// `exl3.encodeIndexed` for the experts.
+    /// Whether every expert of w13 and w2 can take the decode chain and the prompt chunk's chain (`xdOk`: K2 or K3 experts, in the
+    /// layout both chains address); otherwise the layer's experts take `exl3.encodeIndexed` in a decode window and in a prompt chunk.
     xd_ok: bool,
 };
 

@@ -60,6 +60,7 @@ const usage =
     \\                                                         row's finals and logits and, with --drafts, the first hold's proposals. Exits non-zero
     \\                                                         on a difference or a NaN in either leg's results
     \\INKLING_PREFILL_ROWS: the prefill rows, the rows of a prompt chunk at most, as the server reads it: a multiple of 64 from 64 to 8192, 4096 when unset
+    \\INKLING_PROMPT_PATH: the path prompt chunks take, read by every mode that loads a model: per_op (the per-operation kernels, as on a GPU without tensor units), rows or rows:3,7 (the per-row expert projections on every layer or on those layers, as for experts the tensor-unit chain cannot take), auto or unset (what the GPU and the pack allow)
     \\
 ;
 
@@ -185,7 +186,7 @@ fn layersMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const capacity = n + 1;
     var cache = try ik.state.Cache.init(m.device, c, capacity, L);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c, capacity, m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
     const out = try init.gpa.alloc(u16, @as(usize, L) * n * c.hidden);
     defer init.gpa.free(out);
@@ -224,7 +225,7 @@ fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const capacity = longest + 1;
     var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c, capacity, m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
     const finals = try init.gpa.alloc(u16, longest * c.hidden);
     defer init.gpa.free(finals);
@@ -259,7 +260,7 @@ fn exactMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const full = m.layers == c.layers;
     const cont = all.len - at;
     const capacity = all.len + 1;
-    var s = try ik.state.Scratch.init(m.device, c, capacity, m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
     var outs: [2][]u16 = undefined;
     for (&outs) |*o| o.* = try init.gpa.alloc(u16, cont * H * 2);
@@ -311,7 +312,7 @@ fn greedyMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const capacity = ids.value.len + steps + 1;
     var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c, capacity, m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
     var t0 = now();
     try feed(m, &s, &cache, ids.value, null, true);
@@ -360,7 +361,7 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
         defer ids.deinit();
         longest = @max(longest, ids.value.len + steps);
     }
-    var s = try ik.state.Scratch.init(m.device, c, longest, m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, longest, m.chunking());
     defer s.deinit();
     const tp: ik.forward.Taps = .{
         .h = try m.device.buffer(ik.forward.tap_layers.len * R * H * 2, mtl.ResourceOptions.shared),
@@ -455,7 +456,7 @@ fn ftapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     const c = &m.config.text;
     const row: usize = ik.state.feature_taps * @as(usize, c.hidden);
-    var s = try ik.state.Scratch.init(m.device, c, T + 1, m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, T + 1, m.chunking());
     defer s.deinit();
     var cache = try ik.state.Cache.init(m.device, c, T + 1, c.layers);
     defer cache.deinit();
@@ -498,7 +499,7 @@ fn profileMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const capacity = pos + rows * steps + 1;
     var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c, capacity, m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
     const zeros = try init.gpa.alloc(u32, @max(pos, rows));
     defer init.gpa.free(zeros);
@@ -565,7 +566,7 @@ fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const capacity = pos + rows * steps + 1;
     var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c, capacity, m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
     const zeros = try init.gpa.alloc(u32, @max(pos, rows));
     defer init.gpa.free(zeros);
@@ -668,18 +669,16 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     if (T == 0) return error.ExpectedAPrompt;
     const gpa = init.gpa;
     const draft: ?settings.Draft = if (opt.drafts) try settings.draft() else null;
-    const m = try ik.Model.load(gpa, init.io, args[1], .{
-        .layers = opt.layers,
-        .drafts = opt.drafts,
-        .draft_bits = if (draft) |d| d.bits else .default,
-        .prefill_rows = opt.chunk orelse try settings.prefillRows(),
-    });
+    var load = try chunkOptions(opt.layers, opt.chunk);
+    load.drafts = opt.drafts;
+    load.draft_bits = if (draft) |d| d.bits else .default;
+    const m = try ik.Model.load(gpa, init.io, args[1], load);
     defer m.deinit();
     const c = &m.config.text;
     const full = m.layers == c.layers;
     var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers);
     defer cache.deinit();
-    var s = try ik.state.Scratch.init(m.device, c, @max(T + 1, ik.state.window_rows), m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, @max(T + 1, ik.state.window_rows), m.chunking());
     defer s.deinit();
     const absorber: ?Absorber = if (draft) |d| try Absorber.init(gpa, m, d, ids.value) else null;
     defer if (absorber) |a| a.deinit();
@@ -741,12 +740,12 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     // the last row's hidden state after the last layer: a row's bits do not depend on the chunk it was fed in
     const row_bytes = @as(usize, c.hidden) * 2;
     const digest = std.hash.Wyhash.hash(0, s.h.slice(u8, last * row_bytes)[(last - 1) * row_bytes ..][0..row_bytes]);
-    std.debug.print("{{\"prompt_tokens\": {d}, \"chunk\": {d}, \"layers\": {d}, \"repeat\": {d}, \"drafts\": {}, \"prompt_ms\": {d:.1}, \"tok_s\": {d:.2}, \"gpu_ms\": {d:.1}, \"encode_ms\": {d:.1}, \"buffers\": {d}, \"max_buffer_ms\": {d:.1}, \"h_digest\": \"{x}\", \"classes\": ", .{ T, m.prefill_rows, m.layers, opt.repeat, opt.drafts, prompt_s * 1e3, @as(f64, @floatFromInt(T)) / prompt_s, gpu * 1e3, encode * 1e3, buffers, longest * 1e3, digest });
-    printClasses(&totals);
-    std.debug.print("}}\n", .{});
     // the command buffers run one after another: their GPU times cannot add up to more than the prompt's wall time
     if (gpu > prompt_s * 1.02) {
         std.debug.print("the GPU time ({d:.1} ms) exceeds the prompt's wall time ({d:.1} ms): a command buffer's timestamps are wrong\n", .{ gpu * 1e3, prompt_s * 1e3 });
         return error.GpuTimeExceedsWallTime;
     }
+    std.debug.print("{{\"prompt_tokens\": {d}, \"chunk\": {d}, \"layers\": {d}, \"repeat\": {d}, \"drafts\": {}, \"prompt_ms\": {d:.1}, \"tok_s\": {d:.2}, \"gpu_ms\": {d:.1}, \"encode_ms\": {d:.1}, \"buffers\": {d}, \"max_buffer_ms\": {d:.1}, \"h_digest\": \"{x}\", \"classes\": ", .{ T, m.prefill_rows, m.layers, opt.repeat, opt.drafts, prompt_s * 1e3, @as(f64, @floatFromInt(T)) / prompt_s, gpu * 1e3, encode * 1e3, buffers, longest * 1e3, digest });
+    printClasses(&totals);
+    std.debug.print("}}\n", .{});
 }

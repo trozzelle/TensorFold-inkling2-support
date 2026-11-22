@@ -416,7 +416,7 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
     const cut_chunks = try chunkLengths(gpa, T, opt.cuts, rows);
     defer gpa.free(cut_chunks);
     if (std.mem.eql(usize, default_chunks, cut_chunks)) return error.TheCutsGiveTheDefaultChunking;
-    var s = try ik.state.Scratch.init(m.device, c, @max(T + 1, ik.state.window_rows), m.prefill_rows);
+    var s = try ik.state.Scratch.init(m.device, c, @max(T + 1, ik.state.window_rows), m.chunking());
     defer s.deinit();
     // what the forward writes besides the cache, for the diagnosis: every layer's picks (and the tap layers' inputs, unread)
     const tp: ik.forward.Taps = .{
@@ -430,6 +430,6 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
     var b = try runLeg(gpa, m, &s, tp, ids, cut_chunks, draft);
     defer b.deinit(gpa);
     const differ = compare(m, &a, &b, T);
-    std.debug.print("{{\"partition\": \"{s}\", \"prompt_tokens\": {d}, \"layers\": {d}, \"prefill_rows\": {d}, \"default_chunks\": {d}, \"cut_chunks\": {d}, \"first_cuts\": {any}, \"differ\": {d}}}\n", .{ if (differ == 0) "identical" else "differs", T, m.layers, rows, default_chunks.len, cut_chunks.len, cut_chunks[0..@min(cut_chunks.len, 16)], differ });
+    std.debug.print("{{\"partition\": \"{s}\", \"prompt_tokens\": {d}, \"layers\": {d}, \"prompt_path\": \"{s}\", \"prefill_rows\": {d}, \"default_chunks\": {d}, \"cut_chunks\": {d}, \"first_cuts\": {any}, \"differ\": {d}}}\n", .{ if (differ == 0) "identical" else "differs", T, m.layers, @tagName(m.promptPath()), rows, default_chunks.len, cut_chunks.len, cut_chunks[0..@min(cut_chunks.len, 16)], differ });
     if (differ != 0) return error.PartitionDiffers;
 }

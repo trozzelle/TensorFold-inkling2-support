@@ -343,6 +343,10 @@ pub const Drafter = struct {
     /// The GPU seconds of the last hold's and the last settled absorb's command buffers.
     hold_gpu: f64 = 0,
     absorb_gpu: f64 = 0,
+    /// The host's clock at the last absorb's commit and the GPU's end of the last settled one: floors for a command
+    /// buffer Metal reports no start for.
+    absorbed_at: f64 = 0,
+    absorb_end: f64 = 0,
     /// The GPU seconds a hold is expected to take (0: none yet), for the wait: the target's rule (forward.zig's `waitWarm`), a
     /// shorter hold believed at once and a longer one by a quarter.
     expected: f64 = 0,
@@ -691,7 +695,8 @@ pub const Drafter = struct {
         defer cb.release();
         cb.wait();
         if (cb.failure()) |msg| return failed(msg);
-        d.absorb_gpu = cb.gpuSeconds();
+        d.absorb_end = cb.gpuEnd();
+        d.absorb_gpu = d.absorb_end - cb.gpuStartOr(d.absorbed_at);
     }
 
     /// Rows [start, start + rows) replace the context from `start`; the rows of a prompt before its last window are skipped. The
@@ -735,6 +740,7 @@ pub const Drafter = struct {
         }
         const one = cb orelse return;
         enc.end();
+        d.absorbed_at = fwd.seconds();
         one.commit();
         d.pending = one.retain();
     }
@@ -774,7 +780,9 @@ pub const Drafter = struct {
             return err;
         };
         if (cb.failure()) |msg| return failed(msg);
-        d.hold_gpu = cb.gpuSeconds();
+        // a hold queued behind an absorb starts no earlier than the absorb's end; without a reported start its span is
+        // counted from there (or from its commit), never from the clock's zero
+        d.hold_gpu = cb.gpuEnd() - cb.gpuStartOr(@max(committed, d.absorb_end));
         d.expected = if (d.expected == 0 or d.hold_gpu < d.expected) d.hold_gpu else d.expected + (d.hold_gpu - d.expected) / 4;
         d.hold_ms = (now() - began) / @as(f64, @floatFromInt(items.len));
         for (items) |it| {

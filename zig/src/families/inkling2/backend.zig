@@ -61,7 +61,7 @@ pub const Metal = struct {
         const out = try gpa.create(Metal);
         errdefer gpa.destroy(out);
         // a stream's cache holds one position past the context window; the warm-up window runs a window's rows at least
-        var scratch = try st.Scratch.init(model.device, &model.config.text, @max(options.capacity + 1, st.window_rows), model.prefill_rows);
+        var scratch = try st.Scratch.init(model.device, &model.config.text, @max(options.capacity + 1, st.window_rows), model.chunking());
         errdefer scratch.deinit();
         const tokens = try gpa.alloc(u32, ring);
         errdefer gpa.free(tokens);

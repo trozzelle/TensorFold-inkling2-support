@@ -1,6 +1,7 @@
-//! Inkling 2 rows through every layer at mlx-lm's rounding points; rows stay independent. A prompt chunk's layers go through the
-//! chunk path (tensor-unit GEMM, attention and experts' chain) in command buffers committed as they are encoded; a decode window of
-//! up to 16 rows takes the decode path.
+//! Inkling 2 rows through every layer at mlx-lm's rounding points; rows stay independent. A prompt chunk's layers go through a chunk
+//! path in command buffers committed as they are encoded: the tensor-unit GEMM, attention and experts' chain where the load has them,
+//! and for what lacks them (a GPU without tensor units, or experts the chain cannot take) the per-operation kernels; a decode window
+//! of up to 16 rows takes the decode path.
 const std = @import("std");
 const mtl = @import("metal");
 pub const counters = @import("../../core/gpu_counters.zig");
@@ -42,10 +43,11 @@ fn view(comptime V: type, v: B) V {
 /// What a forward writes besides the cache: finals, logits of the last row or every row, every layer's output.
 /// `feature_taps` is what the DSpark head reads: each row's eight taps, [n][8][hidden] bf16 at the buffer: the hidden
 /// states entering the `tap_layers` and the finals, which it forces on (a prompt chunk then runs the final stage too).
-/// `prompt` marks rows that feed a prompt: they always take the chunk path, whatever their count (the tensor-unit GEMM for every
-/// dense projection, the tiled attention and the experts' chain, so a row's bits do not depend on the rows or the chunk it is in);
+/// `prompt` marks rows that feed a prompt: they always take a chunk path, whatever their count: on the tensor units the GEMM for every
+/// dense projection, the tiled attention and the experts' chain (the per-row grouped projections for a layer the chain cannot take),
+/// and without tensor units the per-operation kernels; either way a row's bits do not depend on the rows or the chunk it is in;
 /// other forwards of at most `window_rows` rows take the decode path (fused norms, stacked attention-input matvec, split-K
-/// attention, the decode expert chain), and larger ones the chunk path.
+/// attention, the decode expert chain), and larger ones a chunk path.
 /// `spans` records each stage group's GPU time by class (the `profile` and `prefill` modes), across the forward's command buffers;
 /// `repeat` runs the loaded layers that many times in the one forward (profile only: the cache's position stays, so the repeats
 /// re-read the same rows).
@@ -55,10 +57,11 @@ pub const Out = struct { finals: bool = false, logits: enum { none, last, all } 
 /// timebase: the host's first commit, the GPU's start of the first command buffer and end of the last, and the host's return from
 /// the wait.
 pub const Timing = struct { encode: f64 = 0, gpu: f64 = 0, committed: f64 = 0, started: f64 = 0, ended: f64 = 0, woke: f64 = 0, buffers: u32 = 0, longest: f64 = 0 };
-/// Rows times layers one command buffer of the chunk path holds at most. A prompt row takes about 10 microseconds a layer on the
-/// chunk path (a 4,096-row layer 37 to 45 ms of GPU time on an M5 Ultra), so this is about 30 ms of GPU time. The GPU kills a
-/// command buffer that runs past its timeout (a kill at 15.6 s has been seen); a 4,096-row chunk through 48 layers in one command
-/// buffer would take about 2 s today, so the bound is slack, and holds if a layer takes longer (a shared GPU, a long cache).
+/// Rows times layers one command buffer of a chunk path holds at most. A prompt row takes about 10 microseconds a layer on the
+/// tensor units (a 4,096-row layer 37 to 45 ms of GPU time on an M5 Ultra) and about 0.3 ms on the per-operation kernels (8,202
+/// tokens through 48 layers in 126 s on that Mac), so this is about 30 ms or about a second of GPU time. The GPU kills a command
+/// buffer that runs past its timeout (a kill at 15.6 s has been seen), and a 4,096-row chunk through 48 layers on the per-operation
+/// kernels in one command buffer would take about a minute.
 const buffer_row_layers = 3072;
 /// Command buffers one forward uses at most: a queue holds 64 that are not yet complete, and creating one past that waits for
 /// another to finish.
@@ -150,6 +153,8 @@ const Enc = struct {
     n: usize,
     /// Whether this forward takes the decode path.
     decode: bool = false,
+    /// Whether this forward's rows run on the tensor-unit chunk kernels (the GEMM and the attention): a chunk, on a load that has them.
+    tensor: bool = false,
     spans: ?*counters.Recorder = null,
 
     /// The weights' resources, declared on the current encoder (a span's encoder rotation drops them).
@@ -195,17 +200,17 @@ const Enc = struct {
         matvec(x.e.*, x.m, d, in, out, rows);
     }
 
-    /// out = in W^T for `rows` rows of the bf16 [d.n, d.k] matrix `d`, bf16 out: the decode path's matvec slabs, or the chunk path's
-    /// tensor-unit GEMM (bf16 operands, f32 sums in an order that does not depend on the rows or the tile).
+    /// out = in W^T for `rows` rows of the bf16 [d.n, d.k] matrix `d`, bf16 out: the chunk kernels' tensor-unit GEMM (bf16 operands,
+    /// f32 sums in an order that does not depend on the rows or the tile), or the matvec slabs of the decode and per-operation paths.
     fn proj(x: Enc, d: wts.Dense, in: B, out: B, rows: usize) void {
-        if (x.decode) return x.mv(d, in, out, rows);
-        x.gemm(d, in, out, rows, .bf16);
+        if (x.tensor) return x.gemm(d, in, out, rows, .bf16);
+        x.mv(d, in, out, rows);
     }
 
-    /// The chunk path's GEMM into rows of `d.n` values of `kind` (the router's logits are f32).
+    /// The tensor-unit GEMM into rows of `d.n` values of `kind` (the router's logits are f32).
     fn gemm(x: Enc, d: wts.Dense, in: B, out: B, rows: usize, kind: dense_prefill.Out) void {
-        std.debug.assert(!x.decode);
-        dense_prefill.gemmRows(x.e.*, &x.m.chunk.dense, view(dense_prefill.Mat, in), .{ .buf = d.t.buffer, .off = d.t.offset, .n = d.n, .k = d.k }, view(dense_prefill.Mat, out), kind, rows, d.n);
+        std.debug.assert(x.tensor);
+        dense_prefill.gemmRows(x.e.*, &x.m.chunk.?.dense, view(dense_prefill.Mat, in), .{ .buf = d.t.buffer, .off = d.t.offset, .n = d.n, .k = d.k }, view(dense_prefill.Mat, out), kind, rows, d.n);
     }
 
     /// Up to `max_segs` matvecs over the same k in one dispatch (at most `window_rows` rows). The segment table lives
@@ -303,13 +308,14 @@ const Enc = struct {
 
     /// The layer's routed experts for the chunk's rows through the tensor-unit chain (experts_prefill.zig): the picks sorted by
     /// expert, w13, the capped SwiGLU, w2 and the weighted sum, from s.xm with the picks and weights in s.eids and s.ew into
-    /// s.moe, in the scratch's stage. The chain needs the encoder to be serial and the layer's trellis, scales and descriptor
-    /// tables declared on it (`resources`), and every expert of both tables K2 or K3 (`run` checks `Model.chunkReady`).
+    /// s.moe, in the scratch's stage. The chain needs the encoder to be serial, the layer's trellis, scales and descriptor
+    /// tables declared on it (`resources`), and every expert of both tables K2 or K3 (the layer's `xd_ok`).
     fn xp(x: Enc, l: *const wts.Layer) void {
         const c = &x.m.config.text;
         const s = x.s;
         const e = experts_prefill;
-        e.encode(x.e.*, &x.m.chunk.experts, .{ .w13 = l.w13, .w2 = l.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
+        std.debug.assert(x.tensor and l.xd_ok);
+        e.encode(x.e.*, &x.m.chunk.?.experts, .{ .w13 = l.w13, .w2 = l.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
     }
 };
 
@@ -326,8 +332,8 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     // the decode path's split attention keeps one partial for each 256-key block of the cache so far
     if (decode and cache.len + n > s.capacity) return error.Inkling2ScratchShort;
     if ((out.finals or out.feature_taps != null or out.logits != .none) and m.layers != c.layers) return error.Inkling2PartialModel;
-    // every row of a chunk runs the experts' tensor-unit chain, which takes K2 and K3 experts only
-    if (!decode and !m.chunkReady()) return error.Inkling2ChunkNeedsK2K3Experts;
+    // a chunk takes the path the model does, and the scratch's buffers are made for it
+    if (!decode and s.path != m.promptPath()) return error.Inkling2ScratchForAnotherPromptPath;
     for (ids) |id| if (id >= c.vocab) return error.InvalidInkling2Token;
     @memcpy(s.ids.slice(u32, n), ids);
     const pool = mtl.objc.Pool.push();
@@ -337,7 +343,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     var done: Committed = .{}; // the command buffers committed before `cb`, when the forward is in several
     var enc = cb.compute(.serial);
     var open = true; // `enc` is not yet ended
-    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .spans = out.spans };
+    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
         enc.end();
         return err;
@@ -500,9 +506,11 @@ fn layer(x: Enc, i: u32) !void {
     } else x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
     if (w.attn_query) |q| {
         if (!x.decode) {
-            // the depth mix of the attention input lives at the front of the stage, which the attention and the experts use after it
-            x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(q), b(s.stage) }, .{ n, 1, 1 }, one, true);
-            for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .flags = f32_in, .eps = c.eps }, &.{ bo(s.stage, j * H * 4), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
+            // the depth mix of the attention input: at the front of the stage on the chunk kernels (the attention and the experts use it
+            // after the norms have read it), a buffer of its own on the per-operation path
+            const mix = if (x.tensor) s.stage else s.ai;
+            x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(q), b(mix) }, .{ n, 1, 1 }, one, true);
+            for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .flags = f32_in, .eps = c.eps }, &.{ bo(mix, j * H * 4), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
         }
     } else for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .eps = c.eps }, &.{ b(s.h), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
     try x.end();
@@ -510,12 +518,12 @@ fn layer(x: Enc, i: u32) !void {
     if (x.decode) {
         x.mvs(i, &.{ .{ .x = xq, .w = w.q, .y = b(s.q) }, .{ .x = xk, .w = w.k, .y = b(s.k) }, .{ .x = xv, .w = w.v, .y = b(s.v) }, .{ .x = xq, .w = w.r, .y = b(s.r) }, .{ .x = xq, .w = w.gate, .y = b(s.gate) }, .{ .x = xq, .w = w.sink, .y = b(s.sink) } }, n);
     } else {
-        x.gemm(w.q, xq, b(s.q), n, .bf16);
-        x.gemm(w.k, xk, b(s.k), n, .bf16);
-        x.gemm(w.v, xv, b(s.v), n, .bf16);
-        x.gemm(w.r, xq, b(s.r), n, .bf16);
-        x.gemm(w.gate, xq, b(s.gate), n, .bf16);
-        x.gemm(w.sink, xq, b(s.sink), n, .bf16);
+        x.proj(w.q, xq, b(s.q), n);
+        x.proj(w.k, xk, b(s.k), n);
+        x.proj(w.v, xv, b(s.v), n);
+        x.proj(w.r, xq, b(s.r), n);
+        x.proj(w.gate, xq, b(s.gate), n);
+        x.proj(w.sink, xq, b(s.sink), n);
     }
     try x.end();
     try x.conv(w.k_conv, b(s.k), xk, b(s.kc), i, 0, kvw, hd.kv);
@@ -524,8 +532,9 @@ fn layer(x: Enc, i: u32) !void {
     const values = bo(cache.kv, cache.values(i));
     try x.begin(.attention_prepare);
     x.glue(.prep, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .flags = if (glob) global else 0, .eps = c.eps, .cap = c.qk_clip, .thr = c.rel_clip, .alpha = c.log_alpha, .floor_n = @floatFromInt(c.log_floor) }, &.{ b(s.q), b(s.kc), b(s.vc), b(s.r), t(w.q_scale), t(w.rel_scale), b(s.qn), keys, values, b(s.reln) }, .{ 2 * hd.q + 2 * hd.kv, n, 1 }, .{ 32, 1, 1 }, true);
-    // both attentions form the relative bias themselves from reln and the projection: the decode one inside its kernel, the chunk's
-    // in a table built before it
+    // the decode path's attention forms the relative bias itself from reln and the projection, and so do the chunk kernels (as a table
+    // built right before the attention reads it); the per-operation path builds the table here
+    if (!x.decode and !x.tensor) x.glue(.relbias, .{ .rows = nr, .heads = hd.q, .extent = p.extent, .dim = c.d_rel }, &.{ b(s.reln), t(w.rel_proj), b(s.pb) }, .{ p.extent, hd.q, n }, .{ 256, 1, 1 }, false);
     try x.end();
     try x.begin(.attention);
     const window: u32 = if (glob) 0 else c.window;
@@ -540,11 +549,14 @@ fn layer(x: Enc, i: u32) !void {
         const a: Args = .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .blocks = blocks, .queries = f0, .scale = scale };
         x.glue(.attn_part, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, n, blocks }, part_group, true);
         x.glue(.attn_merge, a, &.{ b(s.part), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
-    } else {
+    } else if (x.tensor) {
         // the table of the chunk's relative biases is built in the stage and read by the tiled attention, 32 query rows of a head
         // a threadgroup; every view is at the chunk's first row
         const io: attention.Io = .{ .q = view(attention.B, b(s.qn)), .k = view(attention.B, keys), .v = view(attention.B, values), .sink = view(attention.B, b(s.sink)), .gate = view(attention.B, b(s.gate)), .out = view(attention.B, b(s.att)) };
-        attention.encodeChunk(x.e.*, &m.chunk.attention, .{ .rows = nr, .p0 = pos, .global = @intFromBool(glob) }, io, view(attention.B, b(s.reln)), view(attention.B, t(w.rel_proj)), view(attention.B, b(s.stage)), s.prefill_rows);
+        attention.encodeChunk(x.e.*, &m.chunk.?.attention, .{ .rows = nr, .p0 = pos, .global = @intFromBool(glob) }, io, view(attention.B, b(s.reln)), view(attention.B, t(w.rel_proj)), view(attention.B, b(s.stage)), s.prefill_rows);
+    } else {
+        // one simdgroup a (head, row) over the keys one by one, reading the table the per-operation path built
+        x.glue(.attn, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .scale = scale }, &.{ b(s.qn), keys, values, b(s.pb), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
     }
     try x.end();
     try x.begin(.dense);
@@ -562,23 +574,22 @@ fn layer(x: Enc, i: u32) !void {
     }
     try x.end();
     try x.begin(.route);
-    if (x.decode) {
-        x.glue(.router, .{ .rows = nr, .width = c.experts, .dim = c.hidden }, &.{ b(s.xm), t(w.router.t), b(s.logits32) }, .{ (c.experts + 7) / 8, n, 1 }, .{ 256, 1, 1 }, true);
-    } else x.gemm(w.router, b(s.xm), b(s.logits32), n, .f32);
+    if (x.tensor) {
+        x.gemm(w.router, b(s.xm), b(s.logits32), n, .f32);
+    } else x.glue(.router, .{ .rows = nr, .width = c.experts, .dim = c.hidden }, &.{ b(s.xm), t(w.router.t), b(s.logits32) }, .{ (c.experts + 7) / 8, n, 1 }, .{ 256, 1, 1 }, true);
     x.glue(.route, .{ .rows = nr, .width = c.experts, .eps = 1e-20, .scale = c.route_scale }, &.{ b(s.logits32), t(w.bias), b(s.eids), b(s.ew) }, .{ n * 32, 1, 1 }, .{ 32, 1, 1 }, false);
-    // the generic expert path is a decode window's: the decode chain reads the picks as routed, the chunk's chain sorts them itself,
-    // and only the grouped projections need them sorted into tiles
+    // a layer's experts take a chain when it can (the decode chain in a window, the tensor-unit chain in a chunk on the chunk kernels)
+    // and the per-row path (ik_tiles, the grouped projections, the SwiGLU and the combine) when it cannot or the chunk has no chain: the
+    // chains read the picks as routed and sort them themselves, and only the grouped projections need them sorted into tiles
     const slots = n * c.topk;
     const rows = st.tileRows(slots, c.experts);
-    const chain = x.decode and w.xd_ok;
-    if (x.decode and !chain) x.glue(.tiles, .{ .rows = @intCast(slots), .width = c.experts, .queries = c.topk, .stride = @intCast(rows) }, &.{ b(s.eids), b(s.texp), b(s.tslot), b(s.ttok) }, .{ 1, 1, 1 }, one, true);
+    const chain = w.xd_ok and (x.decode or x.tensor);
+    if (!chain) x.glue(.tiles, .{ .rows = @intCast(slots), .width = c.experts, .queries = c.topk, .stride = @intCast(rows) }, &.{ b(s.eids), b(s.texp), b(s.tslot), b(s.ttok) }, .{ 1, 1, 1 }, one, true);
     try x.end();
     const I: usize = c.expert_inter;
     try x.begin(.experts);
-    if (!x.decode) {
-        x.xp(w);
-    } else if (chain) {
-        x.xd(w, n);
+    if (chain) {
+        if (x.tensor) x.xp(w) else x.xd(w, n);
     } else {
         try x.experts(w.w13, b(s.xm), H, n, b(s.gu), slots, rows, s.ttok);
         x.glue(.swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.gu), b(s.act) }, .{ I, slots, 1 }, .{ 256, 1, 1 }, false);

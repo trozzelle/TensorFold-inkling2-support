@@ -30,6 +30,50 @@ pub fn parsePrefillRows(text: ?[]const u8) error{BadPrefillRows}!u32 {
     return if (validPrefillRows(n)) n else error.BadPrefillRows;
 }
 
+/// How a load runs the rows of a prompt chunk, which decides what its scratch holds.
+pub const PromptPath = enum {
+    /// On the tensor units: the GEMM and attention kernels, and the experts' chain on every layer.
+    chunk,
+    /// The same GEMM and attention, with the per-row grouped projections for the experts of a layer the chain does not take (the
+    /// chain takes K2 and K3 experts only): the scratch holds those projections' buffers for a whole chunk.
+    chunk_rows,
+    /// A GPU without tensor units: the per-operation kernels (matvec slabs, a relative-bias table and one-row attention, the
+    /// per-row grouped expert projections), with a depth-mix buffer and a table of their own.
+    per_op,
+};
+
+/// What a scratch is made for: the rows of a prompt chunk at most, and the path they take.
+pub const Chunking = struct { rows: usize, path: PromptPath = .chunk };
+
+/// What INKLING_PROMPT_PATH asks of a load, to compare the paths and to test the fallbacks on a GPU and a pack that need none:
+/// `per_op` runs prompt chunks on the per-operation kernels whatever the GPU; `rows` (every layer) or `rows:3,7` (those layers)
+/// sends layers' experts through the per-row grouped projections as if the chain could not take them. Blank and `auto` ask nothing.
+pub const PathRequest = struct {
+    per_op: bool = false,
+    /// Bit i: layer i's experts take the per-row projections.
+    rows: u128 = 0,
+};
+
+comptime {
+    std.debug.assert(cfg.max_layers <= 128);
+}
+
+pub fn parsePromptPath(text: ?[]const u8) error{BadPromptPath}!PathRequest {
+    const t = std.mem.trim(u8, text orelse "", " \t");
+    if (t.len == 0 or std.mem.eql(u8, t, "auto")) return .{};
+    if (std.mem.eql(u8, t, "per_op")) return .{ .per_op = true };
+    if (std.mem.eql(u8, t, "rows")) return .{ .rows = ~@as(u128, 0) };
+    if (!std.mem.startsWith(u8, t, "rows:")) return error.BadPromptPath;
+    var out: PathRequest = .{};
+    var it = std.mem.splitScalar(u8, t["rows:".len..], ',');
+    while (it.next()) |part| {
+        const layer = std.fmt.parseInt(u32, std.mem.trim(u8, part, " \t"), 10) catch return error.BadPromptPath;
+        if (layer >= cfg.max_layers) return error.BadPromptPath;
+        out.rows |= @as(u128, 1) << @intCast(layer);
+    }
+    return out;
+}
+
 /// Positions each convolution's input ring holds: three taps back plus a window's rows, so a rejected window rolls
 /// back by moving the cache length alone.
 pub const ring = 32;
@@ -151,17 +195,18 @@ pub fn partBytes(c: *const cfg.Text, capacity: usize) usize {
     return window_rows * @as(usize, c.local.q) * ((capacity + key_block - 1) / key_block) * part_slot * 4;
 }
 
-/// The buffers of a `Scratch`, by name. Each holds `prefill_rows` rows, but for the decode path's (a verify window's rows: `texp`,
-/// `tslot`, `ttok`, `gu`, `act`, `ey`, `exl3`, `logits`, `segs`, `planes`, `sums`, `ftaps`) and `part` (the context's): a prompt
-/// chunk's experts run in `stage` and read no decode buffer.
+/// The buffers of a `Scratch`, by name. Each holds `prefill_rows` rows, but for the decode path's (a verify window's rows: `logits`,
+/// `segs`, `planes`, `sums`, `ftaps`), `part` (the context's) and the per-row expert path's (`texp`, `tslot`, `ttok`, `gu`, `act`,
+/// `ey`, `exl3`), which hold a window's rows unless the load sends prompt chunks through that path (`PromptPath`).
 ///
-/// Buffers that share bytes, because their lifetimes within a prompt layer do not overlap (each is written in full before it is
-/// read, within the layer, and none carries a value into the next):
-/// - `stage`: the attention input's depth mix (f32 [rows][3][hidden], written by the depth kernel and read by the norms after it),
-///   the chunk attention's relative-bias table (written and read by the attention), and the experts' chain (`experts_prefill.Xp`:
-///   sort tables, window lists and planes, written and read by the experts). A layer runs them in that order, each finished
-///   before the next starts (one serial encoder), and each starts at the front of the buffer.
-pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums", "ftaps", "ptaps", "stage" };
+/// A chunk on the tensor units shares bytes between buffers whose lifetimes within a prompt layer do not overlap (each is written
+/// in full before it is read, within the layer, and none carries a value into the next): `stage` is the attention input's depth mix
+/// (f32 [rows][3][hidden], written by the depth kernel and read by the norms after it), the chunk attention's relative-bias table
+/// (written and read by the attention) and the experts' chain (`experts_prefill.Xp`: sort tables, window lists and planes, written
+/// and read by the experts). A layer runs them in that order, each finished before the next starts (one serial encoder), and each
+/// starts at the front of the buffer. The per-operation path has no `stage`: its depth mix is `ai` and its table `pb`, and they are
+/// empty on the other paths.
+pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums", "ftaps", "ptaps", "stage" };
 
 /// The segment tables of the stacked attention-input matvecs: one `seg_slot` bytes of up to `max_segs` entries a layer.
 pub const max_segs = 6;
@@ -174,22 +219,31 @@ fn named(comptime a: []const u8, comptime b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-/// Bytes of the Scratch buffer `name` for `rows` prompt rows and caches of up to `capacity` positions; `ex` is the generic expert
-/// path's scratch for a decode window.
-fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, rows: usize, ex: usize) usize {
-    const R: usize = rows;
+/// Rows the per-row expert path (`ik_tiles` and the grouped projections) holds at once: a decode window's, or a chunk's on a path
+/// that sends the chunk through it.
+fn genericRows(ch: Chunking) usize {
+    return if (ch.path == .chunk) window_rows else ch.rows;
+}
+
+/// Bytes of the Scratch buffer `name` for a load's `ch` and caches of up to `capacity` positions; `ex` is the per-row expert path's
+/// scratch for `genericRows`.
+fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, ch: Chunking, ex: usize) usize {
+    const R: usize = ch.rows;
     const H: usize = c.hidden;
     const qh: usize = c.local.q;
     const qw: usize = qh * c.local.dim;
     const kvw = kvWidth(c);
     const I: usize = c.expert_inter;
     const picks = R * c.topk; // a chunk's expert picks
-    const slots = window_rows * c.topk; // a decode window's
-    const tiles = tileRows(slots, c.experts);
+    const win_slots = window_rows * c.topk; // a decode window's
+    const gen_slots = genericRows(ch) * c.topk; // the per-row expert path's
+    const tiles = tileRows(gen_slots, c.experts);
+    const per_op = ch.path == .per_op;
     if (comptime named(name, "ids")) return R * 4;
     if (comptime named(name, "h")) return R * H * 2;
     if (comptime named(name, "nr")) return R * H * 4;
     if (comptime named(name, "blocks")) return maxBlocks(c) * R * H * 4;
+    if (comptime named(name, "ai")) return if (per_op) R * max_queries * H * 4 else 0;
     if (comptime (named(name, "xq") or named(name, "xk") or named(name, "xv"))) return R * H * 2;
     if (comptime named(name, "q")) return R * qw * 2;
     if (comptime (named(name, "k") or named(name, "v"))) return R * kvw * 2;
@@ -200,6 +254,7 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, rows:
     if (comptime (named(name, "kc") or named(name, "vc"))) return R * kvw * 2;
     if (comptime named(name, "qn")) return R * qw * 2;
     if (comptime named(name, "reln")) return R * qh * c.d_rel * 2;
+    if (comptime named(name, "pb")) return if (per_op) R * qh * c.window * 2 else 0;
     if (comptime named(name, "att")) return R * qw * 2;
     if (comptime (named(name, "o") or named(name, "ya"))) return R * H * 2;
     if (comptime (named(name, "res") or named(name, "ns") or named(name, "mi"))) return R * H * 4;
@@ -207,9 +262,9 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, rows:
     if (comptime named(name, "logits32")) return R * c.experts * 4;
     if (comptime (named(name, "eids") or named(name, "ew"))) return picks * 4;
     if (comptime (named(name, "texp") or named(name, "tslot") or named(name, "ttok"))) return tiles * 4;
-    if (comptime named(name, "gu")) return slots * 2 * I * 2;
-    if (comptime named(name, "act")) return slots * I * 2;
-    if (comptime named(name, "ey")) return slots * H * 2;
+    if (comptime named(name, "gu")) return gen_slots * 2 * I * 2;
+    if (comptime named(name, "act")) return gen_slots * I * 2;
+    if (comptime named(name, "ey")) return gen_slots * H * 2;
     if (comptime (named(name, "moe") or named(name, "ym"))) return R * H * 2;
     if (comptime named(name, "exl3")) return ex;
     if (comptime named(name, "fin")) return R * H * 4;
@@ -217,32 +272,32 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, rows:
     if (comptime named(name, "logits")) return window_rows * @as(usize, c.vocab) * 2;
     if (comptime named(name, "segs")) return @as(usize, c.layers) * seg_slot;
     if (comptime named(name, "part")) return partBytes(c, capacity);
-    if (comptime named(name, "planes")) return slots * 2 * H * 4; // the decode chain's w13 output per slot as two f32 K halves
-    if (comptime named(name, "sums")) return slots * H * 4; // its w2 output per slot before the output rotation, f32
+    if (comptime named(name, "planes")) return win_slots * 2 * H * 4; // the decode chain's w13 output per slot as two f32 K halves
+    if (comptime named(name, "sums")) return win_slots * H * 4; // its w2 output per slot before the output rotation, f32
     if (comptime named(name, "ftaps")) return window_rows * feature_taps * H * 2; // a decode window's rows of the drafter's taps
     if (comptime named(name, "ptaps")) return R * feature_taps * H * 2; // a prompt chunk's
-    if (comptime named(name, "stage")) return @max(experts_prefill.xpBytes(R), @max(attention_prefill.tableBytes(R), R * max_queries * H * 4));
+    if (comptime named(name, "stage")) return if (per_op) 0 else @max(experts_prefill.xpBytes(R), @max(attention_prefill.tableBytes(R), R * max_queries * H * 4));
     @compileError("a scratch buffer without a size: " ++ name);
 }
 
-/// Bytes of each Scratch buffer, in `fields` order, for `rows` prompt rows and caches of up to `capacity` positions.
-fn sizes(c: *const cfg.Text, capacity: usize, rows: usize) ![fields.len]usize {
+/// Bytes of each Scratch buffer, in `fields` order, for a load's `ch` and caches of up to `capacity` positions.
+fn sizes(c: *const cfg.Text, capacity: usize, ch: Chunking) ![fields.len]usize {
     @setEvalBranchQuota(20000);
-    if (!validPrefillRows(rows)) return error.InvalidInkling2PrefillRows;
+    if (!validPrefillRows(ch.rows)) return error.InvalidInkling2PrefillRows;
     const H: usize = c.hidden;
     const I: usize = c.expert_inter;
-    const tiles = tileRows(window_rows * c.topk, c.experts);
+    const tiles = tileRows(genericRows(ch) * c.topk, c.experts);
     const ex = @max(try exl3.scratchBytes(H, 2 * I, tiles), try exl3.scratchBytes(I, H, tiles));
     var out: [fields.len]usize = undefined;
-    inline for (fields, 0..) |f, i| out[i] = bytesOf(f, c, capacity, rows, ex);
+    inline for (fields, 0..) |f, i| out[i] = bytesOf(f, c, capacity, ch, ex);
     return out;
 }
 
-/// Bytes of a Scratch for caches of up to `capacity` positions and prompt chunks of `rows` rows; capacity 0 counts what does not
-/// grow with the context.
-pub fn scratchBytes(c: *const cfg.Text, capacity: usize, rows: usize) !usize {
+/// Bytes of a Scratch for caches of up to `capacity` positions and a load's `ch`; capacity 0 counts what does not grow with the
+/// context.
+pub fn scratchBytes(c: *const cfg.Text, capacity: usize, ch: Chunking) !usize {
     var total: usize = 0;
-    for (try sizes(c, capacity, rows)) |n| total += n;
+    for (try sizes(c, capacity, ch)) |n| total += n;
     return total;
 }
 
@@ -251,6 +306,7 @@ pub const Scratch = struct {
     h: mtl.Buffer,
     nr: mtl.Buffer,
     blocks: mtl.Buffer,
+    ai: mtl.Buffer,
     xq: mtl.Buffer,
     xk: mtl.Buffer,
     xv: mtl.Buffer,
@@ -265,6 +321,7 @@ pub const Scratch = struct {
     vc: mtl.Buffer,
     qn: mtl.Buffer,
     reln: mtl.Buffer,
+    pb: mtl.Buffer,
     att: mtl.Buffer,
     o: mtl.Buffer,
     ya: mtl.Buffer,
@@ -294,23 +351,26 @@ pub const Scratch = struct {
     /// The drafter's taps, [row][feature_taps][hidden] bf16: a decode window's rows and a prompt chunk's.
     ftaps: mtl.Buffer,
     ptaps: mtl.Buffer,
-    /// A prompt layer's attention-input depth mix, relative-bias table and experts' tables and planes, one stage at a time (see
-    /// `fields`).
+    /// A prompt layer's relative-bias table, attention-input depth mix and experts' tables and planes on the tensor units, one
+    /// stage at a time (see `fields`); empty on the per-operation path.
     stage: mtl.Buffer,
     /// Positions of the longest cache this scratch serves: the split attention's partials hold that many keys' blocks.
     capacity: usize,
     /// Rows of a prompt chunk at most: every per-row buffer holds that many.
     prefill_rows: usize,
+    /// The path the buffers were made for: a forward's chunks take the path the model does.
+    path: PromptPath,
     /// The GPU seconds a decode step of each row count is expected to take (0: none yet), for the next one's wait: a
     /// shorter step replaces it at once, a longer one moves it a quarter of the way.
     expected: [window_rows + 1]f64,
 
-    pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, rows: usize) !Scratch {
+    pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, ch: Chunking) !Scratch {
         @setEvalBranchQuota(10000);
-        const sz = try sizes(c, capacity, rows);
+        const sz = try sizes(c, capacity, ch);
         var s: Scratch = undefined;
         s.capacity = capacity;
-        s.prefill_rows = rows;
+        s.prefill_rows = ch.rows;
+        s.path = ch.path;
         s.expected = @splat(0);
         var made: [fields.len]bool = @splat(false);
         errdefer inline for (fields, 0..) |f, i| if (made[i]) @field(s, f).deinit();
@@ -360,7 +420,7 @@ test "inkling2 state: a cache holds whole blocks of 64 positions, so a chunk's l
 
 test "inkling2 state: the drafter's taps are eight hidden rows a row, a decode window's and a prompt chunk's" {
     const row: usize = feature_taps * 4608 * 2;
-    const bytes = try sizes(&small, 256, default_prefill_rows);
+    const bytes = try sizes(&small, 256, .{ .rows = default_prefill_rows });
     inline for (fields, 0..) |f, i| {
         if (comptime std.mem.eql(u8, f, "ftaps")) try std.testing.expectEqual(window_rows * row, bytes[i]);
         if (comptime std.mem.eql(u8, f, "ptaps")) try std.testing.expectEqual(default_prefill_rows * row, bytes[i]);
@@ -379,12 +439,24 @@ test "inkling2 state: a prompt chunk's rows are a multiple of 64 from 64 to 8192
     for ([_][]const u8{ "0", "63", "100", "8256", "-64", "lots", "2048k", "1e3", "0x40" }) |bad| try std.testing.expectError(error.BadPrefillRows, parsePrefillRows(bad));
 }
 
+test "inkling2 state: INKLING_PROMPT_PATH names the per-operation path, or the layers whose experts take the per-row projections" {
+    try std.testing.expectEqual(PathRequest{}, try parsePromptPath(null));
+    try std.testing.expectEqual(PathRequest{}, try parsePromptPath("  "));
+    try std.testing.expectEqual(PathRequest{}, try parsePromptPath("auto"));
+    try std.testing.expectEqual(PathRequest{ .per_op = true }, try parsePromptPath(" per_op "));
+    try std.testing.expectEqual(PathRequest{ .rows = ~@as(u128, 0) }, try parsePromptPath("rows"));
+    try std.testing.expectEqual(PathRequest{ .rows = 1 }, try parsePromptPath("rows:0"));
+    try std.testing.expectEqual(PathRequest{ .rows = (1 << 3) | (1 << 7) }, try parsePromptPath("rows:3, 7"));
+    try std.testing.expectEqual(PathRequest{ .rows = @as(u128, 1) << 127 }, try parsePromptPath("rows:127"));
+    for ([_][]const u8{ "chunk", "rows:", "rows:x", "rows:128", "rows:-1", "rows:3,,7", "per_op:1", "ROWS" }) |bad| try std.testing.expectError(error.BadPromptPath, parsePromptPath(bad));
+}
+
 test "inkling2 state: the scratch's per-row buffers follow the prompt chunk's rows, the decode path's and the context's do not" {
     @setEvalBranchQuota(100000);
     const row: usize = feature_taps * 4608 * 2;
     var decode_only: [fields.len]usize = undefined;
     for ([_]usize{ 64, 512, 2048, 8192 }, 0..) |rows, round| {
-        const bytes = try sizes(&small, 256, rows);
+        const bytes = try sizes(&small, 256, .{ .rows = rows });
         inline for (fields, 0..) |f, i| {
             if (comptime named(f, "ids")) try std.testing.expectEqual(rows * 4, bytes[i]);
             if (comptime named(f, "h")) try std.testing.expectEqual(rows * 4608 * 2, bytes[i]);
@@ -392,37 +464,54 @@ test "inkling2 state: the scratch's per-row buffers follow the prompt chunk's ro
             if (comptime named(f, "ptaps")) try std.testing.expectEqual(rows * row, bytes[i]);
             if (comptime named(f, "ftaps")) try std.testing.expectEqual(window_rows * row, bytes[i]);
             if (comptime named(f, "part")) try std.testing.expectEqual(partBytes(&small, 256), bytes[i]);
-            // a chunk's picks follow its rows; the relative-bias table has no buffer of its own (it lives in `stage`)
+            // a chunk's picks follow its rows
             if (comptime (named(f, "eids") or named(f, "ew"))) try std.testing.expectEqual(rows * 8 * 4, bytes[i]);
-            // the generic expert path's buffers are a decode window's, whatever the chunk
-            if (comptime named(f, "gu")) try std.testing.expectEqual(window_rows * 8 * 2 * 2304 * 2, bytes[i]);
-            if (comptime named(f, "act")) try std.testing.expectEqual(window_rows * 8 * 2304 * 2, bytes[i]);
-            if (comptime named(f, "ey")) try std.testing.expectEqual(window_rows * 8 * 4608 * 2, bytes[i]);
-            if (comptime (named(f, "texp") or named(f, "tslot") or named(f, "ttok"))) try std.testing.expectEqual(tileRows(window_rows * 8, 384) * 4, bytes[i]);
+            // the per-row expert path's buffers are a decode window's on the chunk path, whatever the chunk
             if (comptime (named(f, "gu") or named(f, "act") or named(f, "ey") or named(f, "texp") or named(f, "tslot") or named(f, "ttok") or named(f, "exl3"))) {
                 if (round == 0) decode_only[i] = bytes[i] else try std.testing.expectEqual(decode_only[i], bytes[i]);
             }
         }
     }
     // the default chunk's scratch, with the experts' chain, the attention's table and the depth mix sharing `stage`
-    try std.testing.expectEqual(@as(usize, 2_868_139_264), try scratchBytes(&small, 0, default_prefill_rows));
-    try std.testing.expectEqual(@as(usize, 398_834_944), try scratchBytes(&small, 0, 512));
-    try std.testing.expect(try scratchBytes(&small, 0, 2048) > try scratchBytes(&small, 0, 512));
+    try std.testing.expectEqual(@as(usize, 2_868_139_264), try scratchBytes(&small, 0, .{ .rows = default_prefill_rows }));
+    try std.testing.expectEqual(@as(usize, 398_834_944), try scratchBytes(&small, 0, .{ .rows = 512 }));
+    try std.testing.expect(try scratchBytes(&small, 0, .{ .rows = 2048 }) > try scratchBytes(&small, 0, .{ .rows = 512 }));
     for ([_]usize{ 0, 63, 100, 8192 + 64 }) |rows| {
-        try std.testing.expectError(error.InvalidInkling2PrefillRows, sizes(&small, 256, rows));
-        try std.testing.expectError(error.InvalidInkling2PrefillRows, scratchBytes(&small, 0, rows));
+        try std.testing.expectError(error.InvalidInkling2PrefillRows, sizes(&small, 256, .{ .rows = rows }));
+        try std.testing.expectError(error.InvalidInkling2PrefillRows, scratchBytes(&small, 0, .{ .rows = rows }));
     }
+}
+
+test "inkling2 state: the per-row expert path's buffers hold a chunk's rows where a path sends the chunk through it, and the per-operation path keeps its own table" {
+    @setEvalBranchQuota(100000);
+    for ([_]usize{ 64, 512, 4096 }) |rows| {
+        for ([_]PromptPath{ .chunk, .chunk_rows, .per_op }) |path| {
+            const bytes = try sizes(&small, 0, .{ .rows = rows, .path = path });
+            const gen: usize = if (path == .chunk) window_rows else rows;
+            inline for (fields, 0..) |f, i| {
+                if (comptime named(f, "gu")) try std.testing.expectEqual(gen * 8 * 2 * 2304 * 2, bytes[i]);
+                if (comptime named(f, "act")) try std.testing.expectEqual(gen * 8 * 2304 * 2, bytes[i]);
+                if (comptime named(f, "ey")) try std.testing.expectEqual(gen * 8 * 4608 * 2, bytes[i]);
+                if (comptime (named(f, "texp") or named(f, "tslot") or named(f, "ttok"))) try std.testing.expectEqual(tileRows(gen * 8, 384) * 4, bytes[i]);
+                // the per-operation path's depth mix and relative-bias table, and no stage; the others the reverse
+                if (comptime named(f, "ai")) try std.testing.expectEqual(if (path == .per_op) rows * 3 * 4608 * 4 else 0, bytes[i]);
+                if (comptime named(f, "pb")) try std.testing.expectEqual(if (path == .per_op) rows * 48 * 1024 * 2 else 0, bytes[i]);
+                if (comptime named(f, "stage")) try std.testing.expectEqual(if (path == .per_op) 0 else experts_prefill.xpBytes(rows), bytes[i]);
+            }
+        }
+    }
+    // the per-operation layout is the one the scratch had before the chunk kernels: 0.57 GiB at 512 rows, 4.0 GiB at 4,096
+    try std.testing.expectEqual(@as(usize, 614_881_792), try scratchBytes(&small, 0, .{ .rows = 512, .path = .per_op }));
+    try std.testing.expectEqual(@as(usize, 4_295_234_048), try scratchBytes(&small, 0, .{ .rows = 4096, .path = .per_op }));
+    // the chunk path with the per-row projections adds those buffers for a whole chunk: 4.26 GiB at 4,096 rows
+    try std.testing.expectEqual(@as(usize, 649_579_264), try scratchBytes(&small, 0, .{ .rows = 512, .path = .chunk_rows }));
+    try std.testing.expectEqual(@as(usize, 4_572_553_984), try scratchBytes(&small, 0, .{ .rows = 4096, .path = .chunk_rows }));
 }
 
 test "inkling2 state: the stage holds the experts' chain, a whole chunk's relative-bias table and the depth mix, one after the other" {
     @setEvalBranchQuota(100000);
-    // the buffers a prompt layer shares in `stage` have none of their own
-    for (fields) |f| {
-        try std.testing.expect(!std.mem.eql(u8, f, "pb"));
-        try std.testing.expect(!std.mem.eql(u8, f, "ai"));
-    }
     for ([_]usize{ 64, 512, 2048, 4096, 8192 }) |rows| {
-        const bytes = try sizes(&small, 0, rows);
+        const bytes = try sizes(&small, 0, .{ .rows = rows });
         inline for (fields, 0..) |f, i| if (comptime named(f, "stage")) {
             try std.testing.expect(bytes[i] >= experts_prefill.xpBytes(rows));
             try std.testing.expect(bytes[i] >= attention_prefill.tableBytes(rows));
@@ -434,27 +523,37 @@ test "inkling2 state: the stage holds the experts' chain, a whole chunk's relati
     try std.testing.expectEqual(@as(usize, 906_465_536), experts_prefill.xpBytes(4096));
 }
 
-test "inkling2 state: a scratch made for some rows holds buffers for them and says how many" {
+test "inkling2 state: a scratch made for some rows holds buffers for them and says how many and for what path" {
     const device = mtl.Device.init() catch |err| switch (err) {
         error.NoDevice => return error.SkipZigTest,
         else => return err,
     };
     defer device.deinit();
-    var few = try Scratch.init(device, &small, 256, 64);
+    var few = try Scratch.init(device, &small, 256, .{ .rows = 64 });
     defer few.deinit();
-    var more = try Scratch.init(device, &small, 256, 128);
+    var more = try Scratch.init(device, &small, 256, .{ .rows = 128 });
     defer more.deinit();
     try std.testing.expectEqual(@as(usize, 64), few.prefill_rows);
     try std.testing.expectEqual(@as(usize, 128), more.prefill_rows);
     try std.testing.expectEqual(@as(usize, 64 * feature_taps * 4608 * 2), few.ptaps.length());
     try std.testing.expectEqual(@as(usize, 128 * feature_taps * 4608 * 2), more.ptaps.length());
-    try std.testing.expectError(error.InvalidInkling2PrefillRows, Scratch.init(device, &small, 256, 100));
+    try std.testing.expectError(error.InvalidInkling2PrefillRows, Scratch.init(device, &small, 256, .{ .rows = 100 }));
     // the stage holds the experts' chain, whose views start at its front and fit
     try std.testing.expectEqual(experts_prefill.xpBytes(64), few.stage.length());
     try std.testing.expectEqual(experts_prefill.xpBytes(128), more.stage.length());
     const views = more.xp();
     try std.testing.expectEqual(@as(usize, 128), views.rows);
     try std.testing.expect(views.counts.buf.id == more.stage.id and views.counts.off == 0);
+    // the per-operation path has the depth mix and the table of its own and no stage; the chunk path has the stage alone
+    var per_op = try Scratch.init(device, &small, 256, .{ .rows = 64, .path = .per_op });
+    defer per_op.deinit();
+    try std.testing.expectEqual(PromptPath.per_op, per_op.path);
+    try std.testing.expectEqual(PromptPath.chunk, few.path);
+    try std.testing.expectEqual(@as(usize, 64 * 3 * 4608 * 4), per_op.ai.length());
+    try std.testing.expectEqual(@as(usize, 64 * 48 * 1024 * 2), per_op.pb.length());
+    try std.testing.expectEqual(@as(usize, 16), per_op.stage.length());
+    try std.testing.expectEqual(@as(usize, 16), few.ai.length());
+    try std.testing.expectEqual(@as(usize, 16), few.pb.length());
 }
 
 test "inkling2 state: a cache's layers hold whole blocks of 64 positions, the values a half after the keys" {

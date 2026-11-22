@@ -69,13 +69,23 @@ checks that each row's result is independent of the rows beside it, and that a N
   kernels at the block and query counts of the real layers.
 - `INKLING_PREFILL_ROWS` sets the rows of a prompt chunk at most (a multiple of 64 from 64 to 8,192; default 4,096). The
   scratch is made for that many rows, so a larger chunk takes more of the load limit (2.67 GiB at 4,096 rows, 0.37 GiB at
-  512), and a prompt is fed in pieces of that many. Prompt rows take the chunk path, whose kernels keep a row's bits
+  512, for the published pack), and a prompt is fed in pieces of that many. Every path below keeps a row's bits
   independent of the chunk it is in.
-- The chunk path runs on the tensor units: the dense projections and the router as GEMMs (bf16 operands, f32 sums in a
-  fixed order), attention over 64-key blocks that reads a relative-bias table built just before it, and the routed
-  experts through a chain adapted from Sushi that sorts the picks by expert on the GPU. A GPU without tensor units
-  refuses the model at load, and so does a pack whose experts are not all K2 or K3. A cache holds a multiple of 64
-  positions.
+- On a GPU with tensor units a prompt chunk takes the chunk path: the dense projections and the router as GEMMs (bf16
+  operands, f32 sums in a fixed order), attention over 64-key blocks that reads a relative-bias table built just before
+  it, and the routed experts through a chain adapted from Sushi that sorts the picks by expert on the GPU. The chain
+  takes a layer whose experts are all K2 or K3; any other layer (a K4 expert, say) runs its experts through the per-row
+  grouped projections that decode windows use for such a layer, while its dense projections and attention stay on the
+  tensor units. A pack that needs this holds the per-row path's buffers for a whole chunk (4.26 GiB of scratch at 4,096
+  rows, 0.60 GiB at 512).
+- A GPU without tensor units takes the per-operation prompt path of the first release: matvec slabs, a relative-bias table
+  and one-row attention, and the per-row expert projections. It runs at that path's speed (about 65 tok/s on an M5
+  Ultra) and with its scratch (4.0 GiB at 4,096 rows, 0.57 GiB at 512, so `INKLING_PREFILL_ROWS=512` is worth setting
+  there). The startup log names the path and its scratch.
+- `INKLING_PROMPT_PATH` is a diagnostic: `per_op` runs prompt chunks on the per-operation kernels whatever the GPU, to
+  compare the paths or to test that fallback; `rows` (every layer) or `rows:3,7` (those layers) sends layers' experts
+  through the per-row projections, in decode windows too, as if the chain could not take them. Unset or `auto` takes what
+  the GPU and the pack allow. A cache holds a multiple of 64 positions.
 - A chunk's layers go to the GPU in several command buffers, committed as they are encoded and run in order, because the
   GPU kills a command buffer that runs for long (a kill at 15.6 s has been seen). Each buffer holds at most 3,072 rows
   times layers: a layer at a time from 2,048 rows up, six layers at 512. The bits are the same as from one buffer.
@@ -85,8 +95,8 @@ checks that each row's result is independent of the rows beside it, and that a N
   a chunk; `--repeat` runs the loaded layers R times a chunk, so a one-layer pack makes a deep model's command buffers;
   `--drafts` adds the draft head's taps and absorb). It exits non-zero when the GPU times add up to more than the wall
   time. `INKLING_PREFILL_ROWS` sets the chunk of its other modes too.
-- `tf-inkling-run MODEL layers ids.json out.bin L [--chunk N]` and `tf-inkling-run MODEL finals index.txt out_dir
-  [--chunk N]` feed their ids as prompt chunks of N rows (the prefill rows when not given), so they exercise the chunk
+- `tf-inkling-run MODEL layers ids.json out.bin L [--window] [--chunk N]` and `tf-inkling-run MODEL finals index.txt
+  out_dir [--window] [--chunk N]` feed their ids as prompt chunks of N rows (the prefill rows when not given), so they exercise the chunk
   path's arithmetic; `--window` feeds them the way a decode-time client does instead.
 - `tf-inkling-run MODEL partition ids.json CUT... [--layers L] [--drafts]` feeds a prompt twice, in chunks of the prefill
   rows and in chunks of the lengths given (the prefill rows for what is left), each leg on a scratch and a cache poisoned
@@ -130,7 +140,7 @@ rows take the chunk path above.
 ## Fidelity
 
 Teacher-forced on a 62,526-token held-out set against the MXFP8 release as teacher, with the per-operation prompt
-kernels the chunk path replaced:
+kernels (the path a GPU without tensor units still takes):
 - **KL:** 0.0325 on the prompt path; 0.0336 with every row after the first 16 fed through the decode path in 16-row
   windows.
 - **Comparison:** the same pack's experts in an MLX forward score KL 0.0341. TensorFold's is 0.0016 lower on the

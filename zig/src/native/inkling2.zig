@@ -79,12 +79,6 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         return null;
     };
     errdefer model.deinit();
-    // a prompt chunk runs the experts' tensor-unit chain, which takes K2 and K3 experts only
-    if (!model.chunkReady()) {
-        model.deinit();
-        problem.* = "the native Inkling 2 EXL3 engine cannot load this checkpoint: prompts run the experts' tensor-unit chain, which takes K2 and K3 experts only, and this pack has others";
-        return null;
-    }
     // the head before the budget: its fold joins the checkpoint's shards when it is made, and its scratch is known
     var draft: ?*fl.dspark.Drafter = null;
     if (model.draft) |*head_weights| {
@@ -128,7 +122,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     // the partials of this window come off what the caches may hold
     const budget = room - fl.state.partBytes(c, @as(usize, @intCast(window)) + 1);
     std.log.info("inkling2: {d:.1} GiB of weights, {d:.1} GiB for caches, context up to {d} tokens", .{ gib(weights), gib(budget), window });
-    std.log.info("inkling2: prompt chunks of {d} rows, {d:.2} GiB of scratch", .{ model.prefill_rows, gib(try fl.state.scratchBytes(c, 0, model.prefill_rows)) });
+    std.log.info("inkling2: prompt chunks of {d} rows on the {s} path, {d:.2} GiB of scratch", .{ model.prefill_rows, @tagName(model.promptPath()), gib(try fl.state.scratchBytes(c, 0, model.chunking())) });
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.gpa = gpa;
