@@ -9,7 +9,7 @@ fn env(name: [*:0]const u8) ?[]const u8 {
 }
 
 /// Rows of a prompt chunk at most, as `native/inkling2.zig` reads them: INKLING_PREFILL_ROWS, a multiple of 64 from 64 to 8192
-/// (512 when unset).
+/// (4,096 when unset).
 pub fn prefillRows() !u32 {
     return ik.state.parsePrefillRows(env("INKLING_PREFILL_ROWS")) catch error.PrefillRowsIsAMultipleOf64From64To8192;
 }

@@ -88,7 +88,8 @@ checks that each row's result is independent of the rows beside it, and that a N
   the GPU and the pack allow. A cache holds a multiple of 64 positions.
 - A chunk's layers go to the GPU in several command buffers, committed as they are encoded and run in order, because the
   GPU kills a command buffer that runs for long (a kill at 15.6 s has been seen). Each buffer holds at most 3,072 rows
-  times layers: a layer at a time from 2,048 rows up, six layers at 512. The bits are the same as from one buffer.
+  times layers, and always at least one whole layer: a layer at a time from 2,048 rows up (so at 4,096 rows and above it
+  is one layer per buffer), six layers at 512. The bits are the same as from one buffer.
 - `tf-inkling-run MODEL prefill ids.json [--chunk N] [--layers L] [--repeat R] [--spans] [--drafts]` feeds a prompt
   through the serving prompt path and prints its time, its GPU time by class, the command buffers it used and the
   longest one's GPU time, and a digest of the last row's hidden state (the same at any chunk size) (`--spans` adds a line

@@ -30,8 +30,9 @@ constant constexpr float kMasked = -3.402823466e+38f;
 constant constexpr float kLog2e = 1.44269504089f;
 constant constexpr float kScale = 0.08838834764831845f; // 1 / sqrt(DH)
 
-// The probabilities cross threadgroup memory as f16: the tensor op cuts a float operand to ten fraction bits, which f16
-// holds, so the product sees the same bits at half the memory.
+// The probabilities cross threadgroup memory as f16 at half the memory. The tensor op takes them at ten fraction bits,
+// which f16 holds for values from 2^-14 up; below that f16 loses precision, and values under about 2^-25 flush to zero,
+// which the layer and KL gates tolerate.
 using PT = half;
 using PT4 = half4;
 
