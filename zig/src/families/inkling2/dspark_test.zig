@@ -755,6 +755,9 @@ test "inkling2 prefill commits: a forward reports the command buffers it used an
     try t.expectEqual(@as(u32, 1), tm.buffers);
     try t.expect(tm.gpu > 0);
     try t.expectEqual(tm.gpu, tm.longest);
+    // the forward's command buffers ran between its first commit and the host's wake: a buffer without a reported start
+    // must not count the clock's whole uptime
+    try t.expect(tm.gpu <= tm.woke - tm.committed);
     // the buffers and the GPU time add up over forwards; the longest is the longest of them all
     var again = tm;
     try fwd.run(f.model, &scratch, &cache, &ids, .{ .logits = .none, .prompt = true, .timing = &again });

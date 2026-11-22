@@ -398,7 +398,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
         tm.encode += seconds() - t0;
     }
     const warm = decode and m.warm_wait and out.spans == null;
-    const committed_at = if (done.n > 0) done.first else if (warm) seconds() else 0;
+    const committed_at = if (done.n > 0) done.first else if (warm or out.timing != null) seconds() else 0;
     cb.commit();
     // spans are a profile's: its steps are waited for as before
     if (warm) waitWarm(cb, s.expected[n], committed_at) else cb.wait();
@@ -410,15 +410,22 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     };
     for (done.all()) |f| try checked(f);
     try checked(cb);
-    const began = (if (done.n > 0) done.bufs[0] else cb).gpuStart();
+    const began = (if (done.n > 0) done.bufs[0] else cb).gpuStartOr(committed_at);
     if (out.timing) |tm| {
-        var gpu = cb.gpuSeconds();
-        var longest = gpu;
+        // a buffer's span runs from its start, or from the end of the one ahead of it (the first: from its commit) when
+        // Metal reports no start for it
+        var gpu: f64 = 0;
+        var longest: f64 = 0;
+        var after = committed_at;
         for (done.all()) |f| {
-            const one = f.gpuSeconds();
+            const one = f.gpuEnd() - f.gpuStartOr(after);
+            after = f.gpuEnd();
             gpu += one;
             longest = @max(longest, one);
         }
+        const one = cb.gpuEnd() - cb.gpuStartOr(after);
+        gpu += one;
+        longest = @max(longest, one);
         tm.gpu += gpu;
         tm.buffers += @intCast(done.n + 1);
         tm.longest = @max(tm.longest, longest);

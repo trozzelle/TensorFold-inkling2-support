@@ -79,10 +79,15 @@ checks that each row's result is independent of the rows beside it, and that a N
 - A chunk's layers go to the GPU in several command buffers, committed as they are encoded and run in order, because the
   GPU kills a command buffer that runs for long (a kill at 15.6 s has been seen). Each buffer holds at most 3,072 rows
   times layers: a layer at a time from 2,048 rows up, six layers at 512. The bits are the same as from one buffer.
-- `tf-inkling-run MODEL prefill ids.json [--chunk N] [--layers L] [--spans] [--drafts]` feeds a prompt through the
-  serving prompt path and prints its time, its GPU time by class, the command buffers it used and the longest one's GPU
-  time, and a digest of the last row's hidden state (the same at any chunk size) (`--spans` adds a line a chunk;
-  `--drafts` adds the draft head's taps and absorb). `INKLING_PREFILL_ROWS` sets the chunk of its other modes too.
+- `tf-inkling-run MODEL prefill ids.json [--chunk N] [--layers L] [--repeat R] [--spans] [--drafts]` feeds a prompt
+  through the serving prompt path and prints its time, its GPU time by class, the command buffers it used and the
+  longest one's GPU time, and a digest of the last row's hidden state (the same at any chunk size) (`--spans` adds a line
+  a chunk; `--repeat` runs the loaded layers R times a chunk, so a one-layer pack makes a deep model's command buffers;
+  `--drafts` adds the draft head's taps and absorb). It exits non-zero when the GPU times add up to more than the wall
+  time. `INKLING_PREFILL_ROWS` sets the chunk of its other modes too.
+- `tf-inkling-run MODEL layers ids.json out.bin L [--chunk N]` and `tf-inkling-run MODEL finals index.txt out_dir
+  [--chunk N]` feed their ids as prompt chunks of N rows (the prefill rows when not given), so they exercise the chunk
+  path's arithmetic; `--window` feeds them the way a decode-time client does instead.
 - `tf-inkling-run MODEL partition ids.json CUT... [--layers L] [--drafts]` feeds a prompt twice, in chunks of the prefill
   rows and in chunks of the lengths given (the prefill rows for what is left), each leg on a scratch and a cache poisoned
   with NaN past the rows in use, and compares the legs bit for bit: every layer's keys and values, the convolution rings,

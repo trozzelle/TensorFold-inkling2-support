@@ -160,6 +160,14 @@ pub const CommandBuffer = struct {
         return objc.msg(f64, self.id, "GPUEndTime", .{});
     }
 
+    /// The GPU's start, or `floor` where Metal reports none: a completed command buffer on a Metal 3 queue can keep a
+    /// GPUStartTime of 0 while its end is set, so end - start would be the whole uptime. A buffer on a serial queue starts
+    /// no earlier than its commit and the end of the one ahead of it: the caller's `floor`, which makes the span a ceiling.
+    pub fn gpuStartOr(self: CommandBuffer, floor: f64) f64 {
+        const start = self.gpuStart();
+        return if (start > 0) start else floor;
+    }
+
     /// The GPU's start and end once reported, without waiting for the report (Metal 4), else null.
     pub fn gpuTimes(self: CommandBuffer) ?[2]f64 {
         if (self.slot()) |s| return s.times(self.use, false);

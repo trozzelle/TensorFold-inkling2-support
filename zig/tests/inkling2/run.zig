@@ -8,11 +8,12 @@ const settings = @import("settings.zig");
 
 const usage =
     \\tf-inkling-run <model> check [layers]                    load the model (or its first layers) and report it
-    \\tf-inkling-run <model> layers <ids.json> <out.bin> <L> [--window]   the first L layers on ids (at most the prefill rows): bf16 [L, T, H]
-    \\tf-inkling-run <model> finals <index.txt> <out_dir> [--window]   each listed ids file in chunks of the prefill rows: seq-NNNNN.bin
-    \\                                                         with bf16 finals [T, H] (out_dir must exist)
-    \\                                                         --window: the first 16 rows as a prompt chunk, the rest in
-    \\                                                         16-row windows through the decode path
+    \\tf-inkling-run <model> layers <ids.json> <out.bin> <L> [--window] [--chunk N]   the first L layers on ids, fed as prompt chunks of the prefill rows
+    \\                                                         (--chunk N sets them; the chunk path's arithmetic): bf16 [L, T, H]
+    \\                                                         --window: the first 16 rows as a prompt chunk, the rest in 16-row windows through the decode path
+    \\tf-inkling-run <model> finals <index.txt> <out_dir> [--window] [--chunk N]   each listed ids file in prompt chunks of the prefill rows (--chunk N
+    \\                                                         sets them): seq-NNNNN.bin with bf16 finals [T, H] (out_dir must exist)
+    \\                                                         --window: as layers
     \\tf-inkling-run <model> exact <ids.json> <at> [layers]    ids[at..] (ids at most the prefill rows) after ids[..at]: one-row steps
     \\                                                         against 16-row windows, bit for bit
     \\tf-inkling-run <model> greedy <ids.json> <n> [--drafts]   the prompt, then n one-row greedy steps; tokens, tok/s
@@ -40,13 +41,14 @@ const usage =
     \\                                                         (the layers run repeat times a step, default 48/layers)
     \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat]   decode steps each followed by the greedy draw: median
     \\                                                         wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw)
-    \\tf-inkling-run <model> prefill <ids.json> [--chunk N] [--layers L] [--spans] [--drafts]   the prompt in chunks of N rows through the serving
+    \\tf-inkling-run <model> prefill <ids.json> [--chunk N] [--layers L] [--repeat R] [--spans] [--drafts]   the prompt in chunks of N rows through the serving
     \\                                                         prompt path: one JSON line with prompt_ms, tok_s, the GPU ms by class (dense, norm,
     \\                                                         attention_prepare, attention, route, experts, activation, final, taps, absorb), the command
     \\                                                         buffers used and the longest one's GPU ms, and a digest of the last row's hidden state
     \\                                                         (the same at any chunk size: rows are independent)
     \\                                                         --chunk: the prefill rows (below); --layers: the first L layers alone, no final stage or
-    \\                                                         logits; --spans: also a line a chunk with its position, for attention's growth with it;
+    \\                                                         logits; --repeat: the loaded layers run R times a chunk, as a deeper model's (the digest then differs);
+    \\                                                         --spans: also a line a chunk with its position, for attention's growth with it;
     \\                                                         --drafts: as served with the draft head (INKLING_DRAFT_* as greedy --drafts reads them):
     \\                                                         every chunk taps its rows and runs the final stage on all of them, and the head absorbs
     \\                                                         the prompt's rows but the last
@@ -104,7 +106,12 @@ fn readIds(init: std.process.Init, path: []const u8) !std.json.Parsed([]u32) {
 
 /// The load options every mode shares: the first `layers` layers (all when null) and the prefill rows INKLING_PREFILL_ROWS names.
 fn options(layers: ?u32) !ik.model.Options {
-    return .{ .layers = layers, .prefill_rows = try settings.prefillRows() };
+    return chunkOptions(layers, null);
+}
+
+/// The options with `chunk` as the prefill rows when given.
+fn chunkOptions(layers: ?u32, chunk: ?u32) !ik.model.Options {
+    return .{ .layers = layers, .prefill_rows = chunk orelse try settings.prefillRows() };
 }
 
 /// ids at the cache's end in chunks of the model's prefill rows; finals rows copied into `finals` when given; logits of the last.
@@ -121,19 +128,23 @@ fn feed(m: *const ik.Model, s: *ik.state.Scratch, cache: *ik.state.Cache, ids: [
     }
 }
 
-/// Where a window-mode run keeps what it records: finals rows into `finals` (T rows), and each loaded layer's output
-/// rows into `layers` ([L][T][H]), the latter through `scratch`, a dump buffer of one window.
+/// Where a recorded run keeps what it records: finals rows into `finals` (T rows), and each loaded layer's output
+/// rows into `layers` ([L][T][H]), the latter through `scratch`, a dump buffer of one piece.
 const Record = struct { finals: ?[]u16 = null, layers: ?[]u16 = null, scratch: ?mtl.Buffer = null };
 
-/// ids at the cache's end the way a decode-time client sends them: the first window_rows rows as a prompt chunk, every
-/// later row in windows of window_rows through the decode path (the last one possibly shorter).
-fn feedWindows(m: *const ik.Model, s: *ik.state.Scratch, cache: *ik.state.Cache, ids: []const u32, rec: Record) !void {
+/// How a recorded run cuts its ids: `chunks` feeds prompt chunks of the model's prefill rows, `windows` the way a
+/// decode-time client sends them: the first window_rows rows as a prompt chunk, every later row in windows of window_rows
+/// through the decode path.
+const Pieces = enum { chunks, windows };
+
+/// ids at the cache's end in pieces (the last one possibly shorter), what `rec` names recorded after each.
+fn feedRecorded(m: *const ik.Model, s: *ik.state.Scratch, cache: *ik.state.Cache, ids: []const u32, rec: Record, pieces: Pieces) !void {
     const H: usize = m.config.text.hidden;
     const T = ids.len;
     var at: usize = 0;
     while (at < T) {
-        const n = @min(T - at, ik.state.window_rows);
-        try ik.forward.run(m, s, cache, ids[at..][0..n], .{ .finals = rec.finals != null, .logits = .none, .dump = rec.scratch, .prompt = at == 0 });
+        const n = @min(T - at, if (pieces == .windows) ik.state.window_rows else m.prefill_rows);
+        try ik.forward.run(m, s, cache, ids[at..][0..n], .{ .finals = rec.finals != null, .logits = .none, .dump = rec.scratch, .prompt = pieces == .chunks or at == 0 });
         if (rec.finals) |f| @memcpy(f[at * H ..][0 .. n * H], s.finals.slice(u16, n * H));
         if (rec.layers) |d| {
             const w = rec.scratch.?.slice(u16, m.layers * n * H);
@@ -144,44 +155,57 @@ fn feedWindows(m: *const ik.Model, s: *ik.state.Scratch, cache: *ik.state.Cache,
     }
 }
 
+/// What `layers` and `finals` take after their fixed arguments.
+const FeedArgs = struct { window: bool = false, chunk: ?u32 = null };
+
+fn feedArgs(args: []const [:0]const u8) !FeedArgs {
+    var p: FeedArgs = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--window")) {
+            p.window = true;
+        } else if (std.mem.eql(u8, args[i], "--chunk")) {
+            p.chunk = try optionValue(args, &i);
+        } else return error.UnknownOption;
+    }
+    if (p.window and p.chunk != null) return error.ChunkSizeIsForTheChunkPath;
+    return p;
+}
+
 fn layersMode(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (args.len != 6 and !(args.len == 7 and std.mem.eql(u8, args[6], "--window"))) return error.ExpectedIdsOutLayers;
-    const window = args.len == 7;
+    if (args.len < 6) return error.ExpectedIdsOutLayers;
+    const opt = try feedArgs(args[6..]);
     const L = try std.fmt.parseInt(u32, args[5], 10);
     const ids = try readIds(init, args[3]);
     defer ids.deinit();
-    const m = try ik.Model.load(init.gpa, init.io, args[1], try options(L));
+    const m = try ik.Model.load(init.gpa, init.io, args[1], try chunkOptions(L, opt.chunk));
     defer m.deinit();
-    if (ids.value.len > m.prefill_rows) return error.IdsExceedThePrefillRows;
     const c = &m.config.text;
-    const capacity = ids.value.len + 1;
+    const n = ids.value.len;
+    const capacity = n + 1;
     var cache = try ik.state.Cache.init(m.device, c, capacity, L);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.prefill_rows);
     defer s.deinit();
-    const n = ids.value.len;
-    if (window) {
-        const out = try init.gpa.alloc(u16, @as(usize, L) * n * c.hidden);
-        defer init.gpa.free(out);
-        const scratch = try m.device.buffer(@as(usize, L) * ik.state.window_rows * c.hidden * 2, mtl.ResourceOptions.shared);
-        defer scratch.deinit();
-        const t0 = now();
-        try feedWindows(m, &s, &cache, ids.value, .{ .layers = out, .scratch = scratch });
-        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[4], .data = std.mem.sliceAsBytes(out) });
-        std.debug.print("{{\"layers\": {d}, \"tokens\": {d}, \"seconds\": {d:.2}, \"window\": true}}\n", .{ L, n, @as(f64, @floatFromInt(now() - t0)) / 1e9 });
-        return;
-    }
-    const dump = try m.device.buffer(@as(usize, L) * n * c.hidden * 2, mtl.ResourceOptions.shared);
-    defer dump.deinit();
+    const out = try init.gpa.alloc(u16, @as(usize, L) * n * c.hidden);
+    defer init.gpa.free(out);
+    const rows = @min(n, if (opt.window) ik.state.window_rows else m.prefill_rows);
+    const scratch = try m.device.buffer(@as(usize, L) * rows * c.hidden * 2, mtl.ResourceOptions.shared);
+    defer scratch.deinit();
     const t0 = now();
-    try ik.forward.run(m, &s, &cache, ids.value, .{ .logits = .none, .dump = dump, .prompt = true });
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[4], .data = dump.slice(u8, @as(usize, L) * n * c.hidden * 2) });
-    std.debug.print("{{\"layers\": {d}, \"tokens\": {d}, \"seconds\": {d:.2}}}\n", .{ L, n, @as(f64, @floatFromInt(now() - t0)) / 1e9 });
+    try feedRecorded(m, &s, &cache, ids.value, .{ .layers = out, .scratch = scratch }, if (opt.window) .windows else .chunks);
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[4], .data = std.mem.sliceAsBytes(out) });
+    const seconds = @as(f64, @floatFromInt(now() - t0)) / 1e9;
+    if (opt.window) {
+        std.debug.print("{{\"layers\": {d}, \"tokens\": {d}, \"seconds\": {d:.2}, \"window\": true}}\n", .{ L, n, seconds });
+    } else {
+        std.debug.print("{{\"layers\": {d}, \"tokens\": {d}, \"seconds\": {d:.2}, \"chunk\": {d}}}\n", .{ L, n, seconds, m.prefill_rows });
+    }
 }
 
 fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (args.len != 5 and !(args.len == 6 and std.mem.eql(u8, args[5], "--window"))) return error.ExpectedIndexOutDir;
-    const window = args.len == 6;
+    if (args.len < 5) return error.ExpectedIndexOutDir;
+    const opt = try feedArgs(args[5..]);
     const index = try std.Io.Dir.cwd().readFileAlloc(init.io, args[3], init.gpa, .limited(1 << 20));
     defer init.gpa.free(index);
     var paths: std.ArrayList([]const u8) = .empty;
@@ -194,7 +218,7 @@ fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
         defer ids.deinit();
         longest = @max(longest, ids.value.len);
     }
-    const m = try ik.Model.load(init.gpa, init.io, args[1], try options(null));
+    const m = try ik.Model.load(init.gpa, init.io, args[1], try chunkOptions(null, opt.chunk));
     defer m.deinit();
     const c = &m.config.text;
     const capacity = longest + 1;
@@ -209,7 +233,7 @@ fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
         defer ids.deinit();
         const t0 = now();
         cache.len = 0;
-        if (window) try feedWindows(m, &s, &cache, ids.value, .{ .finals = finals }) else try feed(m, &s, &cache, ids.value, finals, false);
+        if (opt.window) try feedRecorded(m, &s, &cache, ids.value, .{ .finals = finals }, .windows) else try feed(m, &s, &cache, ids.value, finals, false);
         const out = try std.fmt.allocPrint(init.gpa, "{s}/seq-{d:0>5}.bin", .{ args[4], i });
         defer init.gpa.free(out);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out, .data = std.mem.sliceAsBytes(finals[0 .. ids.value.len * c.hidden]) });
@@ -591,7 +615,7 @@ fn printClasses(secs: *const [class_count]f64) void {
 }
 
 /// What `prefill` takes after the ids file.
-const PrefillArgs = struct { chunk: ?u32 = null, layers: ?u32 = null, spans: bool = false, drafts: bool = false };
+const PrefillArgs = struct { chunk: ?u32 = null, layers: ?u32 = null, repeat: u32 = 1, spans: bool = false, drafts: bool = false };
 
 fn optionValue(args: []const [:0]const u8, at: *usize) !u32 {
     at.* += 1;
@@ -611,10 +635,12 @@ fn prefillArgs(args: []const [:0]const u8) !PrefillArgs {
             p.chunk = try optionValue(args, &i);
         } else if (std.mem.eql(u8, args[i], "--layers")) {
             p.layers = try optionValue(args, &i);
+        } else if (std.mem.eql(u8, args[i], "--repeat")) {
+            p.repeat = try optionValue(args, &i);
         } else return error.UnknownPrefillOption;
     }
-    if (p.layers == 0) return error.ExpectedPositiveLayers;
-    if (p.drafts and p.layers != null) return error.DraftsNeedTheWholeModel;
+    if (p.layers == 0 or p.repeat == 0) return error.ExpectedPositiveLayersRepeat;
+    if (p.drafts and (p.layers != null or p.repeat != 1)) return error.DraftsNeedTheWholeModel;
     return p;
 }
 
@@ -666,7 +692,7 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
         for (&warm_ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37);
         try ik.forward.run(m, &s, &warm, &warm_ids, .{ .logits = if (full) .all else .none });
     }
-    const max_spans = ik.forward.spans_per_layer * @as(usize, m.layers) + 32;
+    const max_spans = ik.forward.spans_per_layer * @as(usize, m.layers) * opt.repeat + 32;
     var rec = try ik.forward.counters.Recorder.init(gpa, m.device, .{ .enabled = true, .max_spans = max_spans });
     defer rec.deinit() catch {};
     var totals: [class_count]f64 = @splat(0);
@@ -681,7 +707,7 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     while (at < T) : (chunk += 1) {
         const n = @min(T - at, m.prefill_rows);
         var tm: ik.forward.Timing = .{};
-        try ik.forward.run(m, &s, &cache, ids.value[at..][0..n], .{ .logits = if (at + n == T and full) .last else .none, .prompt = true, .feature_taps = taps, .timing = &tm, .spans = &rec });
+        try ik.forward.run(m, &s, &cache, ids.value[at..][0..n], .{ .logits = if (at + n == T and full) .last else .none, .prompt = true, .feature_taps = taps, .timing = &tm, .spans = &rec, .repeat = opt.repeat });
         _ = try rec.readAfterCompletion();
         var secs: [class_count]f64 = undefined;
         for (rec.aggregates(), &secs) |a, *x| x.* = a.gpu_seconds;
@@ -715,7 +741,12 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     // the last row's hidden state after the last layer: a row's bits do not depend on the chunk it was fed in
     const row_bytes = @as(usize, c.hidden) * 2;
     const digest = std.hash.Wyhash.hash(0, s.h.slice(u8, last * row_bytes)[(last - 1) * row_bytes ..][0..row_bytes]);
-    std.debug.print("{{\"prompt_tokens\": {d}, \"chunk\": {d}, \"layers\": {d}, \"drafts\": {}, \"prompt_ms\": {d:.1}, \"tok_s\": {d:.2}, \"gpu_ms\": {d:.1}, \"encode_ms\": {d:.1}, \"buffers\": {d}, \"max_buffer_ms\": {d:.1}, \"h_digest\": \"{x}\", \"classes\": ", .{ T, m.prefill_rows, m.layers, opt.drafts, prompt_s * 1e3, @as(f64, @floatFromInt(T)) / prompt_s, gpu * 1e3, encode * 1e3, buffers, longest * 1e3, digest });
+    std.debug.print("{{\"prompt_tokens\": {d}, \"chunk\": {d}, \"layers\": {d}, \"repeat\": {d}, \"drafts\": {}, \"prompt_ms\": {d:.1}, \"tok_s\": {d:.2}, \"gpu_ms\": {d:.1}, \"encode_ms\": {d:.1}, \"buffers\": {d}, \"max_buffer_ms\": {d:.1}, \"h_digest\": \"{x}\", \"classes\": ", .{ T, m.prefill_rows, m.layers, opt.repeat, opt.drafts, prompt_s * 1e3, @as(f64, @floatFromInt(T)) / prompt_s, gpu * 1e3, encode * 1e3, buffers, longest * 1e3, digest });
     printClasses(&totals);
     std.debug.print("}}\n", .{});
+    // the command buffers run one after another: their GPU times cannot add up to more than the prompt's wall time
+    if (gpu > prompt_s * 1.02) {
+        std.debug.print("the GPU time ({d:.1} ms) exceeds the prompt's wall time ({d:.1} ms): a command buffer's timestamps are wrong\n", .{ gpu * 1e3, prompt_s * 1e3 });
+        return error.GpuTimeExceedsWallTime;
+    }
 }
