@@ -6,8 +6,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Keys a block covers, and floats a (row, head, block) partial takes: m, l, then acc[128].
-constant uint IK_AS_KEYS = 256, IK_AS_SLOT = 130;
+// Keys a block covers, floats a (row, head, block) partial takes (m, l, then acc[128]), and rows tiled per pass in ik_attn_part_w.
+constant uint IK_AS_KEYS = 256, IK_AS_SLOT = 130, IK_AS_WTILE = 4;
 
 // One step of a transposed sum over the simdgroup: v[0..2N) hold two halves of N slots, lanes with bit N set keep the
 // upper half, and each kept slot adds the partner lane's value for it.
@@ -56,6 +56,19 @@ struct IkRelFold {
       }
       out[j] = float(bfloat(s));
     }
+  }
+  inline float one(uint t, uint heads, uint head, uint extent, uint dist) const {
+    const device bfloat4* r = (const device bfloat4*)(reln + (ulong(t) * heads + head) * IK_DREL);
+    float s = 0.0f;
+    _Pragma("clang loop unroll(full)")
+    for (uint c = 0; c < IK_DREL / 4; ++c) {
+      const float4 v = float4(r[c]);
+      s += v.x * float(proj[ulong(4 * c) * extent + dist]);
+      s += v.y * float(proj[ulong(4 * c + 1) * extent + dist]);
+      s += v.z * float(proj[ulong(4 * c + 2) * extent + dist]);
+      s += v.w * float(proj[ulong(4 * c + 3) * extent + dist]);
+    }
+    return float(bfloat(s));
   }
 };
 
@@ -174,6 +187,191 @@ inline void ik_attn_part_run(constant ik_args& a, const device bfloat* qn, const
   threadgroup float tmax[8][6], tsum[8][6];
   threadgroup float4 tacc[8][6][32]; // [key group][head][lane]: the lane's four dims
   ik_attn_part_run(a, qn, keys, values, IkRelFold{reln, proj}, part, tmax, tsum, tacc, tg, tid, sg, lane);
+}
+
+// Static register indexing for a rolled kg = 0..7 loop (avoids dynamic-index stack spills and 8x code bloat).
+inline void ik_as_sput(thread float (&s)[8], uint kg, float v) {
+  switch (kg) {
+    case 0: s[0] = v; break;
+    case 1: s[1] = v; break;
+    case 2: s[2] = v; break;
+    case 3: s[3] = v; break;
+    case 4: s[4] = v; break;
+    case 5: s[5] = v; break;
+    case 6: s[6] = v; break;
+    default: s[7] = v; break;
+  }
+}
+
+inline float ik_as_sget(thread const float (&s)[8], uint kg) {
+  switch (kg) {
+    case 0: return s[0];
+    case 1: return s[1];
+    case 2: return s[2];
+    case 3: return s[3];
+    case 4: return s[4];
+    case 5: return s[5];
+    case 6: return s[6];
+    default: return s[7];
+  }
+}
+
+// One (kv head, block) a threadgroup for a global layer's decode window (dispatch (kv heads, 1, a.blocks) threadgroups
+// of 192 threads = 6 simdgroups, one per q head in the kv group): cooperatively loads each 32-key and 32-value slice
+// into 8 KiB of threadgroup memory once for all 6 q heads and up to IK_AS_WTILE window rows, forming every row's
+// partial in the exact reduction and accumulation order of ik_attn_part.
+[[kernel, max_total_threads_per_threadgroup(192)]] void ik_attn_part_w(constant ik_args& a [[buffer(0)]],
+    const device bfloat* qn [[buffer(1)]], const device bfloat* keys [[buffer(2)]], const device bfloat* values [[buffer(3)]],
+    const device bfloat* reln [[buffer(4)]], const device bfloat* proj [[buffer(5)]], device float* part [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  // 8 KiB shared bf16 cache: each 32-key / 32-value slice is loaded once from DRAM for all 6 q heads and all tile rows.
+  threadgroup bfloat4 tbuf[32][32];
+  const uint D = a.dim, g = tg.x, hh = sg, head = g * 6 + hh;
+  // Launch the highest-index (bias-bearing) blocks first so they never straggle in the final wave.
+  const uint blk = a.blocks - 1 - tg.z;
+  const uint base = (a.queries + blk) * IK_AS_KEYS;
+  const uint wrap = base - base % a.ring;
+  const uint win_to = min(a.pos + a.rows, base + IK_AS_KEYS);
+  const ulong head_step = ulong(a.blocks) * IK_AS_SLOT;
+  if (base >= win_to) {
+    for (uint t = 0; t < a.rows; ++t) {
+      device float* slots = part + ((ulong(t) * a.heads + g * 6) * a.blocks + blk) * IK_AS_SLOT;
+      for (uint i = tid; i < 6 * IK_AS_SLOT; i += 192)
+        slots[(i / IK_AS_SLOT) * head_step + i % IK_AS_SLOT] = i % IK_AS_SLOT == 0 ? -INFINITY : 0.0f;
+    }
+    return;
+  }
+  const IkRelFold bias{reln, proj};
+
+  for (uint t0 = 0; t0 < a.rows; t0 += IK_AS_WTILE) {
+    const uint nr = min(IK_AS_WTILE, a.rows - t0);
+    const uint tile_to = min(a.pos + t0 + nr, base + IK_AS_KEYS);
+    if (base >= tile_to) {
+      for (uint r = 0; r < nr; ++r) {
+        const uint t = t0 + r;
+        device float* slots = part + ((ulong(t) * a.heads + g * 6) * a.blocks + blk) * IK_AS_SLOT;
+        for (uint i = tid; i < 6 * IK_AS_SLOT; i += 192)
+          slots[(i / IK_AS_SLOT) * head_step + i % IK_AS_SLOT] = i % IK_AS_SLOT == 0 ? -INFINITY : 0.0f;
+      }
+      continue;
+    }
+    bool row_live[IK_AS_WTILE];
+    float s_tile[IK_AS_WTILE][8];
+    float m_tile[IK_AS_WTILE];
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < IK_AS_WTILE; ++r) {
+      row_live[r] = r < nr && base < min(a.pos + t0 + r + 1, base + IK_AS_KEYS);
+      m_tile[r] = -INFINITY;
+    }
+    // Pass 1: rolled loop over 8 groups of 32 keys through tbuf (small I-cache footprint).
+    for (uint kg = 0; kg < 8; ++kg) {
+      const uint k0 = base + 32 * kg, key = k0 + lane;
+      for (uint idx = tid; idx < 1024; idx += 192) {
+        const uint ki = idx >> 5, ln = idx & 31;
+        tbuf[ki][ln] = *(const device bfloat4*)(keys + (ulong(min(max(k0 + ki, base), tile_to - 1) - wrap) * a.kv + g) * D + 4 * ln);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const bool kg_bias = (a.pos + t0) < k0 + 31 + a.extent;
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < IK_AS_WTILE; ++r) {
+        if (row_live[r]) {
+          const uint t = t0 + r, p = a.pos + t;
+          const uint to = min(p + 1, base + IK_AS_KEYS);
+          const float4 qr = float4(*(const device bfloat4*)(qn + (ulong(t) * a.heads + head) * D + 4 * lane));
+          float pd[32];
+          _Pragma("clang loop unroll(full)")
+          for (uint i = 0; i < 32; ++i) {
+            const float4 k = float4(tbuf[i][lane]);
+            float x = qr.x * k.x;
+            x = fma(qr.y, k.y, x);
+            x = fma(qr.z, k.z, x);
+            pd[i] = fma(qr.w, k.w, x);
+          }
+          float x = ik_as_scatter(pd, lane);
+          if (key >= base && key < to) {
+            x = x * a.scale;
+            if (kg_bias && p - key < a.extent) x += bias.one(t, a.heads, head, a.extent, p - key);
+          } else {
+            x = -INFINITY;
+          }
+          ik_as_sput(s_tile[r], kg, x);
+          const float mx = simd_max(x);
+          m_tile[r] = kg == 0 ? mx : max(m_tile[r], mx);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Pass 2: rolled loop over 8 groups of 32 values through tbuf, accumulating all tile rows per value load.
+    float l_tile[IK_AS_WTILE];
+    float4 acc_tile[IK_AS_WTILE];
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < IK_AS_WTILE; ++r) {
+      l_tile[r] = 0.0f;
+      acc_tile[r] = 0.0f;
+    }
+    for (uint kg = 0; kg < 8; ++kg) {
+      const uint k0 = base + 32 * kg;
+      for (uint idx = tid; idx < 1024; idx += 192) {
+        const uint ki = idx >> 5, ln = idx & 31;
+        tbuf[ki][ln] = *(const device bfloat4*)(values + (ulong(min(max(k0 + ki, base), tile_to - 1) - wrap) * a.kv + g) * D + 4 * ln);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      float w_row[IK_AS_WTILE];
+      float4 ak[IK_AS_WTILE];
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < IK_AS_WTILE; ++r) {
+        ak[r] = 0.0f;
+        w_row[r] = 0.0f;
+        if (row_live[r]) {
+          const float w = exp(ik_as_sget(s_tile[r], kg) - m_tile[r]);
+          w_row[r] = w;
+          const float ls = simd_sum(w);
+          l_tile[r] = kg == 0 ? ls : (l_tile[r] + ls);
+        }
+      }
+      _Pragma("clang loop unroll(full)")
+      for (uint i = 0; i < 32; ++i) {
+        const float4 v = float4(tbuf[i][lane]);
+        _Pragma("clang loop unroll(full)")
+        for (uint r = 0; r < IK_AS_WTILE; ++r) {
+          if (row_live[r]) ak[r] = fma(float4(simd_broadcast(w_row[r], ushort(i))), v, ak[r]);
+        }
+      }
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < IK_AS_WTILE; ++r) {
+        if (row_live[r]) acc_tile[r] = kg == 0 ? ak[r] : (acc_tile[r] + ak[r]);
+      }
+      if (kg < 7) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Write partials directly: each simdgroup owns one q head for all tile rows.
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < IK_AS_WTILE; ++r) {
+      if (r < nr) {
+        const uint t = t0 + r, p = a.pos + t;
+        const uint to = min(p + 1, base + IK_AS_KEYS);
+        device float* slot = part + ((ulong(t) * a.heads + head) * a.blocks + blk) * IK_AS_SLOT;
+        if (base >= to) {
+          if (lane == 0) {
+            slot[0] = -INFINITY;
+            slot[1] = 0.0f;
+          }
+          device float* dst = slot + 2 + 4 * lane;
+          *(device float2*)dst = float2(0.0f);
+          *(device float2*)(dst + 2) = float2(0.0f);
+        } else {
+          if (lane == 0) {
+            slot[0] = m_tile[r];
+            slot[1] = l_tile[r];
+          }
+          device float* dst = slot + 2 + 4 * lane;
+          *(device float2*)dst = acc_tile[r].xy;
+          *(device float2*)(dst + 2) = acc_tile[r].zw;
+        }
+      }
+    }
+    if (t0 + IK_AS_WTILE < a.rows) threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
 }
 
 // One (head, row) a simdgroup (dispatch (heads, rows) threadgroups of 32 threads), four dims a lane. Starts from the sink

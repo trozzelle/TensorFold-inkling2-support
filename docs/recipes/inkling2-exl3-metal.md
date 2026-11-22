@@ -134,8 +134,8 @@ Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a b
 | Prompt, direct start, 8,192 tokens | 2,119 tok/s (3,867 ms: experts 2,325 ms, dense projections 675 ms, norms 422 ms, attention 298 ms, the rest about 100 ms) |
 | Prompt, direct start, 131,008 tokens, drafts on | 1,618 tok/s (80.95 s wall, 78.35 s GPU, max command buffer 216 ms) |
 | Resumed 32k follow-up / regenerate / edit / reask (served, prompt cache on) | 0.51 s / 0.20 s / 0.50 s / 2.45 s TTFT (vs 16.7-17.3 s cache off; bit-identical replies, 1.00x decode rate) |
-| Decode after 32,704 tokens (direct start) | 56.3 tok/s with drafts; 37.1 tok/s plain |
-| Decode after 131,008 tokens (direct start) | 45.7 tok/s with drafts; 31.9 tok/s plain |
+| Decode after 32,704 tokens (direct start) | 56.8 tok/s with drafts (up from 56.3); 37.1 tok/s plain |
+| Decode after 131,008 tokens (direct start) | 47.5 tok/s with drafts (up from 45.7); 31.9 tok/s plain |
 | Decode with drafts, three gate prompts | 60.6 tok/s (61.6 before the chunk path) |
 | Decode with drafts (default) | 61.4 tok/s (65.2 on the bench prompt) |
 | Decode with drafts, every draft verified at depth 4 | 57.1 tok/s |
@@ -144,8 +144,12 @@ Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a b
 | Decode, sampled (temperature 0.7; four short prompts with top_p 0.95, top_p 0.95 and top_k 20, min_p 0.05, none) | 44.7 tok/s with drafts; 38.7 tok/s with `--no-drafts` |
 
 Decode steps of up to 16 rows take a decode path: the experts run a rate-grouped EXL3 chain (adapted from Sushi), and
-attention, norms and the attention-input matvecs have their own kernels. A step takes about 25 ms of GPU time. Prompt
-rows take the chunk path above.
+attention, norms and the attention-input matvecs have their own kernels. On global layers at long contexts (at least 96
+blocks of 256 keys for windows of 3 or more rows, or 256 blocks for 2 or more rows), split-K attention switches to
+`ik_attn_part_w`, which loads each 32-key and 32-value slice once into threadgroup memory for all six query heads and up
+to four window rows in the exact reduction order of `ik_attn_part` (saving 0.73 ms per 6-row verify round at 32k tokens
+and 5.50 ms at 131k on an M5 Ultra, bit-for-bit identical). A step takes about 25 ms of GPU time at short contexts.
+Prompt rows take the chunk path above.
 
 ## Fidelity
 
