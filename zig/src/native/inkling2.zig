@@ -67,7 +67,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     }
     // rows of a prompt chunk at most: read once, and the load's scratch and budget and the host's prefill step follow it
     const prefill_rows = fl.state.parsePrefillRows(if (std.c.getenv("INKLING_PREFILL_ROWS")) |v| std.mem.span(v) else null) catch {
-        problem.* = try std.fmt.allocPrint(a, "INKLING_PREFILL_ROWS is not a prompt chunk size: give a multiple of {d} from {d} to {d}, or unset it for {d}", .{ fl.state.prefill_unit, fl.state.prefill_unit, fl.state.max_prefill_rows, fl.state.default_prefill_rows });
+        problem.* = try std.fmt.allocPrint(a, "INKLING_PREFILL_ROWS is not a prompt chunk size: give a multiple of {d} from {d} to {d}, or unset it for {d} ({d} on a GPU without tensor units)", .{ fl.state.prefill_unit, fl.state.prefill_unit, fl.state.max_prefill_rows, fl.state.default_prefill_rows, fl.state.per_op_prefill_rows });
         return null;
     };
     const pool = mtl.objc.Pool.push();

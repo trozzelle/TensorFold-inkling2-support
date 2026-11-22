@@ -67,6 +67,11 @@ pub const Queue = struct {
     }
 };
 
+/// A reported GPU start, or `floor` where Metal reported none (0): see `CommandBuffer.gpuStartOr`.
+pub fn startOr(start: f64, floor: f64) f64 {
+    return if (start > 0) start else floor;
+}
+
 pub const CommandBuffer = struct {
     id: Id,
     m4: ?*metal4.Slot = null,
@@ -164,8 +169,7 @@ pub const CommandBuffer = struct {
     /// GPUStartTime of 0 while its end is set, so end - start would be the whole uptime. A buffer on a serial queue starts
     /// no earlier than its commit and the end of the one ahead of it: the caller's `floor`, which makes the span a ceiling.
     pub fn gpuStartOr(self: CommandBuffer, floor: f64) f64 {
-        const start = self.gpuStart();
-        return if (start > 0) start else floor;
+        return startOr(self.gpuStart(), floor);
     }
 
     /// The GPU's start and end once reported, without waiting for the report (Metal 4), else null.

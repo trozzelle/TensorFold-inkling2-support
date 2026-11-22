@@ -118,13 +118,14 @@ fn gpuMs(q: mtl.Queue, p: *const cases.Pipes, b: Bufs, mode: Mode, a: cases.Args
         const e = cb.compute(.serial);
         for (0..reps) |_| encodeMode(e, p, b, mode, a);
         e.end();
+        const committed = mtl.clock.seconds();
         cb.commit();
         cb.wait();
         if (cb.failure()) |msg| {
             std.log.err("bench: {s}", .{msg});
             return error.GpuFailed;
         }
-        if (t > 0) ms[t - 1] = (cb.gpuEnd() - cb.gpuStart()) * 1e3 / @as(f64, @floatFromInt(reps));
+        if (t > 0) ms[t - 1] = (cb.gpuEnd() - cb.gpuStartOr(committed)) * 1e3 / @as(f64, @floatFromInt(reps));
     }
     var best = ms[0];
     for (ms) |x| best = @min(best, x);
