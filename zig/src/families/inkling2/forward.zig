@@ -51,7 +51,15 @@ fn view(comptime V: type, v: B) V {
 /// `spans` records each stage group's GPU time by class (the `profile` and `prefill` modes), across the forward's command buffers;
 /// `repeat` runs the loaded layers that many times in the one forward (profile only: the cache's position stays, so the repeats
 /// re-read the same rows).
-pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1 };
+/// Diagnostic per-class ablation for timing: `stub` swaps each dispatch in the class for an empty kernel on the same grid,
+/// `skip` drops the dispatch. Off by default (`Out.ablate == null`); when set, outputs are for timing only.
+pub const Ablation = struct {
+    pub const Mode = enum { run, stub, skip };
+    mode: [counters.class_count]Mode = @splat(.run),
+    now: ?counters.Class = null,
+};
+
+pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1, ablate: ?*Ablation = null };
 /// `encode`, `gpu` and `buffers` (the command buffers used) add up over forwards, and `longest` is the longest single command
 /// buffer's GPU seconds so far; `committed`, `started`, `ended` and `woke` are the last forward's clocks in `seconds()`'s
 /// timebase: the host's first commit, the GPU's start of the first command buffer and end of the last, and the host's return from
@@ -156,6 +164,7 @@ const Enc = struct {
     /// Whether this forward's rows run on the tensor-unit chunk kernels (the GEMM and the attention): a chunk, on a load that has them.
     tensor: bool = false,
     spans: ?*counters.Recorder = null,
+    ablate: ?*Ablation = null,
 
     /// The weights' resources, declared on the current encoder (a span's encoder rotation drops them).
     fn resources(x: Enc) void {
@@ -163,8 +172,15 @@ const Enc = struct {
         for (x.m.weights.tables) |buf| x.e.useResource(buf, mtl.ResourceUsage.read);
     }
 
+    fn ablateMode(x: Enc) Ablation.Mode {
+        const ab = x.ablate orelse return .run;
+        const kind = ab.now orelse return .run;
+        return ab.mode[@backingInt(kind)];
+    }
+
     /// Opens a span of `kind` when recording; spans never nest.
     fn begin(x: Enc, kind: counters.Class) !void {
+        if (x.ablate) |ab| ab.now = kind;
         const sp = x.spans orelse return;
         const before = x.e.*;
         try sp.beginSpan(x.e, kind);
@@ -172,6 +188,7 @@ const Enc = struct {
     }
 
     fn end(x: Enc) !void {
+        if (x.ablate) |ab| ab.now = null;
         const sp = x.spans orelse return;
         const before = x.e.*;
         try sp.endSpan(x.e);
@@ -179,11 +196,20 @@ const Enc = struct {
     }
 
     fn glue(x: Enc, g: Glue, a: Args, bufs: []const B, grid: [3]usize, group: [3]usize, groups: bool) void {
+        const g3 = mtl.Size.of(grid[0], grid[1], grid[2]);
+        const t3 = mtl.Size.of(group[0], group[1], group[2]);
+        switch (x.ablateMode()) {
+            .skip => return,
+            .stub => {
+                x.e.setPipeline(x.m.pipe(.nop));
+                if (groups) x.e.dispatchGroups(g3, t3) else x.e.dispatchThreads(g3, t3);
+                return;
+            },
+            .run => {},
+        }
         x.e.setPipeline(x.m.pipe(g));
         x.e.setValue(a, 0);
         for (bufs, 1..) |r, slot| x.e.setBuffer(r.buf, r.off, slot);
-        const g3 = mtl.Size.of(grid[0], grid[1], grid[2]);
-        const t3 = mtl.Size.of(group[0], group[1], group[2]);
         if (groups) x.e.dispatchGroups(g3, t3) else x.e.dispatchThreads(g3, t3);
     }
 
@@ -197,7 +223,20 @@ const Enc = struct {
 
     /// out = in W^T for `rows` rows in slabs of at most 32 (one row's bits do not depend on the slab).
     fn mv(x: Enc, d: wts.Dense, in: B, out: B, rows: usize) void {
-        matvec(x.e.*, x.m, d, in, out, rows);
+        switch (x.ablateMode()) {
+            .skip => return,
+            .stub => {
+                var r: usize = 0;
+                while (r < rows) {
+                    const k = @min(rows - r, 32);
+                    x.e.setPipeline(x.m.pipe(.nop));
+                    x.e.dispatchGroups(mtl.Size.of((d.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+                    r += k;
+                }
+                return;
+            },
+            .run => matvec(x.e.*, x.m, d, in, out, rows),
+        }
     }
 
     /// out = in W^T for `rows` rows of the bf16 [d.n, d.k] matrix `d`, bf16 out: the chunk kernels' tensor-unit GEMM (bf16 operands,
@@ -218,6 +257,17 @@ const Enc = struct {
     /// buffers by address, so they are declared on the encoder here.
     fn mvs(x: Enc, slot: usize, segs: []const Seg, rows: usize) void {
         std.debug.assert(segs.len <= st.max_segs and rows <= st.window_rows);
+        switch (x.ablateMode()) {
+            .skip => return,
+            .stub => {
+                var total: u32 = 0;
+                for (segs) |sg| total += sg.w.n;
+                x.e.setPipeline(x.m.pipe(.nop));
+                x.e.dispatchGroups(mtl.Size.of((total + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+                return;
+            },
+            .run => {},
+        }
         const off = slot * st.seg_slot;
         const bytes = x.s.segs.slice(u8, off + st.seg_slot)[off..][0 .. segs.len * @sizeOf(IkSeg)];
         const table: []IkSeg = @alignCast(std.mem.bytesAsSlice(IkSeg, bytes));
@@ -343,7 +393,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     var done: Committed = .{}; // the command buffers committed before `cb`, when the forward is in several
     var enc = cb.compute(.serial);
     var open = true; // `enc` is not yet ended
-    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans };
+    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans, .ablate = out.ablate };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
         enc.end();
         return err;
