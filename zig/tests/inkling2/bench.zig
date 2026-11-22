@@ -16,11 +16,16 @@ const usage =
     \\tf-inkling-bench dense [rows...]                              48 layers' dense matvecs (default rows 1 2 4 6 8 16), per shape at 1 and 8 rows, unembed at 1 row
     \\tf-inkling-bench experts <model> <layer> <xm.bin> <eids.bin> <rows> <row0> <act.bin> <out>
     \\                                                              w13 and w2 on recorded MoE inputs, bf16 out
-    \\tf-inkling-bench xd <model> <layer> <xm.bin> <eids.bin> <rows> [check] [parts]
+    \\tf-inkling-bench launch [n]                                   n (default 839) dependent dispatches on a serial encoder: 1 and 64 threadgroups, alone and with a light second-queue load
+    \\tf-inkling-bench read                                         read-only probe with ik_matvec_8's grid/loads over the 384 dense matrices (serial and concurrent), and ik_matvec_8 at 1 and 8 rows
+    \\tf-inkling-bench split [keys...]                              split-K decode attention at long contexts (default 8192 32768 131072), rows 1, 2, 4, 8, sliding and global
+    \\tf-inkling-bench xd <model> <layer> <xm.bin> <eids.bin> <rows> [check] [parts] [ablate=rot|decode] [shared=2|3|4]
     \\                                                              the EXL3 decode chain on a layer's recorded MoE inputs: microseconds per layer call
     \\                                                              (median of 7 rounds after 2 warm-ups, 48 windows chained) at each row count of <rows>
     \\                                                              (one count or a comma list, e.g. 1,2,4,6,8,16), after a comparison of its outputs with the
-    \\                                                              projections' path; `check` stops after the comparison, `parts` also times each dispatch alone
+    \\                                                              projections' path; `check` stops after the comparison, `parts` also times each dispatch alone;
+    \\                                                              `ablate=rot|decode` times timing-only rotation or decode ablations (check skipped);
+    \\                                                              `shared=P` byte-checks and times a shared-expert pair prototype for M = 1..P rows per expert
     \\tf-inkling-bench xd-dump <model> <layer> <xm.bin> <eids.bin> <rows> <row0> <act.bin> <out>
     \\                                                              the decode chain on recorded rows, every pick weighing 1/8: bf16 files <out>.{gu,y,y_own,moe,moe_own}.bin
     \\                                                              (y: w2 per pick on act.bin, the input `experts` measures; y_own: on the chain's own act),
@@ -46,6 +51,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "gemm")) return gemm(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "draft")) return draft(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "dense")) return dense(init, args[2..]);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "launch")) return launchMode(init, args[2..]);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "read")) return readMode(init);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "split")) return splitMode(init, args[2..]);
     if ((args.len == 3 or args.len == 5) and std.mem.eql(u8, args[1], "dspark")) return @import("bench_dspark.zig").run(init, args);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "pattn")) return @import("bench_pattn.zig").run(init, args[2..]);
     if (args.len >= 4 and std.mem.eql(u8, args[1], "xp")) return @import("bench_xp.zig").run(init, args);
@@ -397,6 +405,9 @@ const xd_inner: usize = 2304;
 const xd_experts: usize = 384;
 const xd_taps_layers: usize = 48; // layers in a taps file's expert-pick rows
 
+const XdAblate = enum { none, rot, decode };
+const ProbeEntry = extern struct { eid: u32, n: u32, slot: [4]u32 };
+
 /// Which of the chain's four dispatches to encode; `dbg` takes the mid and finish kernels that also store gu and ey.
 const Run = struct { pair: bool = true, mid: bool = true, down: bool = true, finish: bool = true, dbg: bool = false };
 
@@ -420,15 +431,25 @@ const Xd = struct {
 
     const max_slots = 16 * 8;
 
-    fn init(device: mtl.Device, table: mtl.Buffer) !Xd {
-        const lib = try mtl.Library.fromSource(device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
+    fn init(device: mtl.Device, table: mtl.Buffer, ablate: XdAblate) !Xd {
+        const lib = try mtl.Library.fromSource(device, ks.inkling2_glue ++ @embedFile("bench_probe.metal"), .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
         const H = xd_hidden;
         const I = xd_inner;
+        const pair_name: [:0]const u8 = switch (ablate) {
+            .none => "ik_xd_pair",
+            .rot => "ik_xd_pair_norot",
+            .decode => "ik_xd_pair_nodecode",
+        };
+        const down_name: [:0]const u8 = switch (ablate) {
+            .none => "ik_xd_down",
+            .rot => "ik_xd_down_norot",
+            .decode => "ik_xd_down_nodecode",
+        };
         const xd: Xd = .{
             .lib = lib,
-            .pair = try mtl.Pipeline.init(device, lib, "ik_xd_pair", false),
+            .pair = try mtl.Pipeline.init(device, lib, pair_name, false),
             .mid = try mtl.Pipeline.init(device, lib, "ik_xd_mid", false),
-            .down = try mtl.Pipeline.init(device, lib, "ik_xd_down", false),
+            .down = try mtl.Pipeline.init(device, lib, down_name, false),
             .finish = try mtl.Pipeline.init(device, lib, "ik_xd_finish", false),
             .mid_dbg = try mtl.Pipeline.init(device, lib, "ik_xd_mid_dbg", false),
             .finish_dbg = try mtl.Pipeline.init(device, lib, "ik_xd_finish_dbg", false),
@@ -806,13 +827,24 @@ fn xdLeg(init: std.process.Init, args: []const [:0]const u8) !void {
     const nc = try xdRows(args[6], &counts);
     var check_only = false;
     var parts = false;
+    var ablate: XdAblate = .none;
+    var shared_p: ?usize = null;
     for (args[7..]) |option| {
         if (std.mem.eql(u8, option, "check")) {
             check_only = true;
         } else if (std.mem.eql(u8, option, "parts")) {
             parts = true;
+        } else if (std.mem.eql(u8, option, "ablate=rot")) {
+            ablate = .rot;
+        } else if (std.mem.eql(u8, option, "ablate=decode")) {
+            ablate = .decode;
+        } else if (std.mem.startsWith(u8, option, "shared=")) {
+            const p = try std.fmt.parseInt(usize, option["shared=".len..], 10);
+            if (p < 2 or p > 4) return error.BadSharedP;
+            shared_p = p;
         } else return error.UnknownOption;
     }
+    if (ablate != .none and shared_p != null) return error.ConflictingOptions;
     const device = try mtl.Device.init();
     const q = try device.queue();
     var ck = ik.weights.Checkpoint.init(init.gpa);
@@ -823,21 +855,446 @@ fn xdLeg(init: std.process.Init, args: []const [:0]const u8) !void {
     const taps = try XdTaps.read(init, args[4], args[5]);
     defer taps.deinit(init.gpa);
     const first = try xdFirstRow(init, args[4], taps.T);
-    var xdc = try Xd.init(device, table);
+    var xdc = try Xd.init(device, table, ablate);
     defer xdc.deinit();
-    std.debug.print("{{\"xd\": {{\"layer\": {d}, \"k2\": {d}, \"k3\": {d}, \"rows_in_taps\": {d}, \"first_row\": {d}}}}}\n", .{ layer, widths[2], widths[3], taps.T, first });
+    std.debug.print("{{\"xd\": {{\"layer\": {d}, \"k2\": {d}, \"k3\": {d}, \"rows_in_taps\": {d}, \"first_row\": {d}, \"ablate\": \"{s}\"}}}}\n", .{ layer, widths[2], widths[3], taps.T, first, @tagName(ablate) });
+    if (shared_p) |P| {
+        return xdSharedLeg(device, q, &xdc, &ck, taps, first, slot, layer, P);
+    }
     for (counts[0..nc]) |rows| {
         const win = try XdWindows.init(device, rows, first, taps.T, taps.xm(), taps.picks(), slot, layer);
         defer win.deinit();
-        try xdCheck(device, q, &xdc, &ck, win, layer);
+        if (ablate == .none) {
+            try xdCheck(device, q, &xdc, &ck, win, layer);
+        } else {
+            std.debug.print("{{\"xd_check\": {{\"layer\": {d}, \"rows\": {d}, \"ablate\": \"{s}\", \"skipped\": true}}}}\n", .{ layer, rows, @tagName(ablate) });
+        }
         if (check_only) continue;
         const us = try xdTime(q, &xdc, &ck, win, .{});
-        std.debug.print("{{\"decode\": {{\"layer\": {d}, \"rows\": {d}, \"us\": {d:.1}, \"distinct\": {d:.1}}}}}\n", .{ layer, rows, us, win.distinct });
+        std.debug.print("{{\"decode\": {{\"layer\": {d}, \"rows\": {d}, \"ablate\": \"{s}\", \"us\": {d:.1}, \"distinct\": {d:.1}}}}}\n", .{ layer, rows, @tagName(ablate), us, win.distinct });
         if (parts) {
             const only = [4]Run{ .{ .mid = false, .down = false, .finish = false }, .{ .pair = false, .down = false, .finish = false }, .{ .pair = false, .mid = false, .finish = false }, .{ .pair = false, .mid = false, .down = false } };
             var each: [4]f64 = undefined;
             for (only, &each) |run, *t| t.* = try xdTime(q, &xdc, &ck, win, run);
-            std.debug.print("{{\"decode_parts\": {{\"layer\": {d}, \"rows\": {d}, \"pair_us\": {d:.1}, \"mid_us\": {d:.1}, \"down_us\": {d:.1}, \"finish_us\": {d:.1}}}}}\n", .{ layer, rows, each[0], each[1], each[2], each[3] });
+            std.debug.print("{{\"decode_parts\": {{\"layer\": {d}, \"rows\": {d}, \"ablate\": \"{s}\", \"pair_us\": {d:.1}, \"mid_us\": {d:.1}, \"down_us\": {d:.1}, \"finish_us\": {d:.1}}}}}\n", .{ layer, rows, @tagName(ablate), each[0], each[1], each[2], each[3] });
+        }
+    }
+}
+
+/// Shared-expert pair prototype: 48 experts each with M rows (M = 1..P) from recorded taps.
+/// Byte-checks every slot's planes against ik_xd_pair first; refuses to time on any difference.
+fn xdSharedLeg(device: mtl.Device, q: mtl.Queue, xd: *const Xd, ck: *const ik.weights.Checkpoint, taps: XdTaps, first: usize, slot_idx: usize, layer: u32, P: usize) !void {
+    const H = xd_hidden;
+    const n_experts: usize = 48;
+    const pname: [:0]const u8 = switch (P) {
+        2 => "ik_probe_pair_2",
+        3 => "ik_probe_pair_3",
+        4 => "ik_probe_pair_4",
+        else => return error.BadSharedP,
+    };
+    const shared_pipe = try mtl.Pipeline.init(device, xd.lib, pname, false);
+    defer shared_pipe.deinit();
+    const max_slots = n_experts * P;
+    const x_buf = try device.buffer(P * H * 2, mtl.ResourceOptions.shared);
+    defer x_buf.deinit();
+    const entries_buf = try device.buffer(n_experts * @sizeOf(ProbeEntry), mtl.ResourceOptions.shared);
+    defer entries_buf.deinit();
+    const eids_buf = try device.buffer(max_slots * 4, mtl.ResourceOptions.shared);
+    defer eids_buf.deinit();
+    const ref_planes = try device.buffer(max_slots * 2 * H * 4, mtl.ResourceOptions.shared);
+    defer ref_planes.deinit();
+    const got_planes = try device.buffer(max_slots * 2 * H * 4, mtl.ResourceOptions.shared);
+    defer got_planes.deinit();
+
+    // P distinct recorded rows for inputs, and 48 experts drawn from recorded picks on this layer.
+    const avail = taps.T - first;
+    if (avail == 0) return error.SequenceTooShort;
+    for (0..P) |r| {
+        const src_row = first + (r * 37 + 11) % avail;
+        @memcpy(x_buf.slice(u16, P * H)[r * H ..][0..H], taps.xm()[((src_row) * 2 + slot_idx) * H ..][0..H]);
+    }
+    var chosen: [n_experts]u32 = undefined;
+    var seen: [xd_experts]bool = @splat(false);
+    var found: usize = 0;
+    var scan: usize = 0;
+    while (found < n_experts and scan < taps.T) : (scan += 1) {
+        const r = (first + scan) % taps.T;
+        for (taps.picks()[(r * xd_taps_layers + layer) * 8 ..][0..8]) |e| {
+            if (e < xd_experts and !seen[e]) {
+                seen[e] = true;
+                chosen[found] = e;
+                found += 1;
+                if (found == n_experts) break;
+            }
+        }
+    }
+    while (found < n_experts) : (found += 1) chosen[found] = @intCast(found % xd_experts);
+
+    for (1..P + 1) |M| {
+        const total_slots = n_experts * M;
+        const entries = entries_buf.slice(ProbeEntry, n_experts);
+        const eids = eids_buf.slice(u32, total_slots);
+        // Layout: slot = row * 8 + pick_group; here we assign slot s = r * 8 + (e % 8) only for M=1..4?
+        // Careful: ik_xd_pair computes xrow = slot / 8, so slots belonging to input row r must have slot / 8 == r.
+        // We have 48 experts * M slots; give each expert e and member r its own unique slot where slot / 8 = r_row.
+        // Allocate x_slots = n_experts * P / 8? Even simpler: allocate x_full with ceil(total_slots / 8) rows where row k copies x_buf[k % P]!
+        const x_rows = (total_slots + 7) / 8;
+        const x_full = try device.buffer(x_rows * H * 2, mtl.ResourceOptions.shared);
+        defer x_full.deinit();
+        const x_src = x_buf.slice(u16, P * H);
+        for (0..x_rows) |xr| @memcpy(x_full.slice(u16, x_rows * H)[xr * H ..][0..H], x_src[(xr % P) * H ..][0..H]);
+        for (0..n_experts) |ei| {
+            var ent: ProbeEntry = .{ .eid = chosen[ei], .n = @intCast(M), .slot = @splat(0) };
+            for (0..M) |r| {
+                // spread across rows so slots of one expert come from different input rows r
+                const s: u32 = @intCast(r * n_experts + ei);
+                ent.slot[r] = s;
+                eids[s] = chosen[ei];
+            }
+            entries[ei] = ent;
+        }
+        // Byte-exact check against ik_xd_pair
+        @memset(ref_planes.slice(u8, total_slots * 2 * H * 4), 0xff);
+        @memset(got_planes.slice(u8, total_slots * 2 * H * 4), 0xaa);
+        {
+            const cb = q.commandBuffer();
+            const e = cb.compute(.serial);
+            e.useResource(xd.table, mtl.ResourceUsage.read);
+            for (ck.shards.items) |sh| e.useResource(sh.buffer, mtl.ResourceUsage.read);
+            e.setPipeline(xd.pair);
+            e.setValue(ik.forward.Args{ .rows = @intCast(total_slots) }, 0);
+            e.setBuffer(x_full, 0, 1);
+            e.setBuffer(eids_buf, 0, 2);
+            e.setBuffer(xd.table, 0, 3);
+            e.setBuffer(ref_planes, 0, 4);
+            e.dispatchGroups(mtl.Size.of(144, total_slots, 2), mtl.Size.of(128, 1, 1));
+            e.setPipeline(shared_pipe);
+            e.setBuffer(x_full, 0, 0);
+            e.setBuffer(entries_buf, 0, 1);
+            e.setBuffer(xd.table, 0, 2);
+            e.setBuffer(got_planes, 0, 3);
+            e.dispatchGroups(mtl.Size.of(144, n_experts, 2), mtl.Size.of(128, 1, 1));
+            e.end();
+            cb.commit();
+            cb.wait();
+            if (cb.failure()) |msg| {
+                std.log.err("xd shared check: {s}", .{msg});
+                return error.GpuFailed;
+            }
+        }
+        const bytes = total_slots * 2 * H * 4;
+        if (!std.mem.eql(u8, got_planes.slice(u8, bytes), ref_planes.slice(u8, bytes))) {
+            std.log.err("xd shared P={d} M={d}: planes differ from ik_xd_pair", .{ P, M });
+            return error.SharedPairMismatch;
+        }
+        // Time shared kernel (48 experts per call, 4 calls per CB, median of 7 after 2 warm-ups)
+        const reps: usize = 4;
+        var us_sh: [xd_rounds]f64 = undefined;
+        var us_xd: [xd_rounds]f64 = undefined;
+        for (0..xd_rounds + xd_warmups) |round| {
+            const cb1 = q.commandBuffer();
+            const e1 = cb1.compute(.serial);
+            e1.useResource(xd.table, mtl.ResourceUsage.read);
+            for (ck.shards.items) |sh| e1.useResource(sh.buffer, mtl.ResourceUsage.read);
+            for (0..reps) |_| {
+                e1.setPipeline(shared_pipe);
+                e1.setBuffer(x_full, 0, 0);
+                e1.setBuffer(entries_buf, 0, 1);
+                e1.setBuffer(xd.table, 0, 2);
+                e1.setBuffer(got_planes, 0, 3);
+                e1.dispatchGroups(mtl.Size.of(144, n_experts, 2), mtl.Size.of(128, 1, 1));
+            }
+            e1.end();
+            cb1.commit();
+            cb1.wait();
+            if (cb1.failure()) |msg| {
+                std.log.err("xd shared time: {s}", .{msg});
+                return error.GpuFailed;
+            }
+            const cb2 = q.commandBuffer();
+            const e2 = cb2.compute(.serial);
+            e2.useResource(xd.table, mtl.ResourceUsage.read);
+            for (ck.shards.items) |sh| e2.useResource(sh.buffer, mtl.ResourceUsage.read);
+            for (0..reps) |_| {
+                e2.setPipeline(xd.pair);
+                e2.setValue(ik.forward.Args{ .rows = @intCast(total_slots) }, 0);
+                e2.setBuffer(x_full, 0, 1);
+                e2.setBuffer(eids_buf, 0, 2);
+                e2.setBuffer(xd.table, 0, 3);
+                e2.setBuffer(ref_planes, 0, 4);
+                e2.dispatchGroups(mtl.Size.of(144, total_slots, 2), mtl.Size.of(128, 1, 1));
+            }
+            e2.end();
+            cb2.commit();
+            cb2.wait();
+            if (cb2.failure()) |msg| {
+                std.log.err("xd ref time: {s}", .{msg});
+                return error.GpuFailed;
+            }
+            if (round >= xd_warmups) {
+                us_sh[round - xd_warmups] = (cb1.gpuEnd() - cb1.gpuStart()) * 1e6 / @as(f64, @floatFromInt(reps * n_experts));
+                us_xd[round - xd_warmups] = (cb2.gpuEnd() - cb2.gpuStart()) * 1e6 / @as(f64, @floatFromInt(reps * total_slots));
+            }
+        }
+        std.debug.print("{{\"shared\": {{\"layer\": {d}, \"P\": {d}, \"M\": {d}, \"us_per_expert\": {d:.2}, \"xd_us_per_slot\": {d:.2}}}}}\n", .{ layer, P, M, median(&us_sh), median(&us_xd) });
+    }
+}
+
+// ---- Diagnostic probe modes: launch cost, read ceiling, split attention ----
+
+const BgLoad = struct {
+    q: mtl.Queue,
+    pipe: mtl.Pipeline,
+    src: mtl.Buffer,
+    dst: mtl.Buffer,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *BgLoad) void {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const nvec: u32 = 65536; // 1 MiB / 16 B
+        while (!self.stop.load(.acquire)) {
+            const cb = self.q.commandBuffer();
+            const e = cb.compute(.serial);
+            e.setPipeline(self.pipe);
+            e.setBuffer(self.src, 0, 0);
+            e.setBuffer(self.dst, 0, 1);
+            e.setValue(nvec, 2);
+            e.dispatchGroups(mtl.Size.of(32, 1, 1), mtl.Size.of(32, 1, 1));
+            e.end();
+            cb.commit();
+            cb.wait();
+            self.ready.store(true, .release);
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 100_000 };
+            _ = std.c.nanosleep(&ts, null);
+        }
+    }
+};
+
+fn launchMode(_: std.process.Init, args: []const [:0]const u8) !void {
+    const n: usize = if (args.len >= 1) try std.fmt.parseInt(usize, args[0], 10) else 839;
+    const device = try mtl.Device.init();
+    const q = try device.queue();
+    const lib = try mtl.Library.fromSource(device, ks.inkling2_glue ++ @embedFile("bench_probe.metal"), .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
+    defer lib.deinit();
+    const step_pipe = try mtl.Pipeline.init(device, lib, "ik_probe_step", false);
+    defer step_pipe.deinit();
+    const bg_pipe = try mtl.Pipeline.init(device, lib, "ik_probe_bg", false);
+    defer bg_pipe.deinit();
+    const buf = try device.buffer(64 * 4, mtl.ResourceOptions.shared);
+    defer buf.deinit();
+    @memset(buf.slice(f32, 64), 0);
+    const bg_src = try device.buffer(1 << 20, mtl.ResourceOptions.shared);
+    defer bg_src.deinit();
+    const bg_dst = try device.buffer(32 * 4, mtl.ResourceOptions.shared);
+    defer bg_dst.deinit();
+    fill(bg_src, (1 << 20) / 2, 77);
+    for ([_]bool{ false, true }) |second_queue| {
+        var bg: BgLoad = .{ .q = if (second_queue) try device.queue() else q, .pipe = bg_pipe, .src = bg_src, .dst = bg_dst };
+        var thr: ?std.Thread = null;
+        if (second_queue) {
+            thr = try std.Thread.spawn(.{}, BgLoad.run, .{&bg});
+            while (!bg.ready.load(.acquire)) {
+                var ts: std.c.timespec = .{ .sec = 0, .nsec = 50_000 };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+        defer {
+            if (thr) |t| {
+                bg.stop.store(true, .release);
+                t.join();
+                bg.q.deinit();
+            }
+        }
+        for ([_]usize{ 1, 64 }) |groups| {
+            var us: [7]f64 = undefined;
+            for (0..9) |round| {
+                const cb = q.commandBuffer();
+                const e = cb.compute(.serial);
+                for (0..n) |_| {
+                    e.setPipeline(step_pipe);
+                    e.setBuffer(buf, 0, 0);
+                    e.dispatchGroups(mtl.Size.of(groups, 1, 1), mtl.Size.of(32, 1, 1));
+                }
+                e.end();
+                cb.commit();
+                cb.wait();
+                if (cb.failure()) |msg| {
+                    std.log.err("launch: {s}", .{msg});
+                    return error.GpuFailed;
+                }
+                if (round >= 2) us[round - 2] = (cb.gpuEnd() - cb.gpuStart()) * 1e6 / @as(f64, @floatFromInt(n));
+            }
+            std.debug.print("{{\"launch\": {{\"n\": {d}, \"groups\": {d}, \"second_queue\": {}, \"us_per_launch\": {d:.3}}}}}\n", .{ n, groups, second_queue, median(&us) });
+        }
+    }
+}
+
+fn readMode(init: std.process.Init) !void {
+    const device = try mtl.Device.init();
+    const q = try device.queue();
+    const lib = try mtl.Library.fromSource(device, ks.inkling2_glue ++ @embedFile("bench_probe.metal"), .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
+    defer lib.deinit();
+    const read_pipe = try mtl.Pipeline.init(device, lib, "ik_probe_read", false);
+    defer read_pipe.deinit();
+    const mv8_pipe = try mtl.Pipeline.init(device, lib, "ik_matvec_8", false);
+    defer mv8_pipe.deinit();
+    const x_buf = try device.buffer(8 * 6144 * 2, mtl.ResourceOptions.shared);
+    defer x_buf.deinit();
+    fill(x_buf, 8 * 6144, 3);
+    const shapes = [_][2]usize{ .{ 6144, 4608 }, .{ 6144, 4608 }, .{ 1024, 4608 }, .{ 1024, 4608 }, .{ 768, 4608 }, .{ 48, 4608 }, .{ 4608, 6144 }, .{ 384, 4608 } };
+    const Op = struct { w: mtl.Buffer, n: u32, k: u32, y_off: usize };
+    var ops: [48 * shapes.len]Op = undefined;
+    var bufs: std.ArrayList(mtl.Buffer) = .empty;
+    defer {
+        for (bufs.items) |b| b.deinit();
+        bufs.deinit(init.gpa);
+    }
+    var bytes: f64 = 0;
+    var y_total: usize = 0;
+    for (0..48) |l| for (shapes, 0..) |sh, j| {
+        const b = try device.buffer(sh[0] * sh[1] * 2, mtl.ResourceOptions.shared);
+        try bufs.append(init.gpa, b);
+        fill(b, sh[0] * sh[1], 200 + l * shapes.len + j);
+        ops[l * shapes.len + j] = .{ .w = b, .n = @intCast(sh[0]), .k = @intCast(sh[1]), .y_off = y_total };
+        y_total += 8 * sh[0] * 2;
+        bytes += @floatFromInt(sh[0] * sh[1] * 2);
+    };
+    const y_buf = try device.buffer(y_total, mtl.ResourceOptions.shared);
+    defer y_buf.deinit();
+    const Case = struct { mode: []const u8, concurrent: bool, kernel: []const u8, pipe: mtl.Pipeline, rows: u32 };
+    const cases = [_]Case{
+        .{ .mode = "serial", .concurrent = false, .kernel = "ik_probe_read", .pipe = read_pipe, .rows = 1 },
+        .{ .mode = "concurrent", .concurrent = true, .kernel = "ik_probe_read", .pipe = read_pipe, .rows = 1 },
+        .{ .mode = "serial", .concurrent = false, .kernel = "ik_matvec_8", .pipe = mv8_pipe, .rows = 1 },
+        .{ .mode = "concurrent", .concurrent = true, .kernel = "ik_matvec_8", .pipe = mv8_pipe, .rows = 1 },
+        .{ .mode = "serial", .concurrent = false, .kernel = "ik_matvec_8", .pipe = mv8_pipe, .rows = 8 },
+        .{ .mode = "concurrent", .concurrent = true, .kernel = "ik_matvec_8", .pipe = mv8_pipe, .rows = 8 },
+    };
+    for (cases) |cs| {
+        var ms: [TRIALS]f64 = undefined;
+        for (0..TRIALS + 1) |t| {
+            const cb = q.commandBuffer();
+            const e = cb.compute(if (cs.concurrent) .concurrent else .serial);
+            for (0..2) |_| {
+                for (ops) |op| {
+                    e.setPipeline(cs.pipe);
+                    e.setBuffer(x_buf, 0, 0);
+                    e.setBuffer(op.w, 0, 1);
+                    e.setValue(MvArgs{ .rows = cs.rows, .n = op.n, .k = op.k, .ldy = op.n }, 2);
+                    e.setBuffer(y_buf, op.y_off, 3);
+                    e.dispatchGroups(mtl.Size.of((op.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+                }
+            }
+            e.end();
+            cb.commit();
+            cb.wait();
+            if (cb.failure()) |msg| {
+                std.log.err("read: {s}", .{msg});
+                return error.GpuFailed;
+            }
+            if (t > 0) ms[t - 1] = (cb.gpuEnd() - cb.gpuStart()) * 1e3 / 2.0;
+        }
+        const m = median(&ms);
+        std.debug.print("{{\"read\": {{\"mode\": \"{s}\", \"kernel\": \"{s}\", \"rows\": {d}, \"ms\": {d:.3}, \"gbps\": {d:.0}}}}}\n", .{ cs.mode, cs.kernel, cs.rows, m, bytes / 1e6 / m });
+    }
+}
+
+fn splitMode(_: std.process.Init, args: []const [:0]const u8) !void {
+    var key_counts: [16]usize = undefined;
+    var nk: usize = 0;
+    for (args) |a| {
+        if (nk == key_counts.len) return error.TooManyKeyCounts;
+        key_counts[nk] = try std.fmt.parseInt(usize, a, 10);
+        if (key_counts[nk] < 16) return error.KeysTooSmall;
+        nk += 1;
+    }
+    if (nk == 0) {
+        key_counts[0] = 8192;
+        key_counts[1] = 32768;
+        key_counts[2] = 131072;
+        nk = 3;
+    }
+    var max_keys: usize = 0;
+    for (key_counts[0..nk]) |k| max_keys = @max(max_keys, k);
+    const device = try mtl.Device.init();
+    const q = try device.queue();
+    const lib = try mtl.Library.fromSource(device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
+    defer lib.deinit();
+    const part_pipe = try mtl.Pipeline.init(device, lib, "ik_attn_part", false);
+    defer part_pipe.deinit();
+    const merge_pipe = try mtl.Pipeline.init(device, lib, "ik_attn_merge", false);
+    defer merge_pipe.deinit();
+    const Hq: usize = 48;
+    const KV: usize = 8;
+    const D: usize = 128;
+    const E: usize = 1024;
+    const REL: usize = 16;
+    const max_rows: usize = 8;
+    var cfg_text = std.mem.zeroes(ik.config.Text);
+    cfg_text.local = .{ .q = Hq, .kv = KV, .dim = D };
+    const qn = try device.buffer(max_rows * Hq * D * 2, mtl.ResourceOptions.shared);
+    const keys = try device.buffer(max_keys * KV * D * 2, mtl.ResourceOptions.shared);
+    const vals = try device.buffer(max_keys * KV * D * 2, mtl.ResourceOptions.shared);
+    const reln = try device.buffer(max_rows * Hq * REL * 2, mtl.ResourceOptions.shared);
+    const proj = try device.buffer(REL * E * 2, mtl.ResourceOptions.shared);
+    const sink = try device.buffer(max_rows * Hq * 2, mtl.ResourceOptions.shared);
+    const gate = try device.buffer(max_rows * Hq * D * 2, mtl.ResourceOptions.shared);
+    const att = try device.buffer(max_rows * Hq * D * 2, mtl.ResourceOptions.shared);
+    const part = try device.buffer(ik.state.partBytes(&cfg_text, max_keys), mtl.ResourceOptions.shared);
+    defer for ([_]mtl.Buffer{ qn, keys, vals, reln, proj, sink, gate, att, part }) |b| b.deinit();
+    fill(qn, max_rows * Hq * D, 1);
+    fill(keys, max_keys * KV * D, 2);
+    fill(vals, max_keys * KV * D, 3);
+    fill(reln, max_rows * Hq * REL, 4);
+    fill(proj, REL * E, 5);
+    fill(sink, max_rows * Hq, 6);
+    fill(gate, max_rows * Hq * D, 7);
+    const scale: f32 = @floatCast(1 / @sqrt(@as(f64, D)));
+    const calls: usize = 48;
+    for (key_counts[0..nk]) |kc| {
+        for ([_]bool{ false, true }) |global| {
+            const window: u32 = if (global) 0 else E;
+            for ([_]usize{ 1, 2, 4, 8 }) |rows| {
+                const pos: u32 = @intCast(kc - rows);
+                const first: u32 = if (window > 0 and pos + 1 > window) pos + 1 - window else 0;
+                const f0 = first / ik.state.key_block;
+                const blocks = (pos + @as(u32, @intCast(rows)) - 1) / ik.state.key_block - f0 + 1;
+                const a: ik.forward.Args = .{ .rows = @intCast(rows), .heads = Hq, .kv = KV, .dim = D, .pos = pos, .window = window, .extent = E, .blocks = blocks, .queries = f0, .scale = scale };
+                var us: [7]f64 = undefined;
+                for (0..9) |round| {
+                    const cb = q.commandBuffer();
+                    const e = cb.compute(.serial);
+                    for (0..calls) |_| {
+                        e.setPipeline(part_pipe);
+                        e.setValue(a, 0);
+                        e.setBuffer(qn, 0, 1);
+                        e.setBuffer(keys, 0, 2);
+                        e.setBuffer(vals, 0, 3);
+                        e.setBuffer(reln, 0, 4);
+                        e.setBuffer(proj, 0, 5);
+                        e.setBuffer(part, 0, 6);
+                        e.dispatchGroups(mtl.Size.of(KV, rows, blocks), mtl.Size.of(32, 24, 1));
+                        e.setPipeline(merge_pipe);
+                        e.setValue(a, 0);
+                        e.setBuffer(part, 0, 1);
+                        e.setBuffer(sink, 0, 2);
+                        e.setBuffer(gate, 0, 3);
+                        e.setBuffer(att, 0, 4);
+                        e.dispatchGroups(mtl.Size.of(Hq, rows, 1), mtl.Size.of(32, 1, 1));
+                    }
+                    e.end();
+                    cb.commit();
+                    cb.wait();
+                    if (cb.failure()) |msg| {
+                        std.log.err("split: {s}", .{msg});
+                        return error.GpuFailed;
+                    }
+                    if (round >= 2) us[round - 2] = (cb.gpuEnd() - cb.gpuStart()) * 1e6 / @as(f64, @floatFromInt(calls));
+                }
+                std.debug.print("{{\"split\": {{\"keys\": {d}, \"rows\": {d}, \"global\": {}, \"us_per_layer\": {d:.2}}}}}\n", .{ kc, rows, global, median(&us) });
+            }
         }
     }
 }
@@ -912,7 +1369,7 @@ fn xdDumpLeg(init: std.process.Init, args: []const [:0]const u8) !void {
     defer init.gpa.free(moe);
     const moe_own = try init.gpa.alloc(u16, rows * H);
     defer init.gpa.free(moe_own);
-    var xdc = try Xd.init(device, table);
+    var xdc = try Xd.init(device, table, .none);
     defer xdc.deinit();
     var proj = try XdProj.init(device, &xdc);
     defer proj.deinit();
