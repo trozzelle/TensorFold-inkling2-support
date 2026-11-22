@@ -10,7 +10,6 @@ const st = @import("state.zig");
 const wts = @import("weights.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
-const Legacy = @import("model.zig").Legacy;
 const dense_prefill = @import("dense_prefill.zig");
 const attention = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
@@ -60,7 +59,7 @@ pub const Ablation = struct {
     now: ?counters.Class = null,
 };
 
-pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1, ablate: ?*Ablation = null, legacy: ?Legacy = null };
+pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1, ablate: ?*Ablation = null };
 /// `encode`, `gpu` and `buffers` (the command buffers used) add up over forwards, and `longest` is the longest single command
 /// buffer's GPU seconds so far; `committed`, `started`, `ended` and `woke` are the last forward's clocks in `seconds()`'s
 /// timebase: the host's first commit, the GPU's start of the first command buffer and end of the last, and the host's return from
@@ -168,7 +167,6 @@ const Enc = struct {
     tensor: bool = false,
     spans: ?*counters.Recorder = null,
     ablate: ?*Ablation = null,
-    legacy: Legacy = .{},
 
     /// The weights' resources, declared on the current encoder (a span's encoder rotation drops them).
     fn resources(x: Enc) void {
@@ -398,7 +396,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     var done: Committed = .{}; // the command buffers committed before `cb`, when the forward is in several
     var enc = cb.compute(.serial);
     var open = true; // `enc` is not yet ended
-    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans, .ablate = out.ablate, .legacy = out.legacy orelse m.legacy };
+    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans, .ablate = out.ablate };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
         enc.end();
         return err;
@@ -594,7 +592,7 @@ fn layer(x: Enc, i: u32) !void {
         const a: Args = .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .ring = ring, .blocks = blocks, .queries = f0, .scale = scale };
         // Shared-KV global window attention wins once there are enough 256-key blocks to saturate the GPU; shorter contexts
         // keep per-row threadgroups for full occupancy.
-        const shared_part = glob and !x.legacy.window_attention and ((n >= 3 and blocks >= 96) or (n >= 2 and blocks >= 256));
+        const shared_part = glob and ((n >= 3 and blocks >= 96) or (n >= 2 and blocks >= 256));
         if (shared_part) {
             x.glue(.attn_part_w, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, 1, blocks }, part_w_group, true);
         } else {

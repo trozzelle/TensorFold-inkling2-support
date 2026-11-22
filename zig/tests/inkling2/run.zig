@@ -40,12 +40,10 @@ const usage =
     \\                                                         only the prompt's last K rows before the first hold
     \\tf-inkling-run <model> profile <layers> <pos> <rows> <steps> [repeat]   per-class GPU time of decode steps
     \\                                                         (the layers run repeat times a step, default 48/layers)
-    \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat] [--ablate CLASS=stub|skip]... [--ab NAME]   decode steps each followed by the greedy draw: median
+    \\tf-inkling-run <model> wall <layers> <pos> <rows> <steps> [repeat] [--ablate CLASS=stub|skip]...   decode steps each followed by the greedy draw: median
     \\                                                         wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw);
     \\                                                         --ablate swaps a class's kernels for an empty kernel (stub) or drops them (skip) for
-    \\                                                         timing only (h_digest is not comparable under --ablate);
-    \\                                                         --ab NAME alternates blocks of 20 steps between the new and legacy kernels for NAME
-    \\                                                         on two caches at the same positions and checks their h digests after each pair of blocks
+    \\                                                         timing only (h_digest is not comparable under --ablate)
     \\tf-inkling-run <model> prefill <ids.json> [--chunk N] [--layers L] [--repeat R] [--spans] [--drafts] [--cuts N,N,...]   the prompt in chunks of N rows through the serving
     \\                                                         prompt path: one JSON line with prompt_ms, tok_s, the GPU ms by class (dense, norm,
     \\                                                         attention_prepare, attention, route, experts, activation, final, taps, absorb), the command
@@ -573,8 +571,6 @@ fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
     var repeat: u32 = @max(1, 48 / L);
     var ablate: ik.forward.Ablation = .{};
     var has_ablate = false;
-    var ab_name: ?[]const u8 = null;
-    var ab_mask: ik.model.Legacy = .{};
     var ablate_specs: std.ArrayList([]const u8) = .empty;
     defer ablate_specs.deinit(init.gpa);
     var ai: usize = 7;
@@ -589,20 +585,12 @@ fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
             try parseAblate(args[ai], &ablate);
             try ablate_specs.append(init.gpa, args[ai]);
             has_ablate = true;
-        } else if (std.mem.eql(u8, args[ai], "--ab")) {
-            ai += 1;
-            if (ai == args.len) return error.ExpectedAValueAfterTheOption;
-            if (args[ai].len == 0) return error.UnknownDecodeLegacyName;
-            ab_mask = try ik.model.Legacy.parse(args[ai]);
-            ab_name = args[ai];
         } else return error.UnknownWallOption;
     }
-    if (has_ablate and ab_name != null) return error.AbCannotCombineWithAblate;
     if (L == 0 or rows == 0 or rows > ik.state.window_rows or repeat == 0) return error.ExpectedPositiveLayersRowsRepeat;
     if (steps <= profile_warmup) return error.StepsMustExceedWarmup;
     const m = try ik.Model.load(init.gpa, init.io, args[1], try options(L));
     defer m.deinit();
-    if (ab_name) |name| return wallAb(init, m, pos, rows, steps, repeat, name, ab_mask);
     const c = &m.config.text;
     const full = m.layers == c.layers;
     const capacity = pos + rows * steps + 1;
@@ -646,71 +634,6 @@ fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
     std.debug.print(", \"wall_mean_ms\": {d:.3}, \"wall_min_ms\": {d:.3}, \"wall_p10_ms\": {d:.3}, \"gpu_min_ms\": {d:.3}, \"gpu_p10_ms\": {d:.3}, \"tok_s\": {d:.2}, \"h_digest\": \"{x}\", \"ablate\": [", .{ mean, samples[0][0], samples[0][tenth], samples[3][0], samples[3][tenth], 1e3 / med[0], digest });
     for (ablate_specs.items, 0..) |sp, i| std.debug.print("{s}\"{s}\"", .{ if (i == 0) "" else ", ", sp });
     std.debug.print("]}}\n", .{});
-}
-
-fn wallAbBlock(m: *const ik.Model, s: *ik.state.Scratch, cache: *ik.state.Cache, zeros: []const u32, rows: usize, n: usize, repeat: u32, full: bool, leg: ik.model.Legacy, gpu_out: ?[]f64) !u64 {
-    const c = &m.config.text;
-    for (0..n) |i| {
-        var tm: ik.forward.Timing = .{};
-        try ik.forward.run(m, s, cache, zeros[0..rows], .{ .logits = if (full) .last else .none, .timing = &tm, .repeat = repeat, .legacy = leg });
-        cache.len += rows;
-        if (gpu_out) |dst| dst[i] = (tm.ended - tm.started) * 1e3;
-    }
-    return std.hash.Wyhash.hash(0, s.h.slice(u8, rows * c.hidden * 2));
-}
-
-fn wallAb(init: std.process.Init, m: *const ik.Model, pos: usize, rows: usize, steps: usize, repeat: u32, name: []const u8, mask: ik.model.Legacy) !void {
-    const c = &m.config.text;
-    const full = m.layers == c.layers;
-    const capacity = pos + rows * steps + 1;
-    var cache_new = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
-    defer cache_new.deinit();
-    var cache_leg = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
-    defer cache_leg.deinit();
-    var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
-    defer s.deinit();
-    const zeros = try init.gpa.alloc(u32, @max(pos, rows));
-    defer init.gpa.free(zeros);
-    @memset(zeros, 0);
-    try feed(m, &s, &cache_new, zeros[0..pos], null, false);
-    try feed(m, &s, &cache_leg, zeros[0..pos], null, false);
-    const new_leg = m.legacy.with(mask, false);
-    const old_leg = m.legacy.with(mask, true);
-    const wd_new = try wallAbBlock(m, &s, &cache_new, zeros, rows, profile_warmup, repeat, full, new_leg, null);
-    const wd_leg = try wallAbBlock(m, &s, &cache_leg, zeros, rows, profile_warmup, repeat, full, old_leg, null);
-    if (wd_new != wd_leg) {
-        std.debug.print("{{\"ab\": \"{s}\", \"digests_equal\": false, \"stage\": \"warmup\", \"new_digest\": \"{x}\", \"legacy_digest\": \"{x}\"}}\n", .{ name, wd_new, wd_leg });
-        return error.AbDigestMismatch;
-    }
-    const measured = steps - profile_warmup;
-    const new_gpu = try init.gpa.alloc(f64, measured);
-    defer init.gpa.free(new_gpu);
-    const leg_gpu = try init.gpa.alloc(f64, measured);
-    defer init.gpa.free(leg_gpu);
-    const block_steps: usize = 20;
-    var done: usize = 0;
-    var blk: usize = 0;
-    while (done < measured) : (blk += 1) {
-        const bn = @min(block_steps, measured - done);
-        const new_first = (blk & 1) == 0;
-        const d_new = if (new_first)
-            try wallAbBlock(m, &s, &cache_new, zeros, rows, bn, repeat, full, new_leg, new_gpu[done..][0..bn])
-        else
-            0;
-        const d_leg = try wallAbBlock(m, &s, &cache_leg, zeros, rows, bn, repeat, full, old_leg, leg_gpu[done..][0..bn]);
-        const d_new_final = if (new_first)
-            d_new
-        else
-            try wallAbBlock(m, &s, &cache_new, zeros, rows, bn, repeat, full, new_leg, new_gpu[done..][0..bn]);
-        if (d_new_final != d_leg) {
-            std.debug.print("{{\"ab\": \"{s}\", \"digests_equal\": false, \"block\": {d}, \"pos\": {d}, \"new_digest\": \"{x}\", \"legacy_digest\": \"{x}\"}}\n", .{ name, blk, cache_new.len, d_new_final, d_leg });
-            return error.AbDigestMismatch;
-        }
-        done += bn;
-    }
-    const new_med = median(new_gpu);
-    const leg_med = median(leg_gpu);
-    std.debug.print("{{\"ab\": \"{s}\", \"layers\": {d}, \"pos\": {d}, \"rows\": {d}, \"repeat\": {d}, \"steps\": {d}, \"new_gpu_ms\": {d:.3}, \"legacy_gpu_ms\": {d:.3}, \"saved_ms\": {d:.3}, \"digests_equal\": true}}\n", .{ name, m.layers, pos, rows, repeat, measured, new_med, leg_med, leg_med - new_med });
 }
 
 const prefill_classes = [_]ik.forward.counters.Class{ .dense, .norm, .attention_prepare, .attention, .route, .experts, .activation, .final, .taps, .absorb };
