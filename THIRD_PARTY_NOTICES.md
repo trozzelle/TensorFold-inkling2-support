@@ -554,7 +554,7 @@ those files. `tiny_config.json` and the tensor tables
 `0a57c72e4e5b68aafe1d983dbb62980344a5fcd7`, a randomly initialised model whose model card names that release as its base
 model and states no licence; no weights are included. `tools/zig/inkling2_fixtures.py` rebuilds all of these files.
 
-## Inkling 2 EXL3 decode kernels
+## Inkling 2 EXL3 decode and prefill kernels
 
 `zig/kernels/metal/inkling2/xd.metal` (the `ik_xd_*` kernels) adapts the decode kernels of
 [Sushi](https://github.com/beamivalice/sushi) v1.3.0 (commit `8e4c0af1`) as carried in
@@ -568,3 +568,13 @@ reference. The complete original MIT notice and permission text is retained in
 [Sushi-MIT.txt](LICENSES/Sushi-MIT.txt); its last paragraph names Sushi's own NOTICE and Apache license files, which
 this repository does not ship. Sushi re-implements [ExLlamaV3](https://github.com/turboderp-org/exllamav3)'s EXL3
 format (MIT License, Copyright (c) 2025 Turboderp) from that reference and ships no ExLlamaV3 code.
+
+`zig/kernels/metal/inkling2/xp.metal` (the `ik_xp_*` kernels, dispatched by `zig/src/families/inkling2/experts_prefill.zig`)
+adapts the prefill chain of the same Sushi tree under the same notice. The ported text is `kernels/token_pair_prepare.metal`
+(the input rotation), `kernels/group_window.metal` (the 32-row windows of one expert), `kernels/gemm_nax.metal`,
+`kernels/gemm_nax_open_loop.metal`, `kernels/gemm_nax_decode_lo.metal` and `kernels/gemm_nax_frags.metal` (the
+tensor-unit GEMM over decoded trellis tiles), `kernels/mid.metal` (the middle stage's rotations) and
+`kernels/reduce.metal` (the finish), with the sorted-table dispatch of `expert_exl3_kernels.zig` and the prefill chain
+of `rate_groups.zig`. TensorFold's changes are a counting sort by expert in place of MLX's argsort, one input
+rotation for the one-projection w13, f32 stores in place of f16, the descriptor addressing, windows counted on the GPU
+and dispatched indirectly per rate and projection, and the decode chain's mid and finish arithmetic.
