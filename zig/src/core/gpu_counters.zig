@@ -1,4 +1,5 @@
-//! Same-command-buffer GPU timestamps, bounded resources and no per-span CPU waits.
+//! GPU timestamps taken inside the command buffers of a recording (one, or several committed one after the other), bounded
+//! resources and no per-span CPU waits.
 const std = @import("std");
 const mtl = @import("metal");
 const counters = mtl.counters;
@@ -170,6 +171,36 @@ pub const Recorder = struct {
             resources.fence.waitCompute(encoder.*);
         }
         self.active_span = null;
+    }
+
+    /// Ends the compute encoder between spans so the caller can commit the bound command buffer and carry the recording on in a new
+    /// one: the spans so far stay, `continueCommand` binds the next buffer, and `readAfterCompletion` reads all the spans once the
+    /// caller has waited for the last buffer, which completes after the ones before it. Do not commit inside this API.
+    pub fn endCommand(self: *Recorder, encoder: *mtl.ComputeEncoder) !void {
+        if (!self.enabled()) {
+            encoder.end();
+            self.encoder_open = false;
+            return;
+        }
+        if (self.state != .recording or !self.encoder_open) return error.CounterNotRecording;
+        if (self.active_span != null) return error.UnclosedCounterSpan;
+        encoder.end();
+        self.encoder_open = false;
+        self.command_buffer.?.release();
+        self.command_buffer = null;
+    }
+
+    /// Binds the recording to `cb`, the caller's uncommitted next command buffer, after `endCommand`; the caller opens its compute
+    /// encoder, as after `beginCommand`.
+    pub fn continueCommand(self: *Recorder, cb: mtl.CommandBuffer) !void {
+        if (!self.enabled()) {
+            self.encoder_open = true;
+            return;
+        }
+        if (self.state != .recording or self.encoder_open or self.command_buffer != null) return error.CounterNotRecording;
+        if (cb.status() != .not_enqueued) return error.CounterCommandAlreadySubmitted;
+        self.command_buffer = cb.retain();
+        self.encoder_open = true;
     }
 
     /// Ends the final encoder before the caller's existing commit/wait; resolution requires completion.

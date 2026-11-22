@@ -10,6 +10,9 @@ const pack = @import("expert_pack.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 const dspark_weights = @import("dspark_weights.zig");
+const dense_prefill = @import("dense_prefill.zig");
+const attention_prefill = @import("attention_prefill.zig");
+const experts_prefill = @import("experts_prefill.zig");
 
 pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap" };
 pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap };
@@ -25,7 +28,34 @@ comptime {
 /// experts: the embedding, the final norm and the unembedding alone, enough to run the draft head over recorded taps.
 /// `drafts`: also load the DSpark draft head from the folder's mtp.safetensors, when the config has one and the file is there.
 /// `draft_bits`: the width of the draft layers' projections (INKLING_DRAFT_BITS): quantized to 8 bits at load, or the file's bf16.
-pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default };
+/// `prefill_rows`: rows of a prompt chunk at most (INKLING_PREFILL_ROWS), a multiple of 64 from 64 to 8192: a scratch is made for
+/// that many rows and a prompt is fed in pieces of them.
+pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default, prefill_rows: u32 = st.default_prefill_rows };
+
+/// The kernels of the chunk path, which runs a prompt chunk's rows on the tensor units: the dense projections' GEMM, the attention
+/// and the experts' chain. A load has them on a GPU with tensor units, for the shapes they are written for (`chunkGeometry`).
+pub const Chunk = struct {
+    dense: dense_prefill.Pipes,
+    attention: attention_prefill.Pipes,
+    experts: experts_prefill.Pipes,
+
+    /// Compiles them for `device`, which has tensor units (`error.NeedsTensorUnits` otherwise).
+    pub fn init(device: mtl.Device, gpa: std.mem.Allocator) !Chunk {
+        if (!experts_prefill.available(device)) return error.NeedsTensorUnits;
+        var dense = try dense_prefill.Pipes.init(device, gpa);
+        errdefer dense.deinit();
+        var attention = try attention_prefill.Pipes.init(device, gpa);
+        errdefer attention.deinit();
+        const experts = try experts_prefill.Pipes.init(device, gpa);
+        return .{ .dense = dense, .attention = attention, .experts = experts };
+    }
+
+    pub fn deinit(c: *Chunk) void {
+        c.experts.deinit();
+        c.attention.deinit();
+        c.dense.deinit();
+    }
+};
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -38,6 +68,9 @@ pub const Model = struct {
     weights: wts.Weights,
     glue: [glue_names.len]mtl.Pipeline,
     exl3: exl3.Pipelines,
+    /// The chunk path's kernels; null where prompt chunks run on the per-operation kernels (a GPU without tensor units, shapes the
+    /// chunk kernels are not written for, or INKLING_PROMPT_PATH=per_op).
+    chunk: ?Chunk,
     /// The draft head's tensors in `checkpoint`, when `Options.drafts` asked for them and they exist.
     draft: ?dspark_weights.Weights,
     /// Whether decode steps wait warm (forward.zig's `waitWarm`); INKLING_WARM_WAIT=0 turns it off.
@@ -45,13 +78,22 @@ pub const Model = struct {
     /// Layers a decode step commits in a command buffer of their own, before the rest are encoded (0: the step is one
     /// command buffer); INKLING_FIRST_CHUNK.
     first_chunk: u32,
+    /// Rows of a prompt chunk at most (`Options.prefill_rows`): the load's scratch and budget are sized for them.
+    prefill_rows: u32,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Options) !*Model {
+        if (!st.validPrefillRows(opts.prefill_rows)) return error.InvalidInkling2PrefillRows;
+        // INKLING_PROMPT_PATH, read once: names a path to compare or to test the fallbacks with; unset it asks nothing
+        const request = st.parsePromptPath(if (std.c.getenv("INKLING_PROMPT_PATH")) |v| std.mem.span(v) else null) catch {
+            std.log.err("inkling2: INKLING_PROMPT_PATH is not a prompt path: give per_op, rows, rows:LAYER,LAYER or auto", .{});
+            return error.InvalidInkling2PromptPath;
+        };
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.gpa = gpa;
+        m.prefill_rows = opts.prefill_rows;
         m.warm_wait = if (std.c.getenv("INKLING_WARM_WAIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.first_chunk = if (std.c.getenv("INKLING_FIRST_CHUNK")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4 else 4;
         const cpath = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -74,12 +116,29 @@ pub const Model = struct {
         errdefer m.device.deinit();
         m.queue = try m.device.queue();
         errdefer m.queue.deinit();
+        // prompt chunks run on the tensor units where the GPU has them and the shapes fit; elsewhere on the per-operation kernels
+        const reason: ?[]const u8 = if (request.per_op) "INKLING_PROMPT_PATH asks for them" else if (!m.device.tensorUnits()) "this GPU has no tensor units" else if (!chunkGeometry(t)) "this config's shapes are not the tensor-unit kernels'" else null;
+        if (reason) |r| {
+            m.chunk = null;
+            std.log.info("inkling2: prompt chunks run on the per-operation kernels: {s}", .{r});
+        } else m.chunk = try Chunk.init(m.device, gpa);
+        errdefer if (m.chunk) |*chunk| chunk.deinit();
         m.checkpoint = ck.Checkpoint.init(gpa);
         errdefer m.checkpoint.deinit();
         var p = if (m.layers == 0) pack.Pack{ .arena = std.heap.ArenaAllocator.init(gpa), .layers = &.{} } else try pack.Pack.read(gpa, io, dir, t.layers, t.experts);
         defer p.deinit();
         m.weights = try wts.load(gpa, m.device, &m.checkpoint, t, &m.plan, &p, dir, m.layers);
         errdefer m.weights.deinit(gpa);
+        // a layer the chain cannot take (see `weights.xdOk`), or that INKLING_PROMPT_PATH names, runs its experts through the per-row
+        // grouped projections in a chunk, and in a decode window too: `xd_ok` is what both paths read
+        for (m.weights.layers, 0..) |*l, i| if ((request.rows >> @intCast(i)) & 1 != 0) {
+            l.xd_ok = false;
+        };
+        if (m.chunk != null) {
+            var per_row: usize = 0;
+            for (m.weights.layers) |l| per_row += @intFromBool(!l.xd_ok);
+            if (per_row > 0) std.log.info("inkling2: prompt chunks take the per-row expert projections on {d} of {d} layers: {s}", .{ per_row, m.layers, if (request.rows != 0) "INKLING_PROMPT_PATH asks for them" else "their experts are not all K2 or K3, which the tensor-unit chain needs" });
+        }
         {
             const lib = try mtl.Library.fromSource(m.device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
             defer lib.deinit();
@@ -104,8 +163,22 @@ pub const Model = struct {
         return m.glue[@backingInt(g)];
     }
 
+    /// The path this load's prompt chunks take, which decides the scratch they need: the chunk kernels on every layer, the chunk
+    /// kernels with the per-row expert projections where a layer's experts need them, or the per-operation kernels.
+    pub fn promptPath(m: *const Model) st.PromptPath {
+        if (m.chunk == null) return .per_op;
+        for (m.weights.layers) |l| if (!l.xd_ok) return .chunk_rows;
+        return .chunk;
+    }
+
+    /// What a scratch for this load's prompt chunks is made for.
+    pub fn chunking(m: *const Model) st.Chunking {
+        return .{ .rows = m.prefill_rows, .path = m.promptPath() };
+    }
+
     pub fn deinit(m: *Model) void {
         if (m.draft) |*w| w.deinit(m.gpa);
+        if (m.chunk) |*chunk| chunk.deinit();
         m.exl3.deinit();
         for (m.glue) |x| x.deinit();
         m.weights.deinit(m.gpa);
@@ -123,4 +196,13 @@ fn geometry(t: *const cfg.Text) !void {
         t.local.dim == 128 and t.global.dim == 128 and t.d_rel == 16 and t.topk == 8 and t.experts <= 384 and
         t.window == t.rel_extent and t.hidden % 128 == 0 and t.expert_inter % 128 == 0 and st.maxBlocks(t) <= 9;
     if (!ok) return error.UnsupportedInkling2Geometry;
+}
+
+/// Whether the chunk kernels are written for this config: the attention's 48 query heads over 8 key heads of 128 dims, a relative
+/// state of 16 dims, a window and an extent of 1,024 on both layer kinds, and dense inputs a multiple of the GEMM's 256-deep step.
+fn chunkGeometry(t: *const cfg.Text) bool {
+    const a = attention_prefill;
+    return t.local.q == a.heads and t.local.kv == a.kv_heads and t.local.dim == a.dim and t.global.q == a.heads and
+        t.global.kv == a.kv_heads and t.global.dim == a.dim and t.d_rel == a.rel_dims and t.window == a.extent and
+        t.rel_extent == a.extent and t.hidden % 256 == 0 and (t.local.q * t.local.dim) % 256 == 0;
 }

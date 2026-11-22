@@ -1,4 +1,7 @@
-//! Inkling 2 rows through every layer in one command buffer at mlx-lm's rounding points; rows stay independent.
+//! Inkling 2 rows through every layer at mlx-lm's rounding points; rows stay independent. A prompt chunk's layers go through a chunk
+//! path in command buffers committed as they are encoded: the tensor-unit GEMM, attention and experts' chain where the load has them,
+//! and for what lacks them (a GPU without tensor units, or experts the chain cannot take) the per-operation kernels; a decode window
+//! of up to 16 rows takes the decode path.
 const std = @import("std");
 const mtl = @import("metal");
 pub const counters = @import("../../core/gpu_counters.zig");
@@ -7,6 +10,9 @@ const st = @import("state.zig");
 const wts = @import("weights.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
+const dense_prefill = @import("dense_prefill.zig");
+const attention = @import("attention_prefill.zig");
+const experts_prefill = @import("experts_prefill.zig");
 
 /// glue.metal's ik_args, field for field.
 pub const Args = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, kv: u32 = 0, dim: u32 = 0, pos: u32 = 0, blocks: u32 = 0, queries: u32 = 0, stride: u32 = 0, flags: u32 = 0, window: u32 = 0, extent: u32 = 0, eps: f32 = 0, scale: f32 = 0, cap: f32 = 0, alpha: f32 = 0, floor_n: f32 = 0, thr: f32 = 0 };
@@ -29,18 +35,73 @@ fn t(x: wts.Tensor) B {
     return .{ .buf = x.buffer, .off = x.offset };
 }
 
+/// `v` as the view type of one of the chunk kernels' modules (each holds a buffer and a byte offset).
+fn view(comptime V: type, v: B) V {
+    return .{ .buf = v.buf, .off = v.off };
+}
+
 /// What a forward writes besides the cache: finals, logits of the last row or every row, every layer's output.
 /// `feature_taps` is what the DSpark head reads: each row's eight taps, [n][8][hidden] bf16 at the buffer: the hidden
 /// states entering the `tap_layers` and the finals, which it forces on (a prompt chunk then runs the final stage too).
-/// `prompt` marks rows that feed a prompt: they always take the one-kernel-per-op path, whatever their count; other
-/// forwards of at most `window_rows` rows take the decode path (fused norms, stacked attention-input matvec, split-K
-/// attention).
-/// `spans` records each stage group's GPU time by class (the `profile` mode); `repeat` runs the loaded layers that many
-/// times in the one command buffer (profile only: the cache's position stays, so the repeats re-read the same rows).
+/// `prompt` marks rows that feed a prompt: they always take a chunk path, whatever their count: on the tensor units the GEMM for every
+/// dense projection, the tiled attention and the experts' chain (the per-row grouped projections for a layer the chain cannot take),
+/// and without tensor units the per-operation kernels; either way a row's bits do not depend on the rows or the chunk it is in;
+/// other forwards of at most `window_rows` rows take the decode path (fused norms, stacked attention-input matvec, split-K
+/// attention, the decode expert chain), and larger ones a chunk path.
+/// `spans` records each stage group's GPU time by class (the `profile` and `prefill` modes), across the forward's command buffers;
+/// `repeat` runs the loaded layers that many times in the one forward (profile only: the cache's position stays, so the repeats
+/// re-read the same rows).
 pub const Out = struct { finals: bool = false, logits: enum { none, last, all } = .last, dump: ?mtl.Buffer = null, timing: ?*Timing = null, taps: ?Taps = null, feature_taps: ?B = null, prompt: bool = false, spans: ?*counters.Recorder = null, repeat: u32 = 1 };
-/// `encode` and `gpu` add up over forwards; `committed`, `started`, `ended` and `woke` are the last forward's clocks in
-/// `seconds()`'s timebase: the host's commit, the GPU's start and end, and the host's return from the wait.
-pub const Timing = struct { encode: f64 = 0, gpu: f64 = 0, committed: f64 = 0, started: f64 = 0, ended: f64 = 0, woke: f64 = 0 };
+/// `encode`, `gpu` and `buffers` (the command buffers used) add up over forwards, and `longest` is the longest single command
+/// buffer's GPU seconds so far; `committed`, `started`, `ended` and `woke` are the last forward's clocks in `seconds()`'s
+/// timebase: the host's first commit, the GPU's start of the first command buffer and end of the last, and the host's return from
+/// the wait.
+pub const Timing = struct { encode: f64 = 0, gpu: f64 = 0, committed: f64 = 0, started: f64 = 0, ended: f64 = 0, woke: f64 = 0, buffers: u32 = 0, longest: f64 = 0 };
+/// Rows times layers one command buffer of a chunk path holds at most. A prompt row takes about 10 microseconds a layer on the
+/// tensor units (a 4,096-row layer 37 to 45 ms of GPU time on an M5 Ultra) and about 0.3 ms on the per-operation kernels (8,202
+/// tokens through 48 layers in 126 s on that Mac), so this is about 30 ms or about a second of GPU time. The GPU kills a command
+/// buffer that runs past its timeout (a kill at 15.6 s has been seen), and a 4,096-row chunk through 48 layers on the per-operation
+/// kernels in one command buffer would take about a minute.
+const buffer_row_layers = 3072;
+/// Command buffers one forward uses at most: a queue holds 64 that are not yet complete, and creating one past that waits for
+/// another to finish.
+pub const max_buffers = 48;
+
+/// Layers a chunk-path forward of `rows` rows commits after, of `total` layers: as many as keep a command buffer within
+/// `buffer_row_layers` (at least one), and enough that no more than `max_buffers` buffers make the forward. At or past `total`
+/// the forward is one command buffer.
+pub fn commitEvery(rows: usize, total: usize) usize {
+    const by_rows = @max(1, buffer_row_layers / rows);
+    const by_count = (total + max_buffers - 1) / max_buffers;
+    return @max(by_rows, by_count);
+}
+
+/// The command buffers a forward committed before its last, in order, and the host's clock at the first commit.
+const Committed = struct {
+    bufs: [max_buffers]mtl.CommandBuffer = undefined,
+    n: usize = 0,
+    first: f64 = 0,
+
+    fn commit(c: *Committed, cb: mtl.CommandBuffer) void {
+        std.debug.assert(c.n < c.bufs.len);
+        if (c.n == 0) c.first = seconds();
+        cb.commit();
+        c.bufs[c.n] = cb;
+        c.n += 1;
+    }
+
+    fn all(c: *const Committed) []const mtl.CommandBuffer {
+        return c.bufs[0..c.n];
+    }
+};
+
+fn checked(f: mtl.CommandBuffer) !void {
+    if (f.failure()) |msg| {
+        std.log.err("inkling2 forward: {s}", .{msg});
+        return error.GpuFailed;
+    }
+}
+
 /// Most spans one layer opens (a global layer with dynamic convolutions is the most), so a recorder's capacity is
 /// `spans_per_layer * layers * repeat` plus the final's.
 pub const spans_per_layer = 32;
@@ -92,6 +153,8 @@ const Enc = struct {
     n: usize,
     /// Whether this forward takes the decode path.
     decode: bool = false,
+    /// Whether this forward's rows run on the tensor-unit chunk kernels (the GEMM and the attention): a chunk, on a load that has them.
+    tensor: bool = false,
     spans: ?*counters.Recorder = null,
 
     /// The weights' resources, declared on the current encoder (a span's encoder rotation drops them).
@@ -124,15 +187,30 @@ const Enc = struct {
         if (groups) x.e.dispatchGroups(g3, t3) else x.e.dispatchThreads(g3, t3);
     }
 
-    /// The `n` hidden rows at `src` as tap `k` of the rows of eight taps at `to` ([n][8][hidden] bf16).
-    fn tap(x: Enc, to: B, src: B, k: usize) void {
+    /// The `n` hidden rows at `src` as tap `k` of the rows of eight taps at `to` ([n][8][hidden] bf16), in a taps span.
+    fn tap(x: Enc, to: B, src: B, k: usize) !void {
         const H: usize = x.m.config.text.hidden;
+        try x.begin(.taps);
         x.glue(.tap, .{ .rows = @intCast(x.n), .width = @intCast(H), .stride = @intCast(st.feature_taps * H) }, &.{ src, bo(to.buf, to.off + k * H * 2) }, .{ H, x.n, 1 }, .{ 256, 1, 1 }, false);
+        try x.end();
     }
 
     /// out = in W^T for `rows` rows in slabs of at most 32 (one row's bits do not depend on the slab).
     fn mv(x: Enc, d: wts.Dense, in: B, out: B, rows: usize) void {
         matvec(x.e.*, x.m, d, in, out, rows);
+    }
+
+    /// out = in W^T for `rows` rows of the bf16 [d.n, d.k] matrix `d`, bf16 out: the chunk kernels' tensor-unit GEMM (bf16 operands,
+    /// f32 sums in an order that does not depend on the rows or the tile), or the matvec slabs of the decode and per-operation paths.
+    fn proj(x: Enc, d: wts.Dense, in: B, out: B, rows: usize) void {
+        if (x.tensor) return x.gemm(d, in, out, rows, .bf16);
+        x.mv(d, in, out, rows);
+    }
+
+    /// The tensor-unit GEMM into rows of `d.n` values of `kind` (the router's logits are f32).
+    fn gemm(x: Enc, d: wts.Dense, in: B, out: B, rows: usize, kind: dense_prefill.Out) void {
+        std.debug.assert(x.tensor);
+        dense_prefill.gemmRows(x.e.*, &x.m.chunk.?.dense, view(dense_prefill.Mat, in), .{ .buf = d.t.buffer, .off = d.t.offset, .n = d.n, .k = d.k }, view(dense_prefill.Mat, out), kind, rows, d.n);
     }
 
     /// Up to `max_segs` matvecs over the same k in one dispatch (at most `window_rows` rows). The segment table lives
@@ -172,7 +250,7 @@ const Enc = struct {
             },
             .dynamic => |d| {
                 try x.begin(.dense);
-                x.mv(d.proj, dyn_in, b(x.s.dyn), n);
+                x.proj(d.proj, dyn_in, b(x.s.dyn), n);
                 try x.end();
                 a.scale = 3;
                 try x.begin(.attention_prepare);
@@ -227,46 +305,65 @@ const Enc = struct {
         x.glue(.xd_down, a, &.{ b(s.act), b(s.eids), w2, b(s.sums) }, .{ l.w2.n / 32, slots, 1 }, .{ 128, 1, 1 }, true);
         x.glue(.xd_finish, a, &.{ b(s.sums), b(s.eids), w2, b(s.ew), b(s.moe) }, .{ l.w2.n / 128, rows, 1 }, .{ 256, 1, 1 }, true);
     }
+
+    /// The layer's routed experts for the chunk's rows through the tensor-unit chain (experts_prefill.zig): the picks sorted by
+    /// expert, w13, the capped SwiGLU, w2 and the weighted sum, from s.xm with the picks and weights in s.eids and s.ew into
+    /// s.moe, in the scratch's stage. The chain needs the encoder to be serial, the layer's trellis, scales and descriptor
+    /// tables declared on it (`resources`), and every expert of both tables K2 or K3 (the layer's `xd_ok`).
+    fn xp(x: Enc, l: *const wts.Layer) void {
+        const c = &x.m.config.text;
+        const s = x.s;
+        const e = experts_prefill;
+        std.debug.assert(x.tensor and l.xd_ok);
+        e.encode(x.e.*, &x.m.chunk.?.experts, .{ .w13 = l.w13, .w2 = l.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
+    }
 };
 
-/// `ids` at positions cache.len.. through the loaded layers (cache.len unmoved): the command buffer waited. A decode step
+/// `ids` at positions cache.len.. through the loaded layers (cache.len unmoved): the last command buffer waited. A decode step
 /// commits its first `m.first_chunk` layers in a command buffer of their own and encodes the rest meanwhile, so the GPU
-/// starts while the host is still encoding; the queue runs the two in order, the one's results the other's inputs.
+/// starts while the host is still encoding. A chunk's layers go in command buffers of bounded rows times layers (`commitEvery`),
+/// each committed as soon as it is encoded. The queue runs the buffers in order, the one's results the other's inputs.
 pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, out: Out) !void {
     const c = &m.config.text;
     const n = ids.len;
-    if (n == 0 or n > st.prompt_rows or (out.logits == .all and n > st.window_rows)) return error.Inkling2RowsExceeded;
+    if (n == 0 or n > s.prefill_rows or (out.logits == .all and n > st.window_rows)) return error.Inkling2RowsExceeded;
     if (cache.len + n > cache.capacity) return error.Inkling2ContextFull;
     const decode = !out.prompt and n <= st.window_rows;
     // the decode path's split attention keeps one partial for each 256-key block of the cache so far
     if (decode and cache.len + n > s.capacity) return error.Inkling2ScratchShort;
     if ((out.finals or out.feature_taps != null or out.logits != .none) and m.layers != c.layers) return error.Inkling2PartialModel;
+    // a chunk takes the path the model does, and the scratch's buffers are made for it
+    if (!decode and s.path != m.promptPath()) return error.Inkling2ScratchForAnotherPromptPath;
     for (ids) |id| if (id >= c.vocab) return error.InvalidInkling2Token;
     @memcpy(s.ids.slice(u32, n), ids);
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const t0 = if (out.timing != null) seconds() else 0;
     var cb = m.queue.commandBuffer();
-    var head: ?mtl.CommandBuffer = null; // the step's first command buffer, when it is committed before the rest is encoded
-    var head_commit: f64 = 0;
+    var done: Committed = .{}; // the command buffers committed before `cb`, when the forward is in several
     var enc = cb.compute(.serial);
-    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .spans = out.spans };
+    var open = true; // `enc` is not yet ended
+    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
         enc.end();
         return err;
     };
     errdefer if (out.spans) |sp| sp.cancelEncoding(&enc) catch {};
+    // past a commit the GPU is running work on the scratch: an error hands nothing back until that has finished
+    errdefer for (done.all()) |f| f.wait();
+    errdefer if (open and out.spans == null) enc.end();
     x.resources();
     const H: usize = c.hidden;
     const nr: u32 = @intCast(n);
     x.glue(.embed, .{ .rows = nr, .width = c.hidden, .eps = c.eps }, &.{ b(s.ids), t(m.weights.embed.t), t(m.weights.embed_norm), b(s.h) }, .{ n, 1, 1 }, .{ 1024, 1, 1 }, true);
     const total = @as(usize, m.layers) * out.repeat;
     const split: usize = if (decode and out.spans == null and m.first_chunk < total) m.first_chunk else 0;
+    const every: usize = if (decode) 0 else commitEvery(n, total);
     for (0..total) |li| {
         const i = li % m.layers;
         if (out.taps != null or out.feature_taps != null) for (tap_layers, 0..) |l, k| if (l == i) {
             if (out.taps) |tp| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(tp.h, k * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
-            if (out.feature_taps) |ft| x.tap(ft, b(s.h), k);
+            if (out.feature_taps) |ft| try x.tap(ft, b(s.h), k);
         };
         try layer(x, @intCast(i));
         if (out.taps) |tp| {
@@ -277,18 +374,19 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
             };
         }
         if (out.dump) |d| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(d, i * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
-        if (li + 1 == split) {
-            enc.end();
-            head_commit = seconds();
-            cb.commit();
-            head = cb;
+        if (li + 1 == split or (every != 0 and li + 1 < total and (li + 1) % every == 0)) {
+            if (out.spans) |sp| try sp.endCommand(&enc) else enc.end();
+            open = false;
+            done.commit(cb);
             cb = m.queue.commandBuffer();
+            if (out.spans) |sp| try sp.continueCommand(cb);
             enc = cb.compute(.serial);
+            open = true;
             x.resources();
         }
     }
     if (out.finals or out.feature_taps != null or out.logits != .none) try final(x);
-    if (out.feature_taps) |ft| x.tap(ft, b(s.finals), tap_layers.len);
+    if (out.feature_taps) |ft| try x.tap(ft, b(s.finals), tap_layers.len);
     if (out.logits != .none) {
         const first: usize = if (out.logits == .last) n - 1 else 0;
         const rows = n - first;
@@ -300,23 +398,43 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
         try x.end();
     }
     if (out.spans) |sp| try sp.finishEncoding(&enc) else enc.end();
+    open = false;
     if (out.timing) |tm| {
-        tm.committed = if (head != null) head_commit else seconds();
+        tm.committed = if (done.n > 0) done.first else seconds();
         tm.encode += seconds() - t0;
     }
     const warm = decode and m.warm_wait and out.spans == null;
-    if (head == null) head_commit = if (warm) seconds() else 0;
+    const committed_at = if (done.n > 0) done.first else if (warm or out.timing != null) seconds() else 0;
     cb.commit();
     // spans are a profile's: its steps are waited for as before
-    if (warm) waitWarm(cb, s.expected[n], head_commit) else cb.wait();
+    if (warm) waitWarm(cb, s.expected[n], committed_at) else cb.wait();
     if (out.timing) |tm| tm.woke = seconds();
-    for ([_]?mtl.CommandBuffer{ head, cb }) |one| if (one) |f| if (f.failure()) |msg| {
-        std.log.err("inkling2 forward: {s}", .{msg});
-        return error.GpuFailed;
+    // the buffers before the last completed before it; the status keeps this from waiting for what is done
+    for (done.all()) |f| switch (f.status()) {
+        .completed, .@"error" => {},
+        else => f.wait(),
     };
-    const began = (head orelse cb).gpuStart();
+    for (done.all()) |f| try checked(f);
+    try checked(cb);
+    const began = (if (done.n > 0) done.bufs[0] else cb).gpuStartOr(committed_at);
     if (out.timing) |tm| {
-        tm.gpu += cb.gpuSeconds() + if (head) |f| f.gpuSeconds() else 0;
+        // a buffer's span runs from its start, or from the end of the one ahead of it (the first: from its commit) when
+        // Metal reports no start for it
+        var gpu: f64 = 0;
+        var longest: f64 = 0;
+        var after = committed_at;
+        for (done.all()) |f| {
+            const one = f.gpuEnd() - f.gpuStartOr(after);
+            after = f.gpuEnd();
+            gpu += one;
+            longest = @max(longest, one);
+        }
+        const one = cb.gpuEnd() - cb.gpuStartOr(after);
+        gpu += one;
+        longest = @max(longest, one);
+        tm.gpu += gpu;
+        tm.buffers += @intCast(done.n + 1);
+        tm.longest = @max(tm.longest, longest);
         tm.started = began;
         tm.ended = cb.gpuEnd();
     }
@@ -364,8 +482,8 @@ fn layer(x: Enc, i: u32) !void {
     const hd = p.heads;
     const kvw: usize = @as(usize, hd.kv) * hd.dim;
     const K: u32 = p.blocks_in;
-    const stride: u32 = st.prompt_rows;
-    const slab: usize = st.prompt_rows * H * 4;
+    const stride: u32 = @intCast(s.prefill_rows);
+    const slab: usize = s.prefill_rows * H * 4;
     const glob = p.kind == .global;
     const pos: u32 = @intCast(cache.len);
     const one = .{ 1024, 1, 1 };
@@ -388,8 +506,11 @@ fn layer(x: Enc, i: u32) !void {
     } else x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
     if (w.attn_query) |q| {
         if (!x.decode) {
-            x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(q), b(s.ai) }, .{ n, 1, 1 }, one, true);
-            for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .flags = f32_in, .eps = c.eps }, &.{ bo(s.ai, j * H * 4), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
+            // the depth mix of the attention input: at the front of the stage on the chunk kernels (the attention and the experts use it
+            // after the norms have read it), a buffer of its own on the per-operation path
+            const mix = if (x.tensor) s.stage else s.ai;
+            x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(q), b(mix) }, .{ n, 1, 1 }, one, true);
+            for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .flags = f32_in, .eps = c.eps }, &.{ bo(mix, j * H * 4), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
         }
     } else for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .eps = c.eps }, &.{ b(s.h), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
     try x.end();
@@ -397,12 +518,12 @@ fn layer(x: Enc, i: u32) !void {
     if (x.decode) {
         x.mvs(i, &.{ .{ .x = xq, .w = w.q, .y = b(s.q) }, .{ .x = xk, .w = w.k, .y = b(s.k) }, .{ .x = xv, .w = w.v, .y = b(s.v) }, .{ .x = xq, .w = w.r, .y = b(s.r) }, .{ .x = xq, .w = w.gate, .y = b(s.gate) }, .{ .x = xq, .w = w.sink, .y = b(s.sink) } }, n);
     } else {
-        x.mv(w.q, xq, b(s.q), n);
-        x.mv(w.k, xk, b(s.k), n);
-        x.mv(w.v, xv, b(s.v), n);
-        x.mv(w.r, xq, b(s.r), n);
-        x.mv(w.gate, xq, b(s.gate), n);
-        x.mv(w.sink, xq, b(s.sink), n);
+        x.proj(w.q, xq, b(s.q), n);
+        x.proj(w.k, xk, b(s.k), n);
+        x.proj(w.v, xv, b(s.v), n);
+        x.proj(w.r, xq, b(s.r), n);
+        x.proj(w.gate, xq, b(s.gate), n);
+        x.proj(w.sink, xq, b(s.sink), n);
     }
     try x.end();
     try x.conv(w.k_conv, b(s.k), xk, b(s.kc), i, 0, kvw, hd.kv);
@@ -411,8 +532,9 @@ fn layer(x: Enc, i: u32) !void {
     const values = bo(cache.kv, cache.values(i));
     try x.begin(.attention_prepare);
     x.glue(.prep, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .flags = if (glob) global else 0, .eps = c.eps, .cap = c.qk_clip, .thr = c.rel_clip, .alpha = c.log_alpha, .floor_n = @floatFromInt(c.log_floor) }, &.{ b(s.q), b(s.kc), b(s.vc), b(s.r), t(w.q_scale), t(w.rel_scale), b(s.qn), keys, values, b(s.reln) }, .{ 2 * hd.q + 2 * hd.kv, n, 1 }, .{ 32, 1, 1 }, true);
-    // the decode path's attention forms the bias itself from reln and the projection
-    if (!x.decode) x.glue(.relbias, .{ .rows = nr, .heads = hd.q, .extent = p.extent, .dim = c.d_rel }, &.{ b(s.reln), t(w.rel_proj), b(s.pb) }, .{ p.extent, hd.q, n }, .{ 256, 1, 1 }, false);
+    // the decode path's attention forms the relative bias itself from reln and the projection, and so do the chunk kernels (as a table
+    // built right before the attention reads it); the per-operation path builds the table here
+    if (!x.decode and !x.tensor) x.glue(.relbias, .{ .rows = nr, .heads = hd.q, .extent = p.extent, .dim = c.d_rel }, &.{ b(s.reln), t(w.rel_proj), b(s.pb) }, .{ p.extent, hd.q, n }, .{ 256, 1, 1 }, false);
     try x.end();
     try x.begin(.attention);
     const window: u32 = if (glob) 0 else c.window;
@@ -427,12 +549,18 @@ fn layer(x: Enc, i: u32) !void {
         const a: Args = .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .blocks = blocks, .queries = f0, .scale = scale };
         x.glue(.attn_part, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, n, blocks }, part_group, true);
         x.glue(.attn_merge, a, &.{ b(s.part), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
+    } else if (x.tensor) {
+        // the table of the chunk's relative biases is built in the stage and read by the tiled attention, 32 query rows of a head
+        // a threadgroup; every view is at the chunk's first row
+        const io: attention.Io = .{ .q = view(attention.B, b(s.qn)), .k = view(attention.B, keys), .v = view(attention.B, values), .sink = view(attention.B, b(s.sink)), .gate = view(attention.B, b(s.gate)), .out = view(attention.B, b(s.att)) };
+        attention.encodeChunk(x.e.*, &m.chunk.?.attention, .{ .rows = nr, .p0 = pos, .global = @intFromBool(glob) }, io, view(attention.B, b(s.reln)), view(attention.B, t(w.rel_proj)), view(attention.B, b(s.stage)), s.prefill_rows);
     } else {
+        // one simdgroup a (head, row) over the keys one by one, reading the table the per-operation path built
         x.glue(.attn, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .scale = scale }, &.{ b(s.qn), keys, values, b(s.pb), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
     }
     try x.end();
     try x.begin(.dense);
-    x.mv(w.o, b(s.att), b(s.o), n);
+    x.proj(w.o, b(s.att), b(s.o), n);
     try x.end();
     try x.conv(.{ .static = w.attn_conv }, b(s.o), b(s.o), b(s.ya), i, 2, H, 0);
     try x.begin(.norm);
@@ -446,18 +574,22 @@ fn layer(x: Enc, i: u32) !void {
     }
     try x.end();
     try x.begin(.route);
-    x.glue(.router, .{ .rows = nr, .width = c.experts, .dim = c.hidden }, &.{ b(s.xm), t(w.router.t), b(s.logits32) }, .{ (c.experts + 7) / 8, n, 1 }, .{ 256, 1, 1 }, true);
+    if (x.tensor) {
+        x.gemm(w.router, b(s.xm), b(s.logits32), n, .f32);
+    } else x.glue(.router, .{ .rows = nr, .width = c.experts, .dim = c.hidden }, &.{ b(s.xm), t(w.router.t), b(s.logits32) }, .{ (c.experts + 7) / 8, n, 1 }, .{ 256, 1, 1 }, true);
     x.glue(.route, .{ .rows = nr, .width = c.experts, .eps = 1e-20, .scale = c.route_scale }, &.{ b(s.logits32), t(w.bias), b(s.eids), b(s.ew) }, .{ n * 32, 1, 1 }, .{ 32, 1, 1 }, false);
+    // a layer's experts take a chain when it can (the decode chain in a window, the tensor-unit chain in a chunk on the chunk kernels)
+    // and the per-row path (ik_tiles, the grouped projections, the SwiGLU and the combine) when it cannot or the chunk has no chain: the
+    // chains read the picks as routed and sort them themselves, and only the grouped projections need them sorted into tiles
     const slots = n * c.topk;
     const rows = st.tileRows(slots, c.experts);
-    // the decode chain reads the picks as routed: only the grouped projections need them sorted into tiles
-    const chain = x.decode and w.xd_ok;
+    const chain = w.xd_ok and (x.decode or x.tensor);
     if (!chain) x.glue(.tiles, .{ .rows = @intCast(slots), .width = c.experts, .queries = c.topk, .stride = @intCast(rows) }, &.{ b(s.eids), b(s.texp), b(s.tslot), b(s.ttok) }, .{ 1, 1, 1 }, one, true);
     try x.end();
     const I: usize = c.expert_inter;
     try x.begin(.experts);
     if (chain) {
-        x.xd(w, n);
+        if (x.tensor) x.xp(w) else x.xd(w, n);
     } else {
         try x.experts(w.w13, b(s.xm), H, n, b(s.gu), slots, rows, s.ttok);
         x.glue(.swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.gu), b(s.act) }, .{ I, slots, 1 }, .{ 256, 1, 1 }, false);
@@ -484,9 +616,9 @@ fn final(x: Enc) !void {
     const nr: u32 = @intCast(n);
     const one = .{ 1024, 1, 1 };
     const K: u32 = @intCast(st.maxBlocks(c));
-    try x.begin(.norm);
+    try x.begin(.final);
     x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), b(s.nr) }, .{ n, 1, 1 }, one, true);
-    x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = 1, .stride = st.prompt_rows, .scale = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(c.hidden)))) }, &.{ b(s.blocks), b(s.nr), t(m.weights.out_query), b(s.fin) }, .{ n, 1, 1 }, one, true);
+    x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = 1, .stride = @intCast(s.prefill_rows), .scale = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(c.hidden)))) }, &.{ b(s.blocks), b(s.nr), t(m.weights.out_query), b(s.fin) }, .{ n, 1, 1 }, one, true);
     x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .flags = f32_in, .eps = c.eps }, &.{ b(s.fin), t(m.weights.norm), b(s.finals) }, .{ n, 1, 1 }, one, true);
     try x.end();
 }

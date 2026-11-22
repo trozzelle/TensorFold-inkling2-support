@@ -25,6 +25,14 @@ const usage =
     \\                                                              the decode chain on recorded rows, every pick weighing 1/8: bf16 files <out>.{gu,y,y_own,moe,moe_own}.bin
     \\                                                              (y: w2 per pick on act.bin, the input `experts` measures; y_own: on the chain's own act),
     \\                                                              and <out>.{proj_y_own,proj_moe_own}.bin: the projections' path on its own act
+    \\tf-inkling-bench pattn [rows]                                 the prompt attention at a chunk of <rows> (4096) rows on local and global layers, chunk starts 0 and <rows>:
+    \\                                                              the relative bias formed in the kernel against read from a table; ms a layer, scaled to 48 layers and two chunks
+    \\tf-inkling-bench xp <model> <layer> [rows[,rows...]] [taps=XM[,XM...]:EIDS[,EIDS...]] [parts]
+    \\                                                              a layer's routed experts for a prompt chunk through the tensor-unit chain: milliseconds a layer
+    \\                                                              call (median of 5 trials), grouping included, at each row count (default 512,2048,4096) on <model>'s
+    \\                                                              real weights. taps= names taps files (MoE inputs [T][2][4608] bf16 for layers 0 and 30, and every
+    \\                                                              layer's picks [T][48][8] u32), concatenated and cycled to the row count; without them the rows are
+    \\                                                              random and the picks skewed. parts also times each stage alone
     \\
 ;
 
@@ -39,6 +47,8 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "draft")) return draft(init);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "dense")) return dense(init, args[2..]);
     if ((args.len == 3 or args.len == 5) and std.mem.eql(u8, args[1], "dspark")) return @import("bench_dspark.zig").run(init, args);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "pattn")) return @import("bench_pattn.zig").run(init, args[2..]);
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "xp")) return @import("bench_xp.zig").run(init, args);
     if (args.len == 10 and std.mem.eql(u8, args[1], "experts")) return experts(init, args);
     if (args.len == 10 and std.mem.eql(u8, args[1], "xd-dump")) return xdDumpLeg(init, args);
     if (args.len >= 7 and std.mem.eql(u8, args[1], "xd")) return xdLeg(init, args);
@@ -128,6 +138,35 @@ fn gemm(init: std.process.Init) !void {
         const ms = try timed(q, if (g.n > 100000) 2 else 8, &g, gemmBody);
         const tflops = 2.0 * @as(f64, @floatFromInt(m * g.n * g.k)) / (ms * 1e-3) / 1e12;
         std.debug.print("{{\"gemm\": \"{s}\", \"m\": {d}, \"n\": {d}, \"k\": {d}, \"ms\": {d:.3}, \"tflops\": {d:.1}}}\n", .{ name, m, g.n, g.k, ms, tflops });
+    };
+    try gemmRows(device, q, init.gpa);
+}
+
+const RowsBench = struct { pipes: *const ik.dense_prefill.Pipes, x: mtl.Buffer, w: mtl.Buffer, y: mtl.Buffer, m: usize, n: usize, k: usize, out: ik.dense_prefill.Out };
+
+fn rowsBody(g: *const RowsBench, e: mtl.ComputeEncoder, _: usize) void {
+    ik.dense_prefill.gemmRows(e, g.pipes, .{ .buf = g.x }, .{ .buf = g.w, .n = g.n, .k = g.k }, .{ .buf = g.y }, g.out, g.m, g.n);
+}
+
+/// The forward's dense prompt GEMM (dense_prefill.gemmRows) at the dense shapes, with the router's f32 rows and the
+/// dynamic convolutions' 32 columns; "ms" is one launch.
+fn gemmRows(device: mtl.Device, q: mtl.Queue, gpa: std.mem.Allocator) !void {
+    var pipes = try ik.dense_prefill.Pipes.init(device, gpa);
+    defer pipes.deinit();
+    const shapes = [_][3]usize{ .{ 6144, 4608, 0 }, .{ 1024, 4608, 0 }, .{ 768, 4608, 0 }, .{ 48, 4608, 0 }, .{ 4608, 6144, 0 }, .{ 384, 4608, 1 }, .{ 32, 4608, 0 } };
+    const names = [_][]const u8{ "q|gate", "k|v", "r", "sink", "o", "router f32", "dyn conv" };
+    for (shapes, names) |sh, name| for ([_]usize{ 512, 2048, 4096 }) |m| {
+        var g = RowsBench{ .pipes = &pipes, .x = undefined, .w = undefined, .y = undefined, .m = m, .n = sh[0], .k = sh[1], .out = if (sh[2] == 1) .f32 else .bf16 };
+        const esz: usize = if (sh[2] == 1) 4 else 2;
+        g.x = try device.buffer(m * g.k * 2, mtl.ResourceOptions.shared);
+        g.w = try device.buffer(g.n * g.k * 2, mtl.ResourceOptions.shared);
+        g.y = try device.buffer(m * g.n * esz, mtl.ResourceOptions.shared);
+        defer for ([_]mtl.Buffer{ g.x, g.w, g.y }) |b| b.deinit();
+        fill(g.x, m * g.k, 1);
+        fill(g.w, g.n * g.k, 2);
+        const ms = try timed(q, 8, &g, rowsBody);
+        const tflops = 2.0 * @as(f64, @floatFromInt(m * g.n * g.k)) / (ms * 1e-3) / 1e12;
+        std.debug.print("{{\"dense_prefill\": \"{s}\", \"m\": {d}, \"n\": {d}, \"k\": {d}, \"ms\": {d:.3}, \"tflops\": {d:.1}}}\n", .{ name, m, g.n, g.k, ms, tflops });
     };
 }
 

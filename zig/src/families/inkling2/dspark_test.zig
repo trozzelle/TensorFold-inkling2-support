@@ -17,6 +17,7 @@ const Model = @import("model.zig").Model;
 const glue_names = @import("model.zig").glue_names;
 const dspark = @import("dspark.zig");
 const backend = @import("backend.zig");
+const fwd = @import("forward.zig");
 const budget = @import("budget.zig");
 const state = @import("state.zig");
 
@@ -181,9 +182,11 @@ const Fixture = struct {
             },
             .glue = f.pipes,
             .exl3 = undefined,
+            .chunk = null, // no chunk kernels: prompt chunks take the per-operation path
             .draft = w,
             .warm_wait = true,
             .first_chunk = 0,
+            .prefill_rows = state.default_prefill_rows,
         };
         return f;
     }
@@ -321,10 +324,11 @@ fn chunkingHolds(bits: dw.Bits) !void {
     var a_props: [7]u32 = undefined;
     var b_props: [7]u32 = undefined;
     // the whole context in one call (three passes inside), then 37 rows a call, then as a prompt's 512-row chunks: that pass
-    // skips rows 0 to 476, outside every window the hold attends
+    // skips rows 0 to 476, outside every window the hold attends; and as one prompt chunk of the whole 1,500 rows (past the
+    // drafter's 512-row passes, as a larger prefill chunk is), which keeps the last 1,023 of them in two passes
     try held(d, &s, taps, n, n, false, 7, &a_props, a_logits);
     for (a_props) |x| try t.expect(x < valid);
-    for ([_]struct { chunk: usize, prompt: bool }{ .{ .chunk = 37, .prompt = false }, .{ .chunk = 512, .prompt = true } }) |c| {
+    for ([_]struct { chunk: usize, prompt: bool }{ .{ .chunk = 37, .prompt = false }, .{ .chunk = 512, .prompt = true }, .{ .chunk = n, .prompt = true } }) |c| {
         try held(d, &s, taps, n, c.chunk, c.prompt, 7, &b_props, b_logits);
         try t.expectEqualSlices(u32, &a_props, &b_props);
         try t.expectEqualSlices(u16, a_logits, b_logits);
@@ -662,7 +666,7 @@ test "inkling2 dspark: the load's budget takes the head's file, fold, scratch an
     const dense = 5 << 20;
     try f.model.checkpoint.own(try f.device.buffer(dense, mtl.ResourceOptions.shared), dense);
     const plain = try budget.held(f.model, 0);
-    try t.expectEqual(dense + try state.scratchBytes(&f.model.config.text, 0), plain);
+    try t.expectEqual(dense + try state.scratchBytes(&f.model.config.text, 0, f.model.chunking()), plain);
     // with drafts: the draft file joins the shards (as `Model.load` leaves it), then the head is made and its fold joins them
     const file = 3 << 20;
     try f.model.checkpoint.own(try f.device.buffer(file, mtl.ResourceOptions.shared), file);
@@ -678,6 +682,135 @@ test "inkling2 dspark: the load's budget takes the head's file, fold, scratch an
     const room_drafted = try budget.caches(256 * gib, 240 * gib, 236, base + drafted);
     try t.expect(room_plain > 20 * gib);
     try t.expectEqual(d.residentBytes(1), room_plain - room_drafted);
+}
+
+test "inkling2 prefill rows: the model's setting sizes the scratch and the load's budget, and a chunk past the scratch's rows is refused" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const c = &f.model.config.text;
+    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    defer cache.deinit();
+    var ids: [129]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(5 + i);
+    // a scratch of 64 rows takes a chunk of 64 and refuses one of 65; a scratch of 128 takes 128 and refuses 129
+    const prompt: fwd.Out = .{ .logits = .none, .prompt = true };
+    var few = try state.Scratch.init(f.device, c, 256, .{ .rows = 64, .path = f.model.promptPath() });
+    defer few.deinit();
+    try fwd.run(f.model, &few, &cache, ids[0..64], prompt);
+    try t.expectError(error.Inkling2RowsExceeded, fwd.run(f.model, &few, &cache, ids[0..65], prompt));
+    var more = try state.Scratch.init(f.device, c, 256, .{ .rows = 128, .path = f.model.promptPath() });
+    defer more.deinit();
+    try fwd.run(f.model, &more, &cache, ids[0..128], prompt);
+    try t.expectError(error.Inkling2RowsExceeded, fwd.run(f.model, &more, &cache, ids[0..129], prompt));
+    // the model's rows size the backend's scratch, and the load's budget counts that scratch
+    f.model.prefill_rows = 256;
+    const metal = try backend.Metal.init(gpa, f.model, .{ .capacity = 64, .budget = 1 << 30 });
+    defer metal.deinit();
+    try t.expectEqual(@as(usize, 256), metal.scratch.prefill_rows);
+    try t.expectEqual(try state.scratchBytes(c, 0, f.model.chunking()), try budget.held(f.model, 0) - f.model.checkpoint.residentBytes());
+    f.model.prefill_rows = 128;
+    try t.expectEqual(try state.scratchBytes(c, 0, f.model.chunking()), try budget.held(f.model, 0) - f.model.checkpoint.residentBytes());
+}
+
+test "inkling2 prefill commits: a chunk's layers go to the GPU in command buffers of bounded rows times layers" {
+    // a 4,096-row chunk takes a layer a buffer, and so does anything bigger; a smaller one takes more layers, a small one all
+    for ([_]usize{ 8192, 4096, 2048 }) |rows| try t.expectEqual(@as(usize, 1), fwd.commitEvery(rows, 48));
+    try t.expectEqual(@as(usize, 3), fwd.commitEvery(1024, 48));
+    try t.expectEqual(@as(usize, 6), fwd.commitEvery(512, 48));
+    try t.expectEqual(@as(usize, 24), fwd.commitEvery(128, 48));
+    for ([_]usize{ 64, 16, 1 }) |rows| try t.expect(fwd.commitEvery(rows, 48) >= 48);
+    // never more command buffers than a queue should hold, whatever the rows, layers and repeats
+    for ([_]usize{ 1, 64, 512, 4096, 8192 }) |rows| {
+        for ([_]usize{ 1, 2, 47, 48, 49, 96, 500, 2047 }) |total| {
+            const every = fwd.commitEvery(rows, total);
+            try t.expect(every >= 1);
+            try t.expect((total + every - 1) / every <= fwd.max_buffers);
+        }
+    }
+}
+
+test "inkling2 prefill commits: a forward reports the command buffers it used and the longest one's GPU time" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const c = &f.model.config.text;
+    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    defer cache.deinit();
+    var scratch = try state.Scratch.init(f.device, c, 256, .{ .rows = 64, .path = f.model.promptPath() });
+    defer scratch.deinit();
+    var ids: [64]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(5 + i);
+    // the fixture has no layers: the embedding is the whole forward, one command buffer
+    var tm: fwd.Timing = .{};
+    try fwd.run(f.model, &scratch, &cache, &ids, .{ .logits = .none, .prompt = true, .timing = &tm });
+    try t.expectEqual(@as(u32, 1), tm.buffers);
+    try t.expect(tm.gpu > 0);
+    try t.expectEqual(tm.gpu, tm.longest);
+    // the forward's command buffers ran between its first commit and the host's wake: a buffer without a reported start
+    // must not count the clock's whole uptime
+    try t.expect(tm.gpu <= tm.woke - tm.committed);
+    // the buffers and the GPU time add up over forwards; the longest is the longest of them all
+    var again = tm;
+    try fwd.run(f.model, &scratch, &cache, &ids, .{ .logits = .none, .prompt = true, .timing = &again });
+    try t.expectEqual(@as(u32, 2), again.buffers);
+    try t.expect(again.gpu > tm.gpu and again.longest >= tm.longest and again.longest <= again.gpu);
+}
+
+test "inkling2 prompt path: the chunk kernels where the load has them, the per-row expert projections for a layer the chain cannot take, the per-operation kernels without" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const c = &f.model.config.text;
+    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    defer cache.deinit();
+    var ids: [64]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(5 + i);
+    const prompt: fwd.Out = .{ .logits = .none, .prompt = true };
+    // the fixture has no chunk kernels: prompt chunks take the per-operation path, whatever its experts
+    try t.expectEqual(state.PromptPath.per_op, f.model.promptPath());
+    var per_op = try state.Scratch.init(f.device, c, 256, .{ .rows = 64, .path = f.model.promptPath() });
+    defer per_op.deinit();
+    try fwd.run(f.model, &per_op, &cache, &ids, prompt);
+    // a scratch made for another path is refused before any work; a decode window's forward reads no chunk buffer and is not
+    var chunk = try state.Scratch.init(f.device, c, 256, .{ .rows = 64, .path = .chunk });
+    defer chunk.deinit();
+    try t.expectError(error.Inkling2ScratchForAnotherPromptPath, fwd.run(f.model, &chunk, &cache, &ids, prompt));
+    try fwd.run(f.model, &chunk, &cache, ids[0..8], .{ .logits = .none });
+    // a load with the chunk kernels takes the chunk path, and the per-row expert projections once a layer needs them
+    if (!f.device.tensorUnits()) return;
+    f.model.chunk = try @import("model.zig").Chunk.init(f.device, gpa);
+    defer {
+        f.model.chunk.?.deinit();
+        f.model.chunk = null;
+    }
+    try t.expectEqual(state.PromptPath.chunk, f.model.promptPath());
+    try fwd.run(f.model, &chunk, &cache, &ids, prompt);
+    try t.expectError(error.Inkling2ScratchForAnotherPromptPath, fwd.run(f.model, &per_op, &cache, &ids, prompt));
+    var layer: wts.Layer = undefined;
+    layer.xd_ok = false;
+    f.model.weights.layers = (&layer)[0..1];
+    defer f.model.weights.layers = &.{};
+    try t.expectEqual(state.PromptPath.chunk_rows, f.model.promptPath());
+    try t.expectError(error.Inkling2ScratchForAnotherPromptPath, fwd.run(f.model, &chunk, &cache, &ids, prompt));
+    var rows = try state.Scratch.init(f.device, c, 256, .{ .rows = 64, .path = .chunk_rows });
+    defer rows.deinit();
+    try fwd.run(f.model, &rows, &cache, &ids, prompt);
+    layer.xd_ok = true;
+    try t.expectEqual(state.PromptPath.chunk, f.model.promptPath());
+    try t.expectError(error.Inkling2ScratchForAnotherPromptPath, fwd.run(f.model, &rows, &cache, &ids, prompt));
 }
 
 test "inkling2 dspark: a drafted load's facts fix the depth or leave it to the rule, with the timed window costs and the logprob rows kept" {

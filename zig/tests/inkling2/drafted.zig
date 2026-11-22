@@ -4,11 +4,12 @@
 //! every round holds the deepest chain, 7 drafts when INKLING_DRAFT_DEPTH is unset and at most the number it gives, and verifies the
 //! first draft and each next one while its own probability is at least that. With `off` every draft held is verified, and the depth
 //! is INKLING_DRAFT_DEPTH's: 1 to 7 holds every round at it, `auto` lets the cost rule choose, and unset is 4. The layers are
-//! INKLING_DRAFT_BITS's: 8 (quantized at load, unset too) or 16 (bf16).
+//! INKLING_DRAFT_BITS's: 8 (quantized at load, unset too) or 16 (bf16). INKLING_PREFILL_ROWS sets the prompt chunk's rows, as served.
 const std = @import("std");
 const tf = @import("tensorfold");
 const ik = tf.inkling2;
 const lanes = tf.lanes;
+const settings = @import("settings.zig");
 
 fn now() f64 {
     var ts: std.c.timespec = undefined;
@@ -21,12 +22,9 @@ fn now() f64 {
 pub fn greedy(init: std.process.Init, model_dir: []const u8, ids: []const u32, steps: usize) !void {
     if (steps == 0 or ids.len == 0) return error.ExpectedPromptAndSteps;
     const gpa = init.gpa;
-    const drafting = ik.dspark.Drafting.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null, if (std.c.getenv("INKLING_DRAFT_CONFIDENCE")) |v| std.mem.span(v) else null) catch |err| return switch (err) {
-        error.BadDraftDepth => error.DraftDepthIsOneToSevenOrAuto,
-        error.BadDraftConfidence => error.DraftConfidenceIsAboveZeroAndBelowOneOrOff,
-    };
-    const bits = ik.dspark_weights.Bits.parse(if (std.c.getenv("INKLING_DRAFT_BITS")) |v| std.mem.span(v) else null) catch return error.DraftBitsIsEightOrSixteen;
-    const m = try ik.Model.load(gpa, init.io, model_dir, .{ .drafts = true, .draft_bits = bits });
+    const draft = try settings.draft();
+    const drafting = draft.drafting;
+    const m = try ik.Model.load(gpa, init.io, model_dir, .{ .drafts = true, .draft_bits = draft.bits, .prefill_rows = try settings.prefillRows() });
     defer m.deinit();
     const weights: *ik.dspark_weights.Weights = if (m.draft) |*w| w else return error.NoDraftHead;
     const c = &m.config.text;
