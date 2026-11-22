@@ -52,7 +52,8 @@ const ring_pad = 7;
 const key_block = 256;
 const max_blocks = 7;
 const part_slot = 130;
-/// Rows one absorb pass projects at most (a prompt chunk's).
+/// Rows one absorb pass projects at most: the scratch holds this many rows' mixes, keys and values. A prompt chunk of any size
+/// up to the target's prefill rows (8,192 at most) is absorbed in passes of this many, in order in one command buffer.
 const absorb_rows = 512;
 /// Ids of the vocabulary that groups of 256 ids' argmax partials cover.
 const pick_group = 256;

@@ -182,6 +182,7 @@ const Fixture = struct {
             },
             .glue = f.pipes,
             .exl3 = undefined,
+            .chunk = undefined,
             .draft = w,
             .warm_wait = true,
             .first_chunk = 0,
@@ -323,10 +324,11 @@ fn chunkingHolds(bits: dw.Bits) !void {
     var a_props: [7]u32 = undefined;
     var b_props: [7]u32 = undefined;
     // the whole context in one call (three passes inside), then 37 rows a call, then as a prompt's 512-row chunks: that pass
-    // skips rows 0 to 476, outside every window the hold attends
+    // skips rows 0 to 476, outside every window the hold attends; and as one prompt chunk of the whole 1,500 rows (past the
+    // drafter's 512-row passes, as a larger prefill chunk is), which keeps the last 1,023 of them in two passes
     try held(d, &s, taps, n, n, false, 7, &a_props, a_logits);
     for (a_props) |x| try t.expect(x < valid);
-    for ([_]struct { chunk: usize, prompt: bool }{ .{ .chunk = 37, .prompt = false }, .{ .chunk = 512, .prompt = true } }) |c| {
+    for ([_]struct { chunk: usize, prompt: bool }{ .{ .chunk = 37, .prompt = false }, .{ .chunk = 512, .prompt = true }, .{ .chunk = n, .prompt = true } }) |c| {
         try held(d, &s, taps, n, c.chunk, c.prompt, 7, &b_props, b_logits);
         try t.expectEqualSlices(u32, &a_props, &b_props);
         try t.expectEqualSlices(u16, a_logits, b_logits);
@@ -758,6 +760,35 @@ test "inkling2 prefill commits: a forward reports the command buffers it used an
     try fwd.run(f.model, &scratch, &cache, &ids, .{ .logits = .none, .prompt = true, .timing = &again });
     try t.expectEqual(@as(u32, 2), again.buffers);
     try t.expect(again.gpu > tm.gpu and again.longest >= tm.longest and again.longest <= again.gpu);
+}
+
+test "inkling2 prefill chunks: a model with an expert table the chunk path cannot take refuses a chunk before any work" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const c = &f.model.config.text;
+    var cache = try state.Cache.init(f.device, c, 256, c.layers);
+    defer cache.deinit();
+    var scratch = try state.Scratch.init(f.device, c, 256, 64);
+    defer scratch.deinit();
+    var ids: [64]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(5 + i);
+    // no layers, nothing the chain cannot take
+    try t.expect(f.model.chunkReady());
+    // one layer whose experts only the generic path takes (K4, say): any chunk is refused, a prompt's or not, and no work is done
+    var layer: wts.Layer = undefined;
+    layer.xd_ok = false;
+    f.model.weights.layers = (&layer)[0..1];
+    defer f.model.weights.layers = &.{};
+    try t.expect(!f.model.chunkReady());
+    try t.expectError(error.Inkling2ChunkNeedsK2K3Experts, fwd.run(f.model, &scratch, &cache, &ids, .{ .logits = .none, .prompt = true }));
+    try t.expectError(error.Inkling2ChunkNeedsK2K3Experts, fwd.run(f.model, &scratch, &cache, &ids, .{ .logits = .none }));
+    layer.xd_ok = true;
+    try t.expect(f.model.chunkReady());
 }
 
 test "inkling2 dspark: a drafted load's facts fix the depth or leave it to the rule, with the timed window costs and the logprob rows kept" {

@@ -10,9 +10,12 @@ const pack = @import("expert_pack.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 const dspark_weights = @import("dspark_weights.zig");
+const dense_prefill = @import("dense_prefill.zig");
+const attention_prefill = @import("attention_prefill.zig");
+const experts_prefill = @import("experts_prefill.zig");
 
-pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap" };
-pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap };
+pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap" };
+pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap };
 
 comptime {
     // `pipe` indexes the pipelines by the enum's order: each member is its kernel's name without the ik_ prefix
@@ -29,6 +32,31 @@ comptime {
 /// that many rows and a prompt is fed in pieces of them.
 pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default, prefill_rows: u32 = st.default_prefill_rows };
 
+/// The kernels of the chunk path, the one every prompt row takes: the dense projections' GEMM, the attention and the experts'
+/// chain, on the tensor units.
+pub const Chunk = struct {
+    dense: dense_prefill.Pipes,
+    attention: attention_prefill.Pipes,
+    experts: experts_prefill.Pipes,
+
+    /// Compiles them for `device`: `error.Inkling2NeedsTensorUnits` on a GPU without tensor units, which cannot run the experts' chain.
+    fn init(device: mtl.Device, gpa: std.mem.Allocator) !Chunk {
+        if (!experts_prefill.available(device)) return error.Inkling2NeedsTensorUnits;
+        var dense = try dense_prefill.Pipes.init(device, gpa);
+        errdefer dense.deinit();
+        var attention = try attention_prefill.Pipes.init(device, gpa);
+        errdefer attention.deinit();
+        const experts = try experts_prefill.Pipes.init(device, gpa);
+        return .{ .dense = dense, .attention = attention, .experts = experts };
+    }
+
+    fn deinit(c: *Chunk) void {
+        c.experts.deinit();
+        c.attention.deinit();
+        c.dense.deinit();
+    }
+};
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     device: mtl.Device,
@@ -40,6 +68,8 @@ pub const Model = struct {
     weights: wts.Weights,
     glue: [glue_names.len]mtl.Pipeline,
     exl3: exl3.Pipelines,
+    /// The chunk path's kernels.
+    chunk: Chunk,
     /// The draft head's tensors in `checkpoint`, when `Options.drafts` asked for them and they exist.
     draft: ?dspark_weights.Weights,
     /// Whether decode steps wait warm (forward.zig's `waitWarm`); INKLING_WARM_WAIT=0 turns it off.
@@ -80,6 +110,9 @@ pub const Model = struct {
         errdefer m.device.deinit();
         m.queue = try m.device.queue();
         errdefer m.queue.deinit();
+        // the chunk path needs tensor units: a GPU without them is refused before the checkpoint is read
+        m.chunk = try Chunk.init(m.device, gpa);
+        errdefer m.chunk.deinit();
         m.checkpoint = ck.Checkpoint.init(gpa);
         errdefer m.checkpoint.deinit();
         var p = if (m.layers == 0) pack.Pack{ .arena = std.heap.ArenaAllocator.init(gpa), .layers = &.{} } else try pack.Pack.read(gpa, io, dir, t.layers, t.experts);
@@ -110,8 +143,16 @@ pub const Model = struct {
         return m.glue[@backingInt(g)];
     }
 
+    /// Whether every loaded layer's experts take the chunk path's chain (K2 or K3 trellis, `weights.xdOk`): a prompt chunk runs
+    /// no other way, while a decode window falls back to the generic expert path for a layer that does not.
+    pub fn chunkReady(m: *const Model) bool {
+        for (m.weights.layers) |l| if (!l.xd_ok) return false;
+        return true;
+    }
+
     pub fn deinit(m: *Model) void {
         if (m.draft) |*w| w.deinit(m.gpa);
+        m.chunk.deinit();
         m.exl3.deinit();
         for (m.glue) |x| x.deinit();
         m.weights.deinit(m.gpa);
@@ -123,10 +164,12 @@ pub const Model = struct {
 };
 
 /// The shapes the kernels are written for: both layer kinds 48 x 128 queries over 8 x 128 keys (six query heads to a key
-/// head), d_rel 16, top-8, one relative extent for both kinds.
+/// head), d_rel 16, top-8, and one relative extent of 1,024 for both kinds, which is also the local layers' window.
 fn geometry(t: *const cfg.Text) !void {
-    const ok = t.local.q == t.global.q and t.local.kv == t.global.kv and t.local.q == 6 * t.local.kv and
-        t.local.dim == 128 and t.global.dim == 128 and t.d_rel == 16 and t.topk == 8 and t.experts <= 384 and
-        t.window == t.rel_extent and t.hidden % 128 == 0 and t.expert_inter % 128 == 0 and st.maxBlocks(t) <= 9;
+    const a = attention_prefill;
+    const ok = t.local.q == t.global.q and t.local.kv == t.global.kv and t.local.q == a.heads and t.local.kv == a.kv_heads and
+        t.local.q == 6 * t.local.kv and t.local.dim == a.dim and t.global.dim == a.dim and t.d_rel == a.rel_dims and t.topk == 8 and
+        t.experts <= 384 and t.window == a.extent and t.rel_extent == a.extent and t.hidden % 128 == 0 and
+        t.expert_inter % 128 == 0 and st.maxBlocks(t) <= 9;
     if (!ok) return error.UnsupportedInkling2Geometry;
 }

@@ -1,26 +1,29 @@
 //! Inkling 2's prompt attention (ik_pattn) against an FP64 reference at the output's rounding points, the same rows run in
 //! one call and in calls cut anywhere (bit for bit, with everything past a call's rows poisoned), and the two ways of
 //! supplying the relative bias (read from the table ik_pattn_bias builds, formed in the kernel) against each other.
-//! Also the dispatch the engine runs for a chunk's attention (`encodeChunk`), which the benches use.
+//! The dispatch under test is the engine's (`attention_prefill.encodeChunk`); the formed-bias kernel and the tensor-unit table
+//! builder are test-only kernels, appended to pattn.metal here and in the bench.
 const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
 const tf = @import("tensorfold");
+const ap = tf.inkling2.attention_prefill;
 const h = @import("harness.zig");
 
-pub const Hq = 48;
-pub const KV = 8;
-pub const D = 128;
-pub const E = 1024; // relative-bias extent, also the local layers' window
-pub const REL = 16; // dims of the relative state
+pub const Hq = ap.heads;
+pub const KV = ap.kv_heads;
+pub const D = ap.dim;
+pub const E = ap.extent; // relative-bias extent, also the local layers' window
+pub const REL = ap.rel_dims; // dims of the relative state
 const QROW = Hq * D; // elements in a row of q, gate and the output
 const POISON: u16 = 0x7fc0; // bf16 NaN
 const REACH = 256; // cache rows past a call's last position that a call poisons (a block reaches 63)
 /// Rows of the relative-bias table at a time in the cases: a piece's table is `tableBytes(PIECE)`, 100 MB.
 const PIECE = 1024;
+const tableBytes = ap.tableBytes;
 
 /// ik_pattn's arguments: the call's rows, the first row's position, 1 on a global layer.
-pub const Args = extern struct { rows: u32, p0: u32, global: u32 };
+pub const Args = ap.Args;
 
 /// How a call gets the relative bias: read from the table ik_pattn_bias builds (ik_pattn), or formed in the kernel from the
 /// rows' relative state and the projection (a test-only kernel that runs ik_pattn's body).
@@ -28,96 +31,64 @@ pub const Form = enum { table, formed };
 
 /// Binds of a call at its first row: q [rows][48][128], the layer's keys and values [capacity][8][128], sink [rows][48],
 /// gate and out [rows][48][128] (all bf16).
-pub const Io = struct { q: h.Bind, k: h.Bind, v: h.Bind, sink: h.Bind, gate: h.Bind, out: h.Bind };
+pub const Io = ap.Io;
 
-/// The pattn library (pattn.metal with the test-only kernels, nax.h inlined) and its pipelines.
+/// The engine's pipelines (pattn.metal alone: what `encodeChunk` runs) and the test-only kernels' library: pattn.metal with
+/// ref_pattn.metal appended, nax.h inlined, and the two kernels of ref_pattn.metal.
 pub const Pipes = struct {
+    engine: ap.Pipes,
     lib: mtl.Library,
-    attn: mtl.Pipeline,
-    bias: mtl.Pipeline,
     formed: mtl.Pipeline,
     bias_mma: mtl.Pipeline,
 
     pub fn init(device: mtl.Device, a: std.mem.Allocator) !Pipes {
-        return initWith(device, a, "");
+        return initUnits(device, a, device.tensorUnits());
     }
 
-    /// `prefix` goes before the source (a `#define TF_SIMD_FRAGS 1` builds the text older GPUs run).
-    pub fn initWith(device: mtl.Device, a: std.mem.Allocator, prefix: []const u8) !Pipes {
+    /// The kernels on tensor units or on simdgroup matrices (the text older GPUs run: a GPU with tensor units compiles it but
+    /// cannot run it, since its fragment layout is theirs).
+    pub fn initUnits(device: mtl.Device, a: std.mem.Allocator, units: bool) !Pipes {
+        var engine = try ap.Pipes.initUnits(device, a, units);
+        errdefer engine.deinit();
         const text = try std.mem.concat(a, u8, &.{ ks.inkling2_pattn, @embedFile("ref_pattn.metal") });
         defer a.free(text);
-        const body = try tf.frags.source(device, a, text);
-        defer a.free(body);
-        const src = try std.mem.concat(a, u8, &.{ prefix, body });
+        const src = try tf.frags.precision.source(a, units, text, ks.nax, false);
         defer a.free(src);
         const lib = try mtl.Library.fromSource(device, src, mtl.CompileOptions.mlx());
         errdefer lib.deinit();
-        var p: Pipes = undefined;
-        p.lib = lib;
-        p.attn = try mtl.Pipeline.init(device, lib, "ik_pattn", false);
-        errdefer p.attn.deinit();
-        p.bias = try mtl.Pipeline.init(device, lib, "ik_pattn_bias", false);
-        errdefer p.bias.deinit();
-        p.formed = try mtl.Pipeline.init(device, lib, "ik_pattn_formed", false);
-        errdefer p.formed.deinit();
-        p.bias_mma = try mtl.Pipeline.init(device, lib, "ik_pattn_bias_mma", false);
-        return p;
+        const formed = try mtl.Pipeline.init(device, lib, "ik_pattn_formed", false);
+        errdefer formed.deinit();
+        const bias_mma = try mtl.Pipeline.init(device, lib, "ik_pattn_bias_mma", false);
+        return .{ .engine = engine, .lib = lib, .formed = formed, .bias_mma = bias_mma };
     }
 
     pub fn deinit(p: *Pipes) void {
-        p.attn.deinit();
-        p.bias.deinit();
+        p.engine.deinit();
         p.formed.deinit();
         p.bias_mma.deinit();
         p.lib.deinit();
     }
 };
 
-/// Bytes of the relative-bias table for `rows` rows: a bf16 for each of a row's 48 heads' 1,024 slots.
-pub fn tableBytes(rows: usize) usize {
-    return rows * Hq * E * 2;
-}
-
-/// One call of ik_pattn (or of the formed-bias kernel): a threadgroup of 64 threads for each 32 rows of each of the 48
-/// heads. `rel`: the table at the call's first row, or for the formed kernel the rows' relative state [rows][48][16]
-/// bf16 and (`projt`) the projection as f32 columns [1024][16].
-pub fn encodeAttn(e: mtl.ComputeEncoder, pipe: mtl.Pipeline, a: Args, io: Io, rel: h.Bind, projt: ?h.Bind) void {
+/// One call of the formed-bias kernel (ik_pattn's body, the bias computed in the kernel): a threadgroup of 64 threads for each
+/// 32 rows of each of the 48 heads. `reln`: the rows' relative state [rows][48][16] bf16; `projt`: the projection as f32 columns
+/// [1024][16].
+pub fn encodeFormed(e: mtl.ComputeEncoder, pipe: mtl.Pipeline, a: Args, io: Io, reln: ap.B, projt: ap.B) void {
     e.setPipeline(pipe);
     e.setValue(a, 0);
-    const bs = [_]h.Bind{ io.q, io.k, io.v, io.sink, rel, io.gate, io.out };
+    const bs = [_]ap.B{ io.q, io.k, io.v, io.sink, reln, io.gate, io.out };
     for (bs, 1..) |b, i| e.setBuffer(b.buf, b.off, i);
-    if (projt) |t| e.setBuffer(t.buf, t.off, 8);
+    e.setBuffer(projt.buf, projt.off, 8);
     e.dispatchGroups(mtl.Size.of((a.rows + 31) / 32, Hq, 1), mtl.Size.of(64, 1, 1));
 }
 
-/// The relative-bias table of `a.rows` rows (ik_pattn_bias; `mma`: the tensor-unit builder, whose bits differ): from the
-/// rows' relative state `reln` [rows][48][16] and the weights' projection `proj` [16][1024], into `table`.
-pub fn encodeBias(e: mtl.ComputeEncoder, p: *const Pipes, mma: bool, a: Args, reln: h.Bind, proj: h.Bind, table: h.Bind) void {
-    e.setPipeline(if (mma) p.bias_mma else p.bias);
+/// The relative-bias table of `a.rows` rows built on the tensor units (whose bits differ from the engine's scalar builder),
+/// from the rows' relative state `reln` [rows][48][16] and the projection `proj` [16][1024], into `table`.
+pub fn encodeBiasMma(e: mtl.ComputeEncoder, pipe: mtl.Pipeline, a: Args, reln: ap.B, proj: ap.B, table: ap.B) void {
+    e.setPipeline(pipe);
     e.setValue(a, 0);
-    for ([_]h.Bind{ reln, proj, table }, 1..) |b, i| e.setBuffer(b.buf, b.off, i);
-    if (mma) {
-        e.dispatchGroups(mtl.Size.of(a.rows, Hq / 16, 1), mtl.Size.of(32, 1, 1));
-    } else {
-        e.dispatchThreads(mtl.Size.of(E / 4, Hq / 4, a.rows), mtl.Size.of(64, 1, 1));
-    }
-}
-
-fn down(b: h.Bind, row_bytes: usize, rows: usize) h.Bind {
-    return .{ .buf = b.buf, .off = b.off + rows * row_bytes };
-}
-
-/// The engine's dispatch for a chunk's attention on one layer: the `a.rows` rows in pieces of `piece` rows (a multiple of
-/// 32), each piece's relative-bias table built into `table` (`tableBytes(piece)`) and read by ik_pattn. Every bind is at
-/// the chunk's first row. A row's bytes do not depend on `piece` or on `a.p0`.
-pub fn encodeChunk(e: mtl.ComputeEncoder, p: *const Pipes, a: Args, io: Io, reln: h.Bind, proj: h.Bind, table: h.Bind, piece: usize) void {
-    var at: usize = 0;
-    while (at < a.rows) : (at += piece) {
-        const sub: Args = .{ .rows = @intCast(@min(piece, a.rows - at)), .p0 = a.p0 + @as(u32, @intCast(at)), .global = a.global };
-        encodeBias(e, p, false, sub, down(reln, Hq * REL * 2, at), proj, table);
-        const part: Io = .{ .q = down(io.q, QROW * 2, at), .k = io.k, .v = io.v, .sink = down(io.sink, Hq * 2, at), .gate = down(io.gate, QROW * 2, at), .out = down(io.out, QROW * 2, at) };
-        encodeAttn(e, p.attn, sub, part, table, null);
-    }
+    for ([_]ap.B{ reln, proj, table }, 1..) |b, i| e.setBuffer(b.buf, b.off, i);
+    e.dispatchGroups(mtl.Size.of(a.rows, Hq / 16, 1), mtl.Size.of(32, 1, 1));
 }
 
 fn finish(cb: mtl.CommandBuffer, what: []const u8) !void {
@@ -255,7 +226,7 @@ pub const Seq = struct {
     }
 
     /// The call's relative state at row p0.
-    fn relnAt(s: *const Seq, p0: usize) h.Bind {
+    fn relnAt(s: *const Seq, p0: usize) ap.B {
         return .{ .buf = s.reln, .off = p0 * Hq * REL * 2 };
     }
 
@@ -279,8 +250,8 @@ pub fn call(g: *const h.Gpu, p: *const Pipes, form: Form, s: *Seq, p0: usize, n:
     const cb = g.queue.commandBuffer();
     const e = cb.compute(.serial);
     switch (form) {
-        .table => encodeChunk(e, p, a, s.io(p0), s.relnAt(p0), .{ .buf = s.proj }, .{ .buf = table.? }, piece),
-        .formed => encodeAttn(e, p.formed, a, s.io(p0), s.relnAt(p0), .{ .buf = s.projt }),
+        .table => ap.encodeChunk(e, &p.engine, a, s.io(p0), s.relnAt(p0), .{ .buf = s.proj }, .{ .buf = table.? }, piece),
+        .formed => encodeFormed(e, p.formed, a, s.io(p0), s.relnAt(p0), .{ .buf = s.projt }),
     }
     e.end();
     try finish(cb, "ik_pattn");
@@ -425,7 +396,7 @@ fn caseBias(g: *const h.Gpu, pipes: *const Pipes, r: std.Random) !void {
             @memset(tv, 0xffff);
             const cb = g.queue.commandBuffer();
             const e = cb.compute(.serial);
-            encodeBias(e, pipes, mma, a, s.relnAt(p0), .{ .buf = s.proj }, .{ .buf = table });
+            if (mma) encodeBiasMma(e, pipes.bias_mma, a, s.relnAt(p0), .{ .buf = s.proj }, .{ .buf = table }) else ap.encodeBias(e, pipes.engine.bias, a, s.relnAt(p0), .{ .buf = s.proj }, .{ .buf = table });
             e.end();
             try finish(cb, "ik_pattn_bias");
             var differ: usize = 0;
@@ -557,7 +528,7 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     defer pipes.deinit();
     // the text older GPUs run (simdgroup matrices) builds here too; its fragment layout is theirs, so only this GPU's runs
     if (g.device.tensorUnits()) {
-        var older = try Pipes.initWith(g.device, std.heap.page_allocator, "#define TF_SIMD_FRAGS 1\n");
+        var older = try Pipes.initUnits(g.device, std.heap.page_allocator, false);
         older.deinit();
     }
     try caseRef(g, &pipes, r);

@@ -67,17 +67,28 @@ checks that each row's result is independent of the rows beside it, and that a N
   prints the median wall time and its parts (encode, commit to GPU start, GPU, GPU end to wake, draw), with a digest
   of the last hidden rows to compare two configurations bit for bit. `tf-inkling-kernels time` times the fused norm
   kernels at the block and query counts of the real layers.
-- `INKLING_PREFILL_ROWS` sets the rows of a prompt chunk at most (a multiple of 64 from 64 to 8,192; default 512). The
-  scratch is made for that many rows, so a larger chunk takes more of the load limit, and a prompt is fed in pieces of
-  that many. Every kernel keeps rows independent, so the chunk size changes no bits.
+- `INKLING_PREFILL_ROWS` sets the rows of a prompt chunk at most (a multiple of 64 from 64 to 8,192; default 4,096). The
+  scratch is made for that many rows, so a larger chunk takes more of the load limit (2.67 GiB at 4,096 rows, 0.37 GiB at
+  512), and a prompt is fed in pieces of that many. Prompt rows take the chunk path, whose kernels keep a row's bits
+  independent of the chunk it is in.
+- The chunk path runs on the tensor units: the dense projections and the router as GEMMs (bf16 operands, f32 sums in a
+  fixed order), attention over 64-key blocks that reads a relative-bias table built just before it, and the routed
+  experts through a chain adapted from Sushi that sorts the picks by expert on the GPU. A GPU without tensor units
+  refuses the model at load, and so does a pack whose experts are not all K2 or K3. A cache holds a multiple of 64
+  positions.
 - A chunk's layers go to the GPU in several command buffers, committed as they are encoded and run in order, because the
-  GPU kills a command buffer that runs for long (a kill at 15.6 s has been seen) and a 4,096-row chunk takes about a
-  minute. Each buffer holds at most 3,072 rows times layers, about a second of today's GPU time: a layer at a time from
-  2,048 rows up, six layers at 512. The bits are the same as from one buffer.
+  GPU kills a command buffer that runs for long (a kill at 15.6 s has been seen). Each buffer holds at most 3,072 rows
+  times layers: a layer at a time from 2,048 rows up, six layers at 512. The bits are the same as from one buffer.
 - `tf-inkling-run MODEL prefill ids.json [--chunk N] [--layers L] [--spans] [--drafts]` feeds a prompt through the
   serving prompt path and prints its time, its GPU time by class, the command buffers it used and the longest one's GPU
   time, and a digest of the last row's hidden state (the same at any chunk size) (`--spans` adds a line a chunk;
   `--drafts` adds the draft head's taps and absorb). `INKLING_PREFILL_ROWS` sets the chunk of its other modes too.
+- `tf-inkling-run MODEL partition ids.json CUT... [--layers L] [--drafts]` feeds a prompt twice, in chunks of the prefill
+  rows and in chunks of the lengths given (the prefill rows for what is left), each leg on a scratch and a cache poisoned
+  with NaN past the rows in use, and compares the legs bit for bit: every layer's keys and values, the convolution rings,
+  every row's last-layer output and expert picks and, on the whole model, the taps, the last row's finals and the kept
+  logits (with `--drafts`, the first hold's proposals). It exits non-zero on a difference, on a NaN in a result and on a
+  write past a chunk's rows.
 
 ## Drafts
 
@@ -100,7 +111,7 @@ Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a b
 
 | | |
 |---|---|
-| Prompt | about 65 tok/s (8,202 tokens in 126 s to the first token) |
+| Prompt, on the per-operation kernels the chunk path replaced | about 65 tok/s (8,202 tokens in 126 s to the first token) |
 | Decode with drafts (default) | 61.4 tok/s (65.2 on the bench prompt) |
 | Decode with drafts, every draft verified at depth 4 | 57.1 tok/s |
 | Decode, `--no-drafts` | 39.4 tok/s; 37.9 tok/s after an 8,202-token prompt |
@@ -109,11 +120,12 @@ Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a b
 
 Decode steps of up to 16 rows take a decode path: the experts run a rate-grouped EXL3 chain (adapted from Sushi), and
 attention, norms and the attention-input matvecs have their own kernels. A step takes about 25 ms of GPU time. Prompt
-rows still take the per-operation kernels, which is what limits prompt speed.
+rows take the chunk path above.
 
 ## Fidelity
 
-Teacher-forced on a 62,526-token held-out set against the MXFP8 release as teacher:
+Teacher-forced on a 62,526-token held-out set against the MXFP8 release as teacher, with the per-operation prompt
+kernels the chunk path replaced:
 - **KL:** 0.0325 on the prompt path; 0.0336 with every row after the first 16 fed through the decode path in 16-row
   windows.
 - **Comparison:** the same pack's experts in an MLX forward score KL 0.0341. TensorFold's is 0.0016 lower on the

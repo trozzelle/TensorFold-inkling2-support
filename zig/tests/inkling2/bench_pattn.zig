@@ -6,7 +6,8 @@
 const std = @import("std");
 const mtl = @import("metal");
 const cases = @import("cases_pattn.zig");
-const h = @import("harness.zig");
+const tf = @import("tensorfold");
+const ap = tf.inkling2.attention_prefill;
 
 const trials = 9;
 const Hq = cases.Hq;
@@ -65,7 +66,7 @@ const Bufs = struct {
             .vals = try mk(device, cap * KV * D * 2),
             .proj = try mk(device, REL * E * 2),
             .projt = try mk(device, E * REL * 4),
-            .table = try mk(device, cases.tableBytes(rows)),
+            .table = try mk(device, ap.tableBytes(rows)),
         };
         fill(b.q, rows * Hq * D, r, 3);
         fill(b.sink, rows * Hq, r, 2);
@@ -93,17 +94,17 @@ const Bufs = struct {
 const Mode = union(enum) { chunk: usize, formed, build, attn, mma };
 
 fn encodeMode(e: mtl.ComputeEncoder, p: *const cases.Pipes, b: Bufs, mode: Mode, a: cases.Args) void {
-    const reln: h.Bind = .{ .buf = b.reln };
-    const proj: h.Bind = .{ .buf = b.proj };
-    const table: h.Bind = .{ .buf = b.table };
+    const reln: ap.B = .{ .buf = b.reln };
+    const proj: ap.B = .{ .buf = b.proj };
+    const table: ap.B = .{ .buf = b.table };
     switch (mode) {
-        .chunk => |piece| cases.encodeChunk(e, p, a, b.io(), reln, proj, table, piece),
-        .formed => cases.encodeAttn(e, p.formed, a, b.io(), reln, .{ .buf = b.projt }),
-        .build => cases.encodeBias(e, p, false, a, reln, proj, table),
-        .attn => cases.encodeAttn(e, p.attn, a, b.io(), table, null),
+        .chunk => |piece| ap.encodeChunk(e, &p.engine, a, b.io(), reln, proj, table, piece),
+        .formed => cases.encodeFormed(e, p.formed, a, b.io(), reln, .{ .buf = b.projt }),
+        .build => ap.encodeBias(e, p.engine.bias, a, reln, proj, table),
+        .attn => ap.encodeAttn(e, p.engine.attn, a, b.io(), table),
         .mma => {
-            cases.encodeBias(e, p, true, a, reln, proj, table);
-            cases.encodeAttn(e, p.attn, a, b.io(), table, null);
+            cases.encodeBiasMma(e, p.bias_mma, a, reln, proj, table);
+            ap.encodeAttn(e, p.engine.attn, a, b.io(), table);
         },
     }
 }

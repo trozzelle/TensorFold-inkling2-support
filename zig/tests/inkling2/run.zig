@@ -50,7 +50,14 @@ const usage =
     \\                                                         --drafts: as served with the draft head (INKLING_DRAFT_* as greedy --drafts reads them):
     \\                                                         every chunk taps its rows and runs the final stage on all of them, and the head absorbs
     \\                                                         the prompt's rows but the last
-    \\INKLING_PREFILL_ROWS: the prefill rows, the rows of a prompt chunk at most, as the server reads it: a multiple of 64 from 64 to 8192, 512 when unset
+    \\tf-inkling-run <model> partition <ids.json> <cut>... [--layers L] [--drafts]   the prompt twice through the serving prompt path: in chunks of
+    \\                                                         the prefill rows, and in chunks of the lengths given (the cuts, then the prefill rows for
+    \\                                                         the rest), each leg with its scratch and its cache poisoned with NaN past the rows in use,
+    \\                                                         then compares the legs bit for bit: every layer's keys and values, the convolution rings,
+    \\                                                         every row's last layer output and expert picks and, on the whole model, the taps, the last
+    \\                                                         row's finals and logits and, with --drafts, the first hold's proposals. Exits non-zero
+    \\                                                         on a difference or a NaN in either leg's results
+    \\INKLING_PREFILL_ROWS: the prefill rows, the rows of a prompt chunk at most, as the server reads it: a multiple of 64 from 64 to 8192, 4096 when unset
     \\
 ;
 
@@ -73,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[2], "profile")) return profileMode(init, args);
     if (std.mem.eql(u8, args[2], "wall")) return wallMode(init, args);
     if (std.mem.eql(u8, args[2], "prefill")) return prefillMode(init, args);
+    if (std.mem.eql(u8, args[2], "partition")) return partitionMode(init, args);
     std.debug.print("{s}", .{usage});
     return error.UnknownMode;
 }
@@ -610,47 +618,15 @@ fn prefillArgs(args: []const [:0]const u8) !PrefillArgs {
     return p;
 }
 
-/// The draft head over a prompt, taking its rows in as the drafted lane backend hands them over, chunk by chunk.
-const Absorber = struct {
-    gpa: std.mem.Allocator,
-    drafter: *ik.dspark.Drafter,
-    stream: *lanes.Stream, // on the heap: the drafter keeps its stream's state under this address
-    row_bytes: u32,
+const Absorber = @import("absorber.zig").Absorber;
 
-    fn init(gpa: std.mem.Allocator, m: *ik.Model, draft: settings.Draft, ids: []const u32) !Absorber {
-        const weights: *ik.dspark_weights.Weights = if (m.draft) |*w| w else return error.NoDraftHead;
-        const drafter = try ik.dspark.Drafter.init(gpa, m.device, m, weights, draft.drafting.options());
-        errdefer drafter.deinit();
-        const stream = try gpa.create(lanes.Stream);
-        errdefer gpa.destroy(stream);
-        stream.* = try lanes.Stream.init(gpa, .{ .id = "prefill", .prompt = ids, .max_new = 1 });
-        errdefer stream.deinit(gpa);
-        try drafter.drafter().open(stream);
-        return .{ .gpa = gpa, .drafter = drafter, .stream = stream, .row_bytes = @intCast(ik.state.feature_taps * @as(usize, m.config.text.hidden) * 2) };
-    }
-
-    fn deinit(a: Absorber) void {
-        a.drafter.drafter().release(a.stream);
-        a.stream.deinit(a.gpa);
-        a.gpa.destroy(a.stream);
-        a.drafter.deinit();
-    }
-
-    /// A prompt chunk of `n` rows from `at`, tapped into `taps`, handed over as `Drafted.take` does: every row but the prompt's last
-    /// (absorbed with the first token). The absorb's own command buffer is waited for here, so each chunk's GPU seconds are its
-    /// own; 0 when the head keeps none of these rows (only the prompt's last 1,023 are ever attended).
-    fn take(a: Absorber, taps: mtl.Buffer, at: usize, n: usize) !f64 {
-        const ids = a.stream.prompt();
-        const last = ids.len - 1;
-        if (at >= last) return 0;
-        const rows: u32 = @intCast(@min(n, last - at));
-        const f: lanes.backend.Features = .{ .buffer = @intFromPtr(taps.id), .rows = rows, .row_bytes = a.row_bytes, .space = .device, .dtype = .bf16 };
-        try a.drafter.drafter().absorb(&.{.{ .stream = a.stream, .features = f, .start = at, .follow = ids[at + 1 ..][0..rows] }});
-        if (a.drafter.pending == null) return 0;
-        try a.drafter.sync();
-        return a.drafter.absorb_gpu;
-    }
-};
+/// The prompt through the serving prompt path in two partitions, compared bit for bit (partition.zig).
+fn partitionMode(init: std.process.Init, args: []const [:0]const u8) !void {
+    if (args.len < 5) return error.ExpectedIdsAndCuts;
+    const ids = try readIds(init, args[3]);
+    defer ids.deinit();
+    return @import("partition.zig").run(init, args[1], ids.value, args[4..]);
+}
 
 /// The prompt in chunks of the prefill rows through the serving prompt path (`.prompt = true`, the last row's logits after the
 /// last chunk), each forward's stage groups timed by class: one line of totals and, with --spans, a line a chunk. With --drafts
