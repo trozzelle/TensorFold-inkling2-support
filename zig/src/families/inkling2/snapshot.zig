@@ -11,15 +11,36 @@ pub const Snap = struct {
     buf: mtl.Buffer,
     at: u32,
     bytes: u64,
+    /// The DSpark drafter's context rings for the same stream at `at` (dspark.zig keepLane), when it held rows there.
+    draft: ?mtl.Buffer = null,
+    /// First context position held in `draft` (the rings hold `[draft_from, at)`).
+    draft_from: u64 = 0,
     freed: bool = false, // its storage given back early (a stream needed the room); its entry goes at the pass's report
     follow: ?mtl.ResidencySet.Follow = null,
 
     pub fn free(self: *Snap) void {
         if (!self.freed) {
-            if (self.follow) |f| f.leave(f.ctx, self.buf);
+            if (self.follow) |f| {
+                f.leave(f.ctx, self.buf);
+                if (self.draft) |b| f.leave(f.ctx, b);
+            }
             self.buf.deinit();
+            if (self.draft) |b| b.deinit();
+            self.draft = null;
         }
         self.freed = true;
+    }
+
+    pub fn setDraft(self: *Snap, buffer: mtl.Buffer, from: u64) void {
+        if (self.draft) |old| {
+            if (self.follow) |f| f.leave(f.ctx, old);
+            self.bytes -= old.length();
+            old.deinit();
+        }
+        self.draft = buffer;
+        self.draft_from = from;
+        self.bytes += buffer.length();
+        if (self.follow) |f| f.join(f.ctx, buffer);
     }
 };
 

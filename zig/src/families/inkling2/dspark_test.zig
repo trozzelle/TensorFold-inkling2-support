@@ -1047,3 +1047,63 @@ test "inkling2 dspark: the drafting settings give the lane core a floor of 0.7 a
     // a floor outside (0, 1) is not a floor
     for ([_]f64{ 0, 1, -0.1, 1.5, std.math.nan(f64) }) |bad| try t.expectError(error.DraftConfidence, f.drafterWith(.{ .depth = 4, .confidence = bad }));
 }
+
+test "inkling2 dspark: kept draft rings restore full-window proposals across a late prompt resume" {
+    const snapshot = @import("snapshot.zig");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.init(arena.allocator()) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const d = try f.drafter(7);
+    defer d.deinit();
+    const dv = d.drafter();
+    const total: usize = 1204;
+    const restore_at: usize = 1200;
+    const taps = try f.device.buffer(total * row_bytes, mtl.ResourceOptions.shared);
+    defer taps.deinit();
+    fill(taps, 0, total * 8 * hidden, 0.5, 4242);
+    const prompt = try gpa.alloc(u32, total);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*x, i| x.* = tokenAt(i + 11);
+
+    // Reference: absorb the full prompt, then hold at `total`
+    var s_full = try lanes.Stream.init(gpa, .{ .id = "full", .prompt = prompt, .max_new = 4 });
+    defer s_full.deinit(gpa);
+    try dv.open(&s_full);
+    defer dv.release(&s_full);
+    try dv.absorb(&.{.{ .stream = &s_full, .features = features(taps, 0, total), .start = 0, .follow = &.{}, .prompt = true }});
+    try dv.hold(&.{.{ .stream = &s_full, .pending = tokenAt(total + 11), .position = total + 1, .depth = 7 }});
+    var want: [7]u32 = undefined;
+    try dv.held(&.{&s_full}, &.{&want});
+
+    // Save at `restore_at` (with draft rings), then resume on a fresh stream for the last 4 rows
+    var s_save = try lanes.Stream.init(gpa, .{ .id = "save", .prompt = prompt, .max_new = 4 });
+    defer s_save.deinit(gpa);
+    try dv.open(&s_save);
+    defer dv.release(&s_save);
+    try dv.absorb(&.{.{ .stream = &s_save, .features = features(taps, 0, restore_at), .start = 0, .follow = &.{}, .prompt = true }});
+    var snap = snapshot.Snap{
+        .buf = try f.device.buffer(16, mtl.ResourceOptions.private),
+        .at = restore_at,
+        .bytes = 16,
+    };
+    defer snap.free();
+    try d.keepLane(&s_save, &snap);
+    try t.expect(snap.draft != null);
+    try t.expectEqual(@as(u64, total - 1023), snap.draft_from);
+
+    var s_res = try lanes.Stream.init(gpa, .{ .id = "res", .prompt = prompt, .max_new = 4 });
+    defer s_res.deinit(gpa);
+    s_res.reuse.saved = &snap;
+    s_res.cached = restore_at;
+    try dv.open(&s_res);
+    defer dv.release(&s_res);
+    try dv.absorb(&.{.{ .stream = &s_res, .features = features(taps, restore_at, total - restore_at), .start = restore_at, .follow = &.{}, .prompt = true }});
+    try dv.hold(&.{.{ .stream = &s_res, .pending = tokenAt(total + 11), .position = total + 1, .depth = 7 }});
+    var got: [7]u32 = undefined;
+    try dv.held(&.{&s_res}, &.{&got});
+    try t.expectEqualSlices(u32, &want, &got);
+}

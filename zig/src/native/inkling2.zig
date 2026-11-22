@@ -164,11 +164,10 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         break :blk if (cap_bytes >= @as(f64, @floatFromInt(budget))) budget else @intFromFloat(cap_bytes);
     } else @min(budget, fl.budget.default_states);
     if (h.cache_cap > 0) {
-        const M = fl.backend.Metal;
         // a prompt row's bits do not depend on its chunk: any row is a place to keep or resume a state, and a pass cuts only at
         // its marks and its own chunk rows
         const rules: api.prompt_cache.Rules = .{ .lookahead = 0, .planned = false, .min_prompt = 0, .chunk = @intCast(model.prefill_rows), .chunk_starts = false };
-        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h.metal, .vtable = &.{ .bytes = M.snapBytes, .save = M.snapSave, .restore = M.snapRestore, .drop = M.snapDrop } }, rules, @min(h.cache_cap, budget));
+        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, rules, @min(h.cache_cap, budget));
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
         h.metal.room = .{ .ctx = h, .fit = fitCache };
@@ -183,6 +182,33 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
+
+/// The prompt cache's copies of a stream: the target's caches at a mark (backend.zig), and the drafter's context there.
+const Snaps = struct {
+    const M = fl.backend.Metal;
+    fn host(ptr: *anyopaque) *Host {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn bytes(ptr: *anyopaque, at: u32) u64 {
+        const h = host(ptr);
+        return M.snapBytes(h.metal, at) + if (h.draft != null) fl.dspark.Drafter.keptBytes() else 0;
+    }
+    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+        const h = host(ptr);
+        const saved = try M.snapSave(h.metal, owner, at);
+        if (h.draft) |d| d.keepLane(@ptrCast(@alignCast(owner.?)), @ptrCast(@alignCast(saved))) catch |err| {
+            M.snapDrop(h.metal, saved);
+            return err;
+        };
+        return saved;
+    }
+    fn restore(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
+        return error.BackendRestores; // the prompt pass restores, before its first chunk
+    }
+    fn drop(ptr: *anyopaque, saved: *anyopaque) void {
+        M.snapDrop(host(ptr).metal, saved);
+    }
+};
 
 /// Metal.room's fit: the kept states' budget is what the streams leave, at most the cap; the least valuable go first.
 fn fitCache(ctx: *anyopaque, bytes: u64, restoring: ?*anyopaque, prompt: []const u32) void {

@@ -19,6 +19,7 @@ const cfg = @import("config.zig");
 const dw = @import("dspark_weights.zig");
 const Qmv = @import("dspark_qmv.zig").Qmv;
 const fwd = @import("forward.zig");
+const snapshot = @import("snapshot.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
 
@@ -494,6 +495,52 @@ pub const Drafter = struct {
         return @as(usize, ring + ring_pad) * kv_width * 2;
     }
 
+    /// Device bytes a kept draft context takes beside a prompt state: every draft layer's key and value ring.
+    pub fn keptBytes() u64 {
+        return 2 * draft_layers * ringBytes();
+    }
+
+    /// Stream `s`'s context rings copied into `snap` when its lane stands at the snapshot's position with absorbed rows.
+    pub fn keepLane(d: *Drafter, s: *Stream, snap: *snapshot.Snap) !void {
+        const l = d.lanes.get(s) orelse return;
+        try d.sync(); // the chunk's absorb, left pending
+        if (l.end != snap.at or l.end <= l.from) return;
+        const buf = try d.device.buffer(@intCast(keptBytes()), mtl.ResourceOptions.private);
+        errdefer buf.deinit();
+        try d.copyLane(l, buf, true);
+        snap.setDraft(buf, l.from);
+    }
+
+    /// Restore the lane's rings from the kept prompt state its stream resumed at `start`, returning true if restored.
+    fn resumeLane(d: *Drafter, s: *Stream, l: *Lane, start: u64) !bool {
+        const saved = s.reuse.saved orelse return false;
+        const snap: *const snapshot.Snap = @ptrCast(@alignCast(saved));
+        if (snap.freed or s.cached != start or snap.at != start or l.end != 0) return false;
+        const buf = snap.draft orelse return false;
+        try d.copyLane(l, buf, false);
+        l.from = snap.draft_from;
+        l.end = start;
+        return true;
+    }
+
+    /// A lane's key and value rings and a kept buffer, one blit pass, waited on (`out`: lane to buffer).
+    fn copyLane(d: *Drafter, l: *const Lane, buf: mtl.Buffer, out: bool) !void {
+        const n = ringBytes();
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = d.model.queue.commandBuffer();
+        const e = cb.blit();
+        var at: usize = 0;
+        for (0..draft_layers) |i| for ([_]mtl.Buffer{ l.k[i], l.v[i] }) |live| {
+            if (out) e.copy(live, 0, buf, at, n) else e.copy(buf, at, live, 0, n);
+            at += n;
+        };
+        e.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| return failed(msg);
+    }
+
     fn newLane(d: *Drafter) !*Lane {
         const l = try d.gpa.create(Lane);
         errdefer d.gpa.destroy(l);
@@ -712,16 +759,34 @@ pub const Drafter = struct {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         try d.sync();
+        for (items) |it| {
+            const l = d.lanes.get(it.stream).?;
+            if (it.start > l.end) {
+                const need_prior = !it.prompt or (@as(u64, it.stream.prompt_len -| window) < it.start);
+                const restored = if (need_prior) try d.resumeLane(it.stream, l, it.start) else false;
+                if (!restored) {
+                    l.from = it.start;
+                    l.end = it.start;
+                }
+            }
+        }
         var cb: ?mtl.CommandBuffer = null;
         var enc: mtl.ComputeEncoder = undefined;
         for (items) |it| {
             const l = d.lanes.get(it.stream).?;
             const f = it.features;
-            if (it.start > l.end) l.from = it.start; // the rows before it were restored, not absorbed
             const src = mtl.Buffer{ .id = @ptrFromInt(f.buffer) };
             const end = it.start + f.rows;
+            if (it.start < l.from) l.from = it.start;
             // only the last window of a long prompt is ever attended
             const keep_from = if (it.prompt) @max(it.start, @as(u64, it.stream.prompt_len -| window)) else it.start;
+            if (keep_from >= end) {
+                l.from = end;
+                l.end = end;
+                l.held_len = 0;
+                continue;
+            }
+            if (keep_from > l.end) l.from = keep_from;
             var at: u64 = keep_from;
             while (at < end) {
                 if (cb == null) {

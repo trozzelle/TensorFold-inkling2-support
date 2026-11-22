@@ -264,14 +264,22 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
     if (restore_at > 0) {
         var src = try ik.state.Cache.init(m.device, c, restore_at + 1, m.layers, m.prefill_rows);
         defer src.deinit();
+        const src_abs: ?Absorber = if (draft) |d| try Absorber.init(gpa, m, d, ids) else null;
+        defer if (src_abs) |a| a.deinit();
         var pos: usize = 0;
         while (pos < restore_at) {
             const n = @min(restore_at - pos, m.prefill_rows);
-            try ik.forward.run(m, s, &src, ids[pos..][0..n], .{ .logits = .none, .prompt = true });
+            try ik.forward.run(m, s, &src, ids[pos..][0..n], .{
+                .logits = .none,
+                .prompt = true,
+                .feature_taps = if (src_abs != null) .{ .buf = s.ptaps } else null,
+            });
+            if (src_abs) |a| _ = try a.take(s.ptaps, pos, n);
             src.len += n;
             pos += n;
         }
         snap = try ik.snapshot.save(m.device, m.queue, c, &src);
+        if (src_abs) |a| try a.drafter.keepLane(a.stream, &snap.?);
     }
     var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers, m.prefill_rows);
     defer cache.deinit();
@@ -296,7 +304,10 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
     try poisonCache(m, &cache, 0, true);
     if (snap) |*sp| {
         try ik.snapshot.restore(m.queue, c, sp, &cache);
-        sp.free();
+        if (absorber) |a| {
+            a.stream.reuse.saved = sp;
+            a.stream.cached = @intCast(restore_at);
+        }
     }
     var at: usize = restore_at;
     for (lengths) |n| {
@@ -510,7 +521,7 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
         defer gpa.free(tail_chunks);
         var r = try runLeg(gpa, m, &s, tp, ids, restore_at, tail_chunks, draft);
         defer r.deinit(gpa);
-        restore_diffs[ri] = compare(m, &a, &r, restore_at, T, T - restore_at >= 1023);
+        restore_diffs[ri] = compare(m, &a, &r, restore_at, T, true);
         total_differ += restore_diffs[ri];
     }
     std.debug.print("{{\"partition\": \"{s}\", \"prompt_tokens\": {d}, \"layers\": {d}, \"prompt_path\": \"{s}\", \"prefill_rows\": {d}, \"default_chunks\": {d}, \"cut_chunks\": {d}, \"first_cuts\": {any}, \"differ\": {d}, \"restore\": [", .{ if (differ == 0) "identical" else "differs", T, m.layers, @tagName(m.promptPath()), rows, default_chunks.len, cut_chunks.len, cut_chunks[0..@min(cut_chunks.len, 16)], differ });
