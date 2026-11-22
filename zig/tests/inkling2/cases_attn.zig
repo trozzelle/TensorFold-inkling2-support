@@ -34,7 +34,7 @@ fn casePrep(g: *const h.Gpu, r: std.Random) !void {
     const rsv = h.fill16(rs, Hq * 16, r, 1.5);
     for ([_]bool{ false, true }) |global| {
         var c: h.Check = .{ .name = if (global) "prep global" else "prep local" };
-        try g.run("ik_prep", .{ .rows = rows, .heads = Hq, .kv = KV, .dim = D, .pos = pos0, .flags = if (global) 2 else 0, .eps = 1e-6, .cap = 22.627416997969522, .thr = 8, .alpha = 0.1, .floor_n = 8192 }, &.{ .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = rr }, .{ .buf = qs }, .{ .buf = rs }, .{ .buf = qn }, .{ .buf = keys }, .{ .buf = vals }, .{ .buf = reln } }, .{ 2 * Hq + 2 * KV, rows, 1 }, .{ 32, 1, 1 }, true);
+        try g.run("ik_prep", .{ .rows = rows, .heads = Hq, .kv = KV, .dim = D, .pos = pos0, .flags = if (global) 2 else 0, .ring = cap, .eps = 1e-6, .cap = 22.627416997969522, .thr = 8, .alpha = 0.1, .floor_n = 8192 }, &.{ .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = rr }, .{ .buf = qs }, .{ .buf = rs }, .{ .buf = qn }, .{ .buf = keys }, .{ .buf = vals }, .{ .buf = reln } }, .{ 2 * Hq + 2 * KV, rows, 1 }, .{ 32, 1, 1 }, true);
         for (0..rows) |t| {
             const tf_ = if (global) tau(pos0 + t) else 1.0;
             for (0..Hq) |hd| { // q: scaled clip at 22.627, tau
@@ -117,7 +117,7 @@ fn caseAttn(g: *const h.Gpu, r: std.Random) !void {
     defer std.heap.page_allocator.free(saved);
     for ([_]u32{ 1024, 0 }) |window| {
         const name = if (window > 0) "attention local" else "attention global";
-        const full: h.Args = .{ .rows = rows, .heads = Hq, .kv = KV, .dim = D, .pos = pos0, .window = window, .extent = E, .scale = @floatCast(scale) };
+        const full: h.Args = .{ .rows = rows, .heads = Hq, .kv = KV, .dim = D, .pos = pos0, .window = window, .extent = E, .ring = cap, .scale = @floatCast(scale) };
         var c: h.Check = .{ .name = name };
         try g.run("ik_attn", full, &.{ .{ .buf = qn }, .{ .buf = keys }, .{ .buf = vals }, .{ .buf = pb }, .{ .buf = sink }, .{ .buf = gate }, .{ .buf = out } }, .{ Hq, rows, 1 }, .{ 32, 1, 1 }, true);
         for (0..rows) |t| for (0..Hq) |hd| {
@@ -169,7 +169,113 @@ fn caseAttn(g: *const h.Gpu, r: std.Random) !void {
     }
 }
 
+fn caseAttnRing(g: *const h.Gpu, r: std.Random) !void {
+    const Hq = 48;
+    const KV = 8;
+    const D = 128;
+    const E = 1024;
+    const R_small: usize = 1280;
+    const T: usize = 3 * R_small + 100;
+    const lin_cap: usize = std.mem.alignForward(usize, T, 64);
+    const max_chunk: usize = 64;
+    const nan: u16 = 0x7fc0;
+    const scale: f32 = @floatCast(1 / @sqrt(@as(f64, D)));
+    const q = try g.buf(max_chunk * Hq * D * 2);
+    const k = try g.buf(max_chunk * KV * D * 2);
+    const v = try g.buf(max_chunk * KV * D * 2);
+    const rr = try g.buf(max_chunk * Hq * 16 * 2);
+    const qs = try g.buf(Hq * D * 2);
+    const rs = try g.buf(Hq * 16 * 2);
+    const qn = try g.buf(max_chunk * Hq * D * 2);
+    const reln = try g.buf(max_chunk * Hq * 16 * 2);
+    const pb = try g.buf(max_chunk * Hq * E * 2);
+    const proj = try g.buf(16 * E * 2);
+    const sink = try g.buf(max_chunk * Hq * 2);
+    const gate = try g.buf(max_chunk * Hq * D * 2);
+    const out_lin = try g.buf(max_chunk * Hq * D * 2);
+    const out_ring = try g.buf(max_chunk * Hq * D * 2);
+    const lin_k = try g.buf(lin_cap * KV * D * 2);
+    const lin_v = try g.buf(lin_cap * KV * D * 2);
+    const ring_k = try g.buf(lin_cap * KV * D * 2);
+    const ring_v = try g.buf(lin_cap * KV * D * 2);
+    defer for ([_]mtl.Buffer{ q, k, v, rr, qs, rs, qn, reln, pb, proj, sink, gate, out_lin, out_ring, lin_k, lin_v, ring_k, ring_v }) |b| b.deinit();
+    _ = h.fill16(qs, Hq * D, r, 1.5);
+    _ = h.fill16(rs, Hq * 16, r, 1.5);
+    _ = h.fill16(proj, 16 * E, r, 1.0);
+    const chunks = [_]usize{ 64, 17 };
+    for ([_]bool{ false, true }) |global| {
+        const ring_slots: usize = if (global) lin_cap else R_small;
+        const window: u32 = if (global) 0 else E;
+        var c: h.Check = .{ .name = if (global) "attention ring global" else "attention ring local" };
+        var pos: usize = 0;
+        var ci: usize = 0;
+        while (pos < T) : (ci += 1) {
+            const n = @min(chunks[ci % chunks.len], T - pos);
+            _ = h.fill16(q, n * Hq * D, r, 1.0);
+            _ = h.fill16(k, n * KV * D, r, 1.0);
+            _ = h.fill16(v, n * KV * D, r, 1.0);
+            _ = h.fill16(rr, n * Hq * 16, r, 1.0);
+            _ = h.fill16(sink, n * Hq, r, 2.0);
+            _ = h.fill16(gate, n * Hq * D, r, 3.0);
+            var poisoned: [R_small]bool = @splat(false);
+            if (!global) {
+                const live_lo = std.mem.alignBackward(usize, pos -| (E - 1), 64);
+                var keep: [R_small]bool = @splat(false);
+                for (live_lo..pos) |p| keep[p % R_small] = true;
+                const rk = ring_k.slice(u16, R_small * KV * D);
+                const rv = ring_v.slice(u16, R_small * KV * D);
+                for (0..R_small) |s| if (!keep[s]) {
+                    poisoned[s] = true;
+                    @memset(rk[s * KV * D ..][0 .. KV * D], nan);
+                    @memset(rv[s * KV * D ..][0 .. KV * D], nan);
+                };
+            }
+            const prep_base: h.Args = .{ .rows = @intCast(n), .heads = Hq, .kv = KV, .dim = D, .pos = @intCast(pos), .flags = if (global) 2 else 0, .eps = 1e-6, .cap = 22.627416997969522, .thr = 8, .alpha = 0.1, .floor_n = 8192 };
+            var prep_lin = prep_base;
+            prep_lin.ring = @intCast(lin_cap);
+            try g.run("ik_prep", prep_lin, &.{ .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = rr }, .{ .buf = qs }, .{ .buf = rs }, .{ .buf = qn }, .{ .buf = lin_k }, .{ .buf = lin_v }, .{ .buf = reln } }, .{ 2 * Hq + 2 * KV, n, 1 }, .{ 32, 1, 1 }, true);
+            var prep_ring = prep_base;
+            prep_ring.ring = @intCast(ring_slots);
+            try g.run("ik_prep", prep_ring, &.{ .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = rr }, .{ .buf = qs }, .{ .buf = rs }, .{ .buf = qn }, .{ .buf = ring_k }, .{ .buf = ring_v }, .{ .buf = reln } }, .{ 2 * Hq + 2 * KV, n, 1 }, .{ 32, 1, 1 }, true);
+            try g.run("ik_relbias", .{ .rows = @intCast(n), .heads = Hq, .extent = E, .dim = 16 }, &.{ .{ .buf = reln }, .{ .buf = proj }, .{ .buf = pb } }, .{ E, Hq, n }, .{ 256, 1, 1 }, false);
+            const attn_base: h.Args = .{ .rows = @intCast(n), .heads = Hq, .kv = KV, .dim = D, .pos = @intCast(pos), .window = window, .extent = E, .scale = scale };
+            var attn_lin = attn_base;
+            attn_lin.ring = @intCast(lin_cap);
+            try g.run("ik_attn", attn_lin, &.{ .{ .buf = qn }, .{ .buf = lin_k }, .{ .buf = lin_v }, .{ .buf = pb }, .{ .buf = sink }, .{ .buf = gate }, .{ .buf = out_lin } }, .{ Hq, n, 1 }, .{ 32, 1, 1 }, true);
+            var attn_ring = attn_base;
+            attn_ring.ring = @intCast(ring_slots);
+            try g.run("ik_attn", attn_ring, &.{ .{ .buf = qn }, .{ .buf = ring_k }, .{ .buf = ring_v }, .{ .buf = pb }, .{ .buf = sink }, .{ .buf = gate }, .{ .buf = out_ring } }, .{ Hq, n, 1 }, .{ 32, 1, 1 }, true);
+            const bytes = n * Hq * D * 2;
+            c.same(out_ring.slice(u8, bytes), out_lin.slice(u8, bytes));
+            for (out_ring.slice(u16, n * Hq * D)) |x| {
+                if (std.math.isNan(h.fb(x))) {
+                    c.bad += 1;
+                    break;
+                }
+            }
+            if (!global) {
+                var written: [R_small]bool = @splat(false);
+                for (pos..pos + n) |p| written[p % R_small] = true;
+                const rk = ring_k.slice(u16, R_small * KV * D);
+                const rv = ring_v.slice(u16, R_small * KV * D);
+                for (0..R_small) |s| if (poisoned[s] and !written[s]) {
+                    c.n += 1;
+                    for (rk[s * KV * D ..][0 .. KV * D], rv[s * KV * D ..][0 .. KV * D]) |kv_x, vv_x| {
+                        if (kv_x != nan or vv_x != nan) {
+                            c.bad += 1;
+                            break;
+                        }
+                    }
+                };
+            }
+            pos += n;
+        }
+        try c.done();
+    }
+}
+
 pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try casePrep(g, r);
     try caseAttn(g, r);
+    try caseAttnRing(g, r);
 }

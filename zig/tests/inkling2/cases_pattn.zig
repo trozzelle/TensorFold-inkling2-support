@@ -246,7 +246,7 @@ pub fn call(g: *const h.Gpu, p: *const Pipes, form: Form, s: *Seq, p0: usize, n:
     const after = @min(s.pad, s.n + s.pad - end);
     @memset(s.rowsOf(p0, n + after), 0xff);
     s.syncProjt();
-    const a: Args = .{ .rows = @intCast(n), .p0 = @intCast(p0), .global = @intFromBool(global) };
+    const a: Args = .{ .rows = @intCast(n), .p0 = @intCast(p0), .global = @intFromBool(global), .ring = @intCast(s.cap) };
     const cb = g.queue.commandBuffer();
     const e = cb.compute(.serial);
     switch (form) {
@@ -391,7 +391,7 @@ fn caseBias(g: *const h.Gpu, pipes: *const Pipes, r: std.Random) !void {
         if (adversarial) cancelling(&s, r);
         var c: h.Check = .{ .name = if (adversarial) "pattn bias bits (cancelling sums)" else "pattn bias bits" };
         const p0 = 1024 - 40;
-        const a: Args = .{ .rows = rows, .p0 = p0, .global = 0 };
+        const a: Args = .{ .rows = rows, .p0 = p0, .global = 0, .ring = @intCast(s.cap) };
         for ([_]bool{ false, true }) |mma| {
             @memset(tv, 0xffff);
             const cb = g.queue.commandBuffer();
@@ -523,6 +523,107 @@ fn casePieces(g: *const h.Gpu, pipes: *const Pipes, r: std.Random) !void {
     }
 }
 
+/// A ring gives a linear cache's bytes across wraps, local and global, with non-live ring slots poisoned before each chunk.
+fn caseRing(g: *const h.Gpu, pipes: *const Pipes, r: std.Random) !void {
+    const R_small: usize = 1280;
+    const T: usize = 3 * R_small + 100;
+    const lin_cap: usize = std.mem.alignForward(usize, T, 64);
+    const max_chunk: usize = 64;
+    const q = try g.buf(max_chunk * QROW * 2);
+    const k = try g.buf(max_chunk * KV * D * 2);
+    const v = try g.buf(max_chunk * KV * D * 2);
+    const rr = try g.buf(max_chunk * Hq * REL * 2);
+    const qs = try g.buf(Hq * D * 2);
+    const rs = try g.buf(Hq * REL * 2);
+    const qn = try g.buf(max_chunk * QROW * 2);
+    const reln = try g.buf(max_chunk * Hq * REL * 2);
+    const proj = try g.buf(REL * E * 2);
+    const sink = try g.buf(max_chunk * Hq * 2);
+    const gate = try g.buf(max_chunk * QROW * 2);
+    const table = try g.buf(tableBytes(max_chunk));
+    const out_lin = try g.buf(max_chunk * QROW * 2);
+    const out_ring = try g.buf(max_chunk * QROW * 2);
+    const lin_k = try g.buf(lin_cap * KV * D * 2);
+    const lin_v = try g.buf(lin_cap * KV * D * 2);
+    const ring_k = try g.buf(lin_cap * KV * D * 2);
+    const ring_v = try g.buf(lin_cap * KV * D * 2);
+    defer for ([_]mtl.Buffer{ q, k, v, rr, qs, rs, qn, reln, proj, sink, gate, table, out_lin, out_ring, lin_k, lin_v, ring_k, ring_v }) |b| b.deinit();
+    _ = h.fill16(qs, Hq * D, r, 1.5);
+    _ = h.fill16(rs, Hq * REL, r, 1.5);
+    _ = h.fill16(proj, REL * E, r, 1.0);
+    const chunks = [_]usize{ 64, 37, 64, 1, 64, 31 };
+    for ([_]bool{ false, true }) |global| {
+        const ring_slots: usize = if (global) lin_cap else R_small;
+        var c: h.Check = .{ .name = if (global) "pattn ring global" else "pattn ring local" };
+        var pos: usize = 0;
+        var ci: usize = 0;
+        while (pos < T) : (ci += 1) {
+            const n = @min(chunks[ci % chunks.len], T - pos);
+            _ = h.fill16(q, n * QROW, r, 3);
+            _ = h.fill16(k, n * KV * D, r, 3);
+            _ = h.fill16(v, n * KV * D, r, 1.7);
+            _ = h.fill16(rr, n * Hq * REL, r, 2);
+            _ = h.fill16(sink, n * Hq, r, 2);
+            _ = h.fill16(gate, n * QROW, r, 3);
+            var poisoned: [R_small]bool = @splat(false);
+            if (!global) {
+                const live_lo = std.mem.alignBackward(usize, pos -| (E - 1), 64);
+                var keep: [R_small]bool = @splat(false);
+                for (live_lo..pos) |p| keep[p % R_small] = true;
+                const rk = ring_k.slice(u16, R_small * KV * D);
+                const rv = ring_v.slice(u16, R_small * KV * D);
+                for (0..R_small) |s| if (!keep[s]) {
+                    poisoned[s] = true;
+                    @memset(rk[s * KV * D ..][0 .. KV * D], POISON);
+                    @memset(rv[s * KV * D ..][0 .. KV * D], POISON);
+                };
+            }
+            const prep_base: h.Args = .{ .rows = @intCast(n), .heads = Hq, .kv = KV, .dim = D, .pos = @intCast(pos), .flags = if (global) 2 else 0, .eps = 1e-6, .cap = 22.627416997969522, .thr = 8, .alpha = 0.1, .floor_n = 8192 };
+            var prep_lin = prep_base;
+            prep_lin.ring = @intCast(lin_cap);
+            try g.run("ik_prep", prep_lin, &.{ .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = rr }, .{ .buf = qs }, .{ .buf = rs }, .{ .buf = qn }, .{ .buf = lin_k }, .{ .buf = lin_v }, .{ .buf = reln } }, .{ 2 * Hq + 2 * KV, n, 1 }, .{ 32, 1, 1 }, true);
+            var prep_ring = prep_base;
+            prep_ring.ring = @intCast(ring_slots);
+            try g.run("ik_prep", prep_ring, &.{ .{ .buf = q }, .{ .buf = k }, .{ .buf = v }, .{ .buf = rr }, .{ .buf = qs }, .{ .buf = rs }, .{ .buf = qn }, .{ .buf = ring_k }, .{ .buf = ring_v }, .{ .buf = reln } }, .{ 2 * Hq + 2 * KV, n, 1 }, .{ 32, 1, 1 }, true);
+            const cb1 = g.queue.commandBuffer();
+            const e1 = cb1.compute(.serial);
+            ap.encodeChunk(e1, &pipes.engine, .{ .rows = @intCast(n), .p0 = @intCast(pos), .global = @intFromBool(global), .ring = @intCast(lin_cap) }, .{ .q = .{ .buf = qn }, .k = .{ .buf = lin_k }, .v = .{ .buf = lin_v }, .sink = .{ .buf = sink }, .gate = .{ .buf = gate }, .out = .{ .buf = out_lin } }, .{ .buf = reln }, .{ .buf = proj }, .{ .buf = table }, max_chunk);
+            e1.end();
+            try finish(cb1, "ik_pattn linear");
+            const cb2 = g.queue.commandBuffer();
+            const e2 = cb2.compute(.serial);
+            ap.encodeChunk(e2, &pipes.engine, .{ .rows = @intCast(n), .p0 = @intCast(pos), .global = @intFromBool(global), .ring = @intCast(ring_slots) }, .{ .q = .{ .buf = qn }, .k = .{ .buf = ring_k }, .v = .{ .buf = ring_v }, .sink = .{ .buf = sink }, .gate = .{ .buf = gate }, .out = .{ .buf = out_ring } }, .{ .buf = reln }, .{ .buf = proj }, .{ .buf = table }, max_chunk);
+            e2.end();
+            try finish(cb2, "ik_pattn ring");
+            const bytes = n * QROW * 2;
+            c.same(out_ring.slice(u8, bytes), out_lin.slice(u8, bytes));
+            for (out_ring.slice(u16, n * QROW)) |x| {
+                if (std.math.isNan(h.fb(x))) {
+                    c.bad += 1;
+                    break;
+                }
+            }
+            if (!global) {
+                var written: [R_small]bool = @splat(false);
+                for (pos..pos + n) |p| written[p % R_small] = true;
+                const rk = ring_k.slice(u16, R_small * KV * D);
+                const rv = ring_v.slice(u16, R_small * KV * D);
+                for (0..R_small) |s| if (poisoned[s] and !written[s]) {
+                    c.n += 1;
+                    for (rk[s * KV * D ..][0 .. KV * D], rv[s * KV * D ..][0 .. KV * D]) |kv_x, vv_x| {
+                        if (kv_x != POISON or vv_x != POISON) {
+                            c.bad += 1;
+                            break;
+                        }
+                    }
+                };
+            }
+            pos += n;
+        }
+        try c.done();
+    }
+}
+
 pub fn run(g: *const h.Gpu, r: std.Random) !void {
     var pipes = try Pipes.init(g.device, std.heap.page_allocator);
     defer pipes.deinit();
@@ -535,4 +636,5 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseBias(g, &pipes, r);
     try casePieces(g, &pipes, r);
     try casePartition(g, &pipes, r);
+    try caseRing(g, &pipes, r);
 }

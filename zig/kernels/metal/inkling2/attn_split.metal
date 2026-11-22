@@ -67,6 +67,8 @@ inline void ik_attn_part_run(constant ik_args& a, const device bfloat* qn, const
   const uint D = a.dim, g = tg.x, t = tg.y, p = a.pos + t;
   const uint lo = (a.window > 0 && p + 1 > a.window) ? p + 1 - a.window : 0;
   const uint base = (a.queries + tg.z) * IK_AS_KEYS;
+  // the block's first slot: a ring is a multiple of the block, or holds every position, so a block never wraps
+  const uint wrap = base - base % a.ring;
   const uint from = max(lo, base), to = min(p + 1, base + IK_AS_KEYS);
   device float* slots = part + ((ulong(t) * a.heads + g * 6) * a.blocks + tg.z) * IK_AS_SLOT;
   const ulong head_step = ulong(a.blocks) * IK_AS_SLOT;
@@ -87,7 +89,7 @@ inline void ik_attn_part_run(constant ik_args& a, const device bfloat* qn, const
     bfloat4 kr[32];
     _Pragma("clang loop unroll(full)")
     for (uint i = 0; i < 32; ++i)
-      kr[i] = *(const device bfloat4*)(keys + (ulong(min(max(k0 + i, from), to - 1)) * a.kv + g) * D + 4 * lane);
+      kr[i] = *(const device bfloat4*)(keys + (ulong(min(max(k0 + i, from), to - 1) - wrap) * a.kv + g) * D + 4 * lane);
     if (reads_bias) bias.two(t, a.heads, g * 6 + h0, a.extent, p - key, bz);
     _Pragma("clang loop unroll(full)")
     for (uint j = 0; j < 2; ++j) {
@@ -118,7 +120,7 @@ inline void ik_attn_part_run(constant ik_args& a, const device bfloat* qn, const
   bfloat4 vr[32];
   _Pragma("clang loop unroll(full)")
   for (uint i = 0; i < 32; ++i)
-    vr[i] = *(const device bfloat4*)(values + (ulong(min(max(k0 + i, from), to - 1)) * a.kv + g) * D + 4 * lane);
+    vr[i] = *(const device bfloat4*)(values + (ulong(min(max(k0 + i, from), to - 1) - wrap) * a.kv + g) * D + 4 * lane);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float w[2];
   float4 acc[2];

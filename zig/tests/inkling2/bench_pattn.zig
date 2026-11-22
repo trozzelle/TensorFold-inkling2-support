@@ -156,7 +156,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
         const b = try Bufs.init(device, r, rows, cap);
         defer b.deinit();
         for ([_]bool{ false, true }) |global| {
-            const a: cases.Args = .{ .rows = @intCast(rows), .p0 = @intCast(p0), .global = @intFromBool(global) };
+            const a: cases.Args = .{ .rows = @intCast(rows), .p0 = @intCast(p0), .global = @intFromBool(global), .ring = @intCast(cap) };
             const fl = flops(rows, p0, global);
             const reps: usize = if (global and p0 > 0) 2 else 4;
             for (forms, 0..) |form, fi| {

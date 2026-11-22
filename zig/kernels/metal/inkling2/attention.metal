@@ -33,16 +33,18 @@ inline float ik_tau(uint p, constant ik_args& a) {
     }
   } else if (slot < H + a.kv) {
     const uint h = slot - H;
+    const ulong at = ulong(p % a.ring) * a.kv;
     float s[4], ss = 0.0f;
     for (uint j = 0; j < 4; ++j) { s[j] = float(k[(ulong(t) * a.kv + h) * D + lane + 32 * j]); ss += s[j] * s[j]; }
     const float f = min(a.cap / (sqrt(simd_sum(ss)) + 1e-6f), 1.0f);
-    for (uint j = 0; j < 4; ++j) keys[(ulong(p) * a.kv + h) * D + lane + 32 * j] = bfloat(s[j] * f);
+    for (uint j = 0; j < 4; ++j) keys[(at + h) * D + lane + 32 * j] = bfloat(s[j] * f);
   } else if (slot < H + 2 * a.kv) {
     const uint h = slot - H - a.kv;
+    const ulong at = ulong(p % a.ring) * a.kv;
     float s[4], ss = 0.0f;
     for (uint j = 0; j < 4; ++j) { s[j] = float(v[(ulong(t) * a.kv + h) * D + lane + 32 * j]); ss += s[j] * s[j]; }
     const float inv = rsqrt(simd_sum(ss) / float(D) + a.eps);
-    for (uint j = 0; j < 4; ++j) values[(ulong(p) * a.kv + h) * D + lane + 32 * j] = bfloat(s[j] * inv);
+    for (uint j = 0; j < 4; ++j) values[(at + h) * D + lane + 32 * j] = bfloat(s[j] * inv);
   } else {
     const uint h = slot - H - 2 * a.kv;
     const bool on = lane < IK_DREL;
@@ -80,14 +82,14 @@ inline float ik_tau(uint p, constant ik_args& a) {
   float m = float(sink[ulong(t) * a.heads + h]), l = 1.0f;
   const device bfloat* bias = pb + (ulong(t) * a.heads + h) * a.extent;
   for (uint key = first; key <= p; ++key) {
-    const device bfloat* kr = keys + (ulong(key) * a.kv + g) * D;
+    const device bfloat* kr = keys + (ulong(key % a.ring) * a.kv + g) * D;
     float s = 0.0f;
     for (uint j = 0; j < 4; ++j) s += q[j] * float(kr[lane + 32 * j]);
     s = simd_sum(s) * a.scale;
     if (p - key < a.extent) s += float(bias[p - key]);
     const float mn = max(m, s), f = exp(m - mn), e = exp(s - mn);
     l = l * f + e;
-    const device bfloat* vr = values + (ulong(key) * a.kv + g) * D;
+    const device bfloat* vr = values + (ulong(key % a.ring) * a.kv + g) * D;
     for (uint j = 0; j < 4; ++j) acc[j] = acc[j] * f + e * float(vr[lane + 32 * j]);
     m = mn;
   }

@@ -15,13 +15,13 @@ const attention = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
 
 /// glue.metal's ik_args, field for field.
-pub const Args = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, kv: u32 = 0, dim: u32 = 0, pos: u32 = 0, blocks: u32 = 0, queries: u32 = 0, stride: u32 = 0, flags: u32 = 0, window: u32 = 0, extent: u32 = 0, eps: f32 = 0, scale: f32 = 0, cap: f32 = 0, alpha: f32 = 0, floor_n: f32 = 0, thr: f32 = 0 };
+pub const Args = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, kv: u32 = 0, dim: u32 = 0, pos: u32 = 0, blocks: u32 = 0, queries: u32 = 0, stride: u32 = 0, flags: u32 = 0, window: u32 = 0, extent: u32 = 0, ring: u32 = 0, eps: f32 = 0, scale: f32 = 0, cap: f32 = 0, alpha: f32 = 0, floor_n: f32 = 0, thr: f32 = 0 };
 pub const f32_in: u32 = 1;
 pub const global: u32 = 2;
 pub const boundary: u32 = 4;
 
 comptime {
-    std.debug.assert(@sizeOf(Args) == 72);
+    std.debug.assert(@sizeOf(Args) == 76);
 }
 
 pub const B = struct { buf: mtl.Buffer, off: usize = 0 };
@@ -519,8 +519,9 @@ fn layer(x: Enc, i: u32) !void {
     try x.conv(w.v_conv, b(s.v), xv, b(s.vc), i, 1, kvw, hd.kv);
     const keys = bo(cache.kv, cache.keys(i));
     const values = bo(cache.kv, cache.values(i));
+    const ring: u32 = @intCast(st.cachePositions(cache.capacity));
     try x.begin(.attention_prepare);
-    x.glue(.prep, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .flags = if (glob) global else 0, .eps = c.eps, .cap = c.qk_clip, .thr = c.rel_clip, .alpha = c.log_alpha, .floor_n = @floatFromInt(c.log_floor) }, &.{ b(s.q), b(s.kc), b(s.vc), b(s.r), t(w.q_scale), t(w.rel_scale), b(s.qn), keys, values, b(s.reln) }, .{ 2 * hd.q + 2 * hd.kv, n, 1 }, .{ 32, 1, 1 }, true);
+    x.glue(.prep, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .flags = if (glob) global else 0, .ring = ring, .eps = c.eps, .cap = c.qk_clip, .thr = c.rel_clip, .alpha = c.log_alpha, .floor_n = @floatFromInt(c.log_floor) }, &.{ b(s.q), b(s.kc), b(s.vc), b(s.r), t(w.q_scale), t(w.rel_scale), b(s.qn), keys, values, b(s.reln) }, .{ 2 * hd.q + 2 * hd.kv, n, 1 }, .{ 32, 1, 1 }, true);
     // the decode path's attention forms the relative bias itself from reln and the projection, and so do the chunk kernels (as a table
     // built right before the attention reads it); the per-operation path builds the table here
     if (!x.decode and !x.tensor) x.glue(.relbias, .{ .rows = nr, .heads = hd.q, .extent = p.extent, .dim = c.d_rel }, &.{ b(s.reln), t(w.rel_proj), b(s.pb) }, .{ p.extent, hd.q, n }, .{ 256, 1, 1 }, false);
@@ -535,17 +536,17 @@ fn layer(x: Enc, i: u32) !void {
         const first: u32 = if (window > 0 and pos + 1 > window) pos + 1 - window else 0;
         const f0 = first / st.key_block;
         const blocks = (pos + nr - 1) / st.key_block - f0 + 1;
-        const a: Args = .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .blocks = blocks, .queries = f0, .scale = scale };
+        const a: Args = .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .ring = ring, .blocks = blocks, .queries = f0, .scale = scale };
         x.glue(.attn_part, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, n, blocks }, part_group, true);
         x.glue(.attn_merge, a, &.{ b(s.part), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
     } else if (x.tensor) {
         // the table of the chunk's relative biases is built in the stage and read by the tiled attention, 32 query rows of a head
         // a threadgroup; every view is at the chunk's first row
         const io: attention.Io = .{ .q = view(attention.B, b(s.qn)), .k = view(attention.B, keys), .v = view(attention.B, values), .sink = view(attention.B, b(s.sink)), .gate = view(attention.B, b(s.gate)), .out = view(attention.B, b(s.att)) };
-        attention.encodeChunk(x.e.*, &m.chunk.?.attention, .{ .rows = nr, .p0 = pos, .global = @intFromBool(glob) }, io, view(attention.B, b(s.reln)), view(attention.B, t(w.rel_proj)), view(attention.B, b(s.stage)), s.prefill_rows);
+        attention.encodeChunk(x.e.*, &m.chunk.?.attention, .{ .rows = nr, .p0 = pos, .global = @intFromBool(glob), .ring = ring }, io, view(attention.B, b(s.reln)), view(attention.B, t(w.rel_proj)), view(attention.B, b(s.stage)), s.prefill_rows);
     } else {
         // one simdgroup a (head, row) over the keys one by one, reading the table the per-operation path built
-        x.glue(.attn, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .scale = scale }, &.{ b(s.qn), keys, values, b(s.pb), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
+        x.glue(.attn, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .ring = ring, .scale = scale }, &.{ b(s.qn), keys, values, b(s.pb), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
     }
     try x.end();
     try x.begin(.dense);
