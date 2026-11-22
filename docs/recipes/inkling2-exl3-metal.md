@@ -42,8 +42,8 @@ checks that each row's result is independent of the rows beside it, and that a N
 - The load limit covers weights, scratch and caches. The default is 75% of RAM, which leaves no room for caches
   beside this pack on a 256 GB Mac.
   - `--load-limit-gb` sets the limit; `INKLING_LOAD_LIMIT_GB` is the fallback.
-  - At 236 GB, about 25 GiB is left for caches with the draft head (about 27 GiB with `--no-drafts`), roughly 130k
-    tokens.
+  - At 236 GB, 23.0 GiB is left for caches with the draft head (192.1 GiB of weights and 2.67 GiB of prompt-chunk
+    scratch at the default 4,096 rows), roughly 120k tokens. A 512-row chunk takes 0.37 GiB of scratch instead.
 - Caches take 192 KiB a token, because every layer keeps its whole context, plus 33 MiB of convolution rings a
   stream.
 - Started by launchd (a router run as a LaunchDaemon or LaunchAgent), the server needs two things:
@@ -79,7 +79,7 @@ checks that each row's result is independent of the rows beside it, and that a N
   tensor units. A pack that needs this holds the per-row path's buffers for a whole chunk (4.26 GiB of scratch at 4,096
   rows, 0.60 GiB at 512).
 - A GPU without tensor units takes the per-operation prompt path of the first release: matvec slabs, a relative-bias table
-  and one-row attention, and the per-row expert projections. It runs at that path's speed (about 65 tok/s on an M5
+  and one-row attention, and the per-row expert projections. It runs at that path's speed (about 65-71 tok/s on an M5
   Ultra) and with its scratch (4.0 GiB at 4,096 rows, 0.57 GiB at 512, so `INKLING_PREFILL_ROWS=512` is worth setting
   there). The startup log names the path and its scratch.
 - `INKLING_PROMPT_PATH` is a diagnostic: `per_op` runs prompt chunks on the per-operation kernels whatever the GPU, to
@@ -126,7 +126,9 @@ Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a b
 
 | | |
 |---|---|
-| Prompt, on the per-operation kernels the chunk path replaced | about 65 tok/s (8,202 tokens in 126 s to the first token) |
+| Prompt (prefill), 8k-token prompts, drafts on | 2,057-2,090 tok/s (median of three requests on each of three prompts of 8,191-8,193 tokens; about 3.9 s to the first token), up from about 65-71 tok/s on the per-operation kernels |
+| Prompt, direct start, 8,192 tokens | 2,119 tok/s (3,867 ms: experts 2,325 ms, dense projections 675 ms, norms 422 ms, attention 298 ms, the rest about 100 ms) |
+| Decode with drafts, three gate prompts | 60.6 tok/s (61.6 before the chunk path) |
 | Decode with drafts (default) | 61.4 tok/s (65.2 on the bench prompt) |
 | Decode with drafts, every draft verified at depth 4 | 57.1 tok/s |
 | Decode, `--no-drafts` | 39.4 tok/s; 37.9 tok/s after an 8,202-token prompt |
@@ -140,7 +142,7 @@ rows take the chunk path above.
 ## Fidelity
 
 Teacher-forced on a 62,526-token held-out set against the MXFP8 release as teacher, with the per-operation prompt
-kernels (the path a GPU without tensor units still takes):
+kernels (the path a GPU without tensor units still takes); the chunk path was then checked against it:
 - **KL:** 0.0325 on the prompt path; 0.0336 with every row after the first 16 fed through the decode path in 16-row
   windows.
 - **Comparison:** the same pack's experts in an MLX forward score KL 0.0341. TensorFold's is 0.0016 lower on the
@@ -148,6 +150,9 @@ kernels (the path a GPU without tensor units still takes):
 - **Top-1 agreement:** 95.5%.
 - **Per layer:** hidden states stay within 1.3× the difference between two correct bf16 implementations (1.21× on the
   decode path).
+- **Chunk path:** the held-out KL 95% upper bound of TensorFold minus the MLX reference is +0.00073 in chunk mode
+  (gate +0.002). The per-layer gate's worst layer is 1.096× the noise floor in chunk mode and 1.062× in window mode
+  (limit 1.5×); `layers` and `finals` run in either mode.
 - **Decode windows:** a window of up to 16 rows gives the same bits as the same rows decoded one at a time.
 
 ## Limits
