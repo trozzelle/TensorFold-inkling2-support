@@ -1,4 +1,4 @@
-//! Inkling 2 behind the lane engine: one to eight streams, their caches, shared verify rounds and copy-drafted windows drawn on the host.
+//! Inkling 2 lane backend: 1..8 streams, caches, shared verify rounds, and host-drawn copy-drafted windows.
 const std = @import("std");
 const mtl = @import("metal");
 const lanes = @import("lanes");
@@ -16,14 +16,13 @@ pub const Options = struct { capacity: usize, budget: u64, streams: u32 = 1 };
 /// Widths `measure` times: a pending token and up to seven drafts, the deepest verify a head asks for.
 pub const measured_widths = 8;
 
-/// Multi-stream total widths `measure` times when `options.streams > 1` so the lane core prices shared rounds accurately.
+/// Multi-stream total widths `measure` times when `options.streams > 1` for shared-round cost pricing.
 const shared_widths = [_]usize{ 16, 24, 32, 48, 64 };
 
 /// Token handles: drawn tokens and host-fed ones, in a host ring.
 const ring = 4096;
 
-/// Seconds a stream's rounds spent, by where (INKLING_ROUND_TIMING): the forward's encode and GPU time by its own
-/// clocks, the forward call, the draws, and the time between one round's end and the next one's start.
+/// Per-stream round timings (INKLING_ROUND_TIMING): encode/GPU clocks, forward, draws, and inter-round gaps.
 const Spent = struct {
     rounds: u64 = 0,
     forward: fwd.Timing = .{},
@@ -109,8 +108,7 @@ pub const Metal = struct {
         while (it.next()) |cache| cache.*.setResident(hook);
     }
 
-    /// Rows are independent across streams in every kernel. A draft head's facts come from `Drafted.facts`; window and
-    /// shared forward costs are those `measure` timed, if it ran.
+    /// Rows are stream-independent; draft facts come from `Drafted.facts` and costs from `measure`.
     pub fn facts(self: *const Metal) lanes.Model {
         return .{
             .exact_width = st.window_rows,
@@ -138,9 +136,7 @@ pub const Metal = struct {
         try fwd.run(self.model, &self.scratch, &cache, &ids, .{ .logits = .all });
     }
 
-    /// A window of each width 1 to `measured_widths` on a throwaway cache at position 0, the second of two runs timed, with
-    /// the rows tapped as a drafted round's are once the features are prepared: what the depth rule prices a round's window by.
-    /// When `options.streams > 1`, also times multi-stream shared forwards across `shared_widths`.
+    /// Times widths 1..`measured_widths` (and `shared_widths` when `options.streams > 1`) on throwaway caches.
     pub fn measure(self: *Metal) !void {
         const c = &self.model.config.text;
         var cache = try st.Cache.init(self.model.device, c, 32, c.layers, self.scratch.prefill_rows);
@@ -242,7 +238,7 @@ pub const Metal = struct {
         return @as(usize, st.feature_taps) * self.model.config.text.hidden * 2;
     }
 
-    /// Allocate a stream's cache under the cache budget, evict prompt snapshots if needed, and restore any prefix snapshot.
+    /// Allocate a stream cache under the budget, evicting prompt snapshots if needed, and restore any prefix snapshot.
     fn openStream(self: *Metal, stream: *lanes.Stream) !*st.Cache {
         const ids = stream.prompt();
         if (ids.len == 0 or ids.len + stream.max_new > self.options.capacity or self.caches.contains(stream)) return error.InvalidInkling2Prompt;
@@ -277,8 +273,7 @@ pub const Metal = struct {
         return cache;
     }
 
-    /// One prompt chunk of at most `max_rows` (or `scratch.prefill_rows` when 0), cut at reuse marks; returns true when the
-    /// whole prompt is filled and its final logits (and last_tap when tapped) are held on the stream's cache.
+    /// Runs one prompt chunk (<= `max_rows` or `prefill_rows`), cut at reuse marks; returns true when filled.
     fn prefillStepFn(ptr: *anyopaque, stream: *lanes.Stream, max_rows: u32) !bool {
         const self = cast(ptr);
         const cache = self.caches.get(stream) orelse try self.openStream(stream);
@@ -288,8 +283,7 @@ pub const Metal = struct {
         const cap = if (max_rows > 0) @min(@as(usize, max_rows), self.scratch.prefill_rows) else self.scratch.prefill_rows;
         const at = cache.len;
         var end = @min(ids.len, at + cap);
-        // a mark ends a chunk, so the state there can be kept; the server's per-message chunk starts are not cut at: a row's
-        // bits do not depend on its chunk, and each cut costs a small chunk
+        // Stop at reuse marks so their state can be saved; chunk boundaries do not affect row bits.
         for (stream.reuse.marks) |x| if (x > at and x < end) {
             end = x;
         };
@@ -328,8 +322,7 @@ pub const Metal = struct {
         while (!try prefillStepFn(ptr, stream, 0)) {}
     }
 
-    /// The drafter's layers, told once before any forward. A forward taps the inputs of `fwd.tap_layers` and the finals
-    /// only, so a drafter that reads others is refused; from here on every forward taps its rows.
+    /// Validates the drafter's tap layers (`fwd.tap_layers` + finals) and enables row tapping on forwards.
     fn prepareFn(ptr: *anyopaque, taps: []const u32) !void {
         const self = cast(ptr);
         if (!tapsAre(taps, self.model.config.text.layers)) return error.UnsupportedInkling2Taps;
@@ -394,8 +387,7 @@ pub const Metal = struct {
         return row(l, greedy.argmax(l), stream.logprobs orelse 0);
     }
 
-    /// One or more streams' pending tokens and drafts in one shared forward, each stream's rows drawn with its own
-    /// sampling and masks (draw.zig); keep() rolls back by length.
+    /// Shared forward over 1..N streams' pending tokens and drafts, drawn per stream; keep() rolls back.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) !void {
         const self = cast(ptr);
         const c = &self.model.config.text;
@@ -507,22 +499,19 @@ pub const Metal = struct {
     }
 };
 
-/// Admit a new stream cache under `budget`: when other streams hold part of the budget, return `error.LaneMemory` so the
-/// host requeues until a stream finishes; when no other stream is active, return `error.Inkling2CachesFull`.
+/// Admit a cache under `budget`: returns `LaneMemory` if other streams are active, else `Inkling2CachesFull`.
 fn admitBudget(held: u64, need: u64, budget: u64, active: usize) !void {
     if (held + need <= budget) return;
     return if (active > 0) error.LaneMemory else error.Inkling2CachesFull;
 }
 
-/// Whether `taps` are the layers a forward taps, in order: the inputs of `fwd.tap_layers`, then the finals, named by the
-/// layer count.
+/// True when `taps` matches `fwd.tap_layers` followed by `layers` (the finals).
 fn tapsAre(taps: []const u32, layers: u32) bool {
     const n = fwd.tap_layers.len;
     return taps.len == n + 1 and std.mem.eql(u32, taps[0..n], &fwd.tap_layers) and taps[n] == layers;
 }
 
-/// Rows [start, start + count) from `cache`: prefers `cache.last_tap` for the final prompt row (immune to later
-/// prefill chunks on other streams), else checks `tap.gen == cur_gen` before serving from shared scratch.
+/// Rows [start, start + count) from `cache`, preferring `last_tap` for the final prompt row.
 fn featuresOf(cache: *const st.Cache, width: usize, start: u64, count: u32, cur_gen: u64) !be.Features {
     if (count == 1) if (cache.last_tap) |buf| if (cache.last_tap_pos) |pos| if (start == pos) {
         return .{ .buffer = @intFromPtr(buf.id), .offset = 0, .rows = 1, .row_bytes = @intCast(width), .space = .device, .dtype = .bf16 };
@@ -557,19 +546,12 @@ test "inkling2 backend: the taps are the inputs of seven layers and the finals, 
 }
 
 test "inkling2 backend: features are the window's rows from the buffer's offset, guard stale generations, and preserve last_tap" {
-    const fake = mtl.Buffer{ .id = @ptrFromInt(0x4000) };
-    const last = mtl.Buffer{ .id = @ptrFromInt(0x8000) };
     const width: usize = st.feature_taps * 4608 * 2;
-    const tp: st.Tap = .{ .buf = fake, .off = 100, .start = 7, .rows = 3, .gen = 5 };
+    const tp: st.Tap = .{ .buf = .{ .id = @ptrFromInt(0x4000) }, .off = 100, .start = 7, .rows = 3, .gen = 5 };
     const whole = try tappedRows(tp, width, 7, 3, 5);
-    try std.testing.expectEqual(@as(u64, 0x4000), whole.buffer);
-    try std.testing.expectEqual(@as(u64, 100), whole.offset);
-    try std.testing.expectEqual(@as(u32, 3), whole.rows);
-    try std.testing.expectEqual(@as(u32, width), whole.row_bytes);
-    try std.testing.expect(whole.space == .device and whole.dtype == .bf16);
+    try std.testing.expect(whole.buffer == 0x4000 and whole.offset == 100 and whole.rows == 3 and whole.row_bytes == width and whole.space == .device and whole.dtype == .bf16);
     const tail = try tappedRows(tp, width, 8, 2, 5);
-    try std.testing.expectEqual(@as(u64, 100 + width), tail.offset);
-    try std.testing.expectEqual(@as(u32, 2), tail.rows);
+    try std.testing.expect(tail.offset == 100 + width and tail.rows == 2);
     try std.testing.expectError(error.StaleInkling2Taps, tappedRows(tp, width, 7, 3, 6));
     try std.testing.expectError(error.Inkling2TapsNotHeld, tappedRows(tp, width, 6, 2, 5));
     try std.testing.expectError(error.Inkling2TapsNotHeld, tappedRows(tp, width, 8, 3, 5));
@@ -579,11 +561,10 @@ test "inkling2 backend: features are the window's rows from the buffer's offset,
     // last_tap serves the prompt's final row even after another stream advances tap_gen
     var c: st.Cache = undefined;
     c.tap = tp;
-    c.last_tap = last;
+    c.last_tap = .{ .id = @ptrFromInt(0x8000) };
     c.last_tap_pos = 9;
     const saved = try featuresOf(&c, width, 9, 1, 99);
-    try std.testing.expectEqual(@as(u64, 0x8000), saved.buffer);
-    try std.testing.expectEqual(@as(u64, 0), saved.offset);
+    try std.testing.expect(saved.buffer == 0x8000 and saved.offset == 0);
     try std.testing.expectError(error.StaleInkling2Taps, featuresOf(&c, width, 7, 2, 99));
 }
 
@@ -593,20 +574,14 @@ test "inkling2 backend: multi-stream facts enable shared rounds in lanes.Config"
     m.timed = 0;
     m.shared_timed = 0;
     const f4 = m.facts();
-    try std.testing.expect(f4.hidden_rows and f4.streams_exact);
-    try std.testing.expectEqual(@as(u32, 4), f4.max_streams);
-    try std.testing.expectEqual(@as(u32, st.batch_rows), f4.batch_rows);
+    try std.testing.expect(f4.hidden_rows and f4.streams_exact and f4.max_streams == 4 and f4.batch_rows == st.batch_rows);
     var cfg4 = try lanes.Config.init(std.testing.allocator, f4, st.window_rows, st.window_rows - 1);
     defer cfg4.deinit(std.testing.allocator);
-    try std.testing.expect(cfg4.family_streams);
-    try std.testing.expectEqual(@as(u32, 4), cfg4.batch_streams);
-    try std.testing.expectEqual(@as(u32, st.batch_rows), cfg4.batch_rows);
-
+    try std.testing.expect(cfg4.family_streams and cfg4.batch_streams == 4 and cfg4.batch_rows == st.batch_rows);
     m.options.streams = 1;
     var cfg1 = try lanes.Config.init(std.testing.allocator, m.facts(), st.window_rows, st.window_rows - 1);
     defer cfg1.deinit(std.testing.allocator);
-    try std.testing.expect(!cfg1.family_streams);
-    try std.testing.expectEqual(@as(u32, 1), cfg1.batch_streams);
+    try std.testing.expect(!cfg1.family_streams and cfg1.batch_streams == 1);
 }
 
 test "inkling2 backend: cache budget admission requeues behind active streams and fails alone" {

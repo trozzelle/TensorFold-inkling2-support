@@ -304,9 +304,7 @@ fn exactMode(init: std.process.Init, args: []const [:0]const u8) !void {
     if (differ != 0) return error.Inkling2NotRowExact;
 }
 
-/// Multi-stream shared-round check: runs 2, 4, 8 streams at staggered positions and mixed window lengths (plus a 4x16
-/// 64-row batch) through `forward.runShared` with NaN-poisoned `s.part` against solo `forward.run` (and reversed
-/// segment order for strict cross-stream row independence).
+/// Multi-stream shared-round check (2/4/8 streams, up to 64 rows) vs solo and reversed segment order.
 fn sharedMode(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len < 4) return error.ExpectedIds;
     const L: ?u32 = if (args.len > 4) try std.fmt.parseInt(u32, args[4], 10) else null;
@@ -411,8 +409,7 @@ fn sharedMode(init: std.process.Init, args: []const [:0]const u8) !void {
             src_off += len;
         }
 
-        // Compare: (a) forward vs reversed must ALWAYS be bit-identical; (b) solo_exact must be bit-identical vs solo;
-        // (c) xp_batch must have 0 non-finite values and match solo within bf16 rounding tolerance (<= 1e-2 rel_rms).
+        // Forward vs reversed must match bit-for-bit; solo_exact must match solo; xp_batch within bf16 tolerance.
         var order_diff: usize = 0;
         var solo_diff: usize = 0;
         var nonfinite: usize = 0;
