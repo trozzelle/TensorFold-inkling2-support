@@ -1,4 +1,4 @@
-//! Inkling 2 behind the lane engine: one stream, its caches, one-row rounds and copy-drafted windows drawn on the host.
+//! Inkling 2 behind the lane engine: one to eight streams, their caches, shared verify rounds and copy-drafted windows drawn on the host.
 const std = @import("std");
 const mtl = @import("metal");
 const lanes = @import("lanes");
@@ -192,7 +192,29 @@ pub const Metal = struct {
     }
 
     pub fn backend(self: *Metal) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .prepare_features = prepareFn, .features = featuresFn, .prefill_features = prefillFeaturesFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .first_row = firstRowFn, .held = heldFn } };
+        return .{
+            .ptr = self,
+            .chunk_invariant = true,
+            .vtable = &.{
+                .prefill = prefillFn,
+                .prefill_step = prefillStepFn,
+                .cancel_prefill = cancelPrefillFn,
+                .reports_fill = true,
+                .prepare_features = prepareFn,
+                .features = featuresFn,
+                .prefill_features = prefillFeaturesFn,
+                .first = firstFn,
+                .first_masked = firstMaskedFn,
+                .queue = queueFn,
+                .read = readFn,
+                .verify = verifyFn,
+                .keep = keepFn,
+                .draft = draftFn,
+                .release = releaseFn,
+                .first_row = firstRowFn,
+                .held = heldFn,
+            },
+        };
     }
 
     fn cast(ptr: *anyopaque) *Metal {
@@ -220,56 +242,14 @@ pub const Metal = struct {
         return @as(usize, st.feature_taps) * self.model.config.text.hidden * 2;
     }
 
-    /// A prompt chunk's `n` tapped rows (the first at the cache's end), given to the sink while they are held; the
-    /// prompt's last row stays in the cache for the first draft.
-    fn holdTaps(self: *Metal, cache: *st.Cache, stream: *lanes.Stream, n: usize, last: bool) !void {
-        const width = self.tapBytes();
-        if (self.sink) |k| try k.take(k.ptr, stream, .{ .buffer = @intFromPtr(self.scratch.ptaps.id), .rows = @intCast(n), .row_bytes = @intCast(width), .space = .device, .dtype = .bf16 }, cache.len);
-        if (!last) return;
-        if (cache.last_tap == null) {
-            const buf = try self.model.device.buffer(width, mtl.ResourceOptions.shared);
-            if (cache.follow) |f| f.join(f.ctx, buf);
-            cache.last_tap = buf;
-        }
-        @memcpy(cache.last_tap.?.slice(u8, width), self.scratch.ptaps.slice(u8, n * width)[(n - 1) * width ..][0..width]);
-        cache.last_tap_pos = cache.len + n - 1;
-        cache.tap = .{ .buf = cache.last_tap, .start = cache.len + n - 1, .rows = 1, .gen = self.tap_gen };
-    }
-
-    /// ids at the cache's end in prompt chunks, cutting at the stream's reuse marks, the last chunk's last logits kept
-    /// for the first draw. With the features prepared each chunk is tapped, and `holdTaps` hands its rows on.
-    fn feed(self: *Metal, cache: *st.Cache, ids: []const u32, stream: *lanes.Stream) !void {
-        const base = cache.len; // a resumed pass starts past the kept state's rows
-        var at: usize = 0;
-        while (at < ids.len) {
-            if (stream.isCancelled()) return error.Cancelled;
-            var end = @min(ids.len, at + self.scratch.prefill_rows);
-            // a mark ends a chunk, so the state there can be kept; the server's per-message chunk starts are not cut at: a row's
-            // bits do not depend on its chunk, and each cut costs a small chunk
-            for (stream.reuse.marks) |x| if (x > base + at and x < base + end) {
-                end = x - base;
-            };
-            const n = end - at;
-            const last = end == ids.len;
-            const to: ?fwd.B = if (self.tapped) .{ .buf = self.scratch.ptaps } else null;
-            try fwd.run(self.model, &self.scratch, cache, ids[at..end], .{ .logits = if (last) .last else .none, .prompt = true, .feature_taps = to });
-            if (to != null) try self.holdTaps(cache, stream, n, last);
-            if (last) @memcpy(cache.logits.slice(u16, self.model.config.text.vocab), self.scratch.logits.slice(u16, self.model.config.text.vocab));
-            cache.len += n;
-            lanes.prefill_widths.completed(self.gpa, stream, n);
-            at = end;
-            if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(cache.len)) != null) if (stream.reuse.hook) |k| k.at(k.ptr, stream, @intCast(cache.len));
-        }
-    }
-
-    fn prefillFn(ptr: *anyopaque, stream: *lanes.Stream) !void {
-        const self = cast(ptr);
+    /// Allocate a stream's cache under the cache budget, evict prompt snapshots if needed, and restore any prefix snapshot.
+    fn openStream(self: *Metal, stream: *lanes.Stream) !*st.Cache {
         const ids = stream.prompt();
         if (ids.len == 0 or ids.len + stream.max_new > self.options.capacity or self.caches.contains(stream)) return error.InvalidInkling2Prompt;
         const c = &self.model.config.text;
         const capacity = ids.len + stream.max_new + 1;
         const need = st.cacheBytes(c, capacity, c.layers, self.scratch.prefill_rows);
-        if (self.held + need > self.options.budget) return error.Inkling2CachesFull;
+        try admitBudget(self.held, need, self.options.budget, self.caches.count());
         self.held += need;
         errdefer self.held -= need;
         if (stream.reuse.saved) |saved| { // a state the stream cannot hold beside its caches: freed now, no restore
@@ -292,8 +272,60 @@ pub const Metal = struct {
                 if (snapshot.restore(self.model.queue, c, snap, cache)) stream.cached = snap.at else |_| stream.reuse_failed = true;
             } else stream.reuse_failed = true;
         }
-        if (self.spent != null) self.spent = .{};
-        try self.feed(cache, ids[cache.len..], stream);
+        stream.fill_at.store(@intCast(cache.len), .release);
+        if (self.spent != null and self.caches.count() == 1) self.spent = .{};
+        return cache;
+    }
+
+    /// One prompt chunk of at most `max_rows` (or `scratch.prefill_rows` when 0), cut at reuse marks; returns true when the
+    /// whole prompt is filled and its final logits (and last_tap when tapped) are held on the stream's cache.
+    fn prefillStepFn(ptr: *anyopaque, stream: *lanes.Stream, max_rows: u32) !bool {
+        const self = cast(ptr);
+        const cache = self.caches.get(stream) orelse try self.openStream(stream);
+        const ids = stream.prompt();
+        if (cache.len >= ids.len) return true;
+        if (stream.isCancelled()) return error.Cancelled;
+        const cap = if (max_rows > 0) @min(@as(usize, max_rows), self.scratch.prefill_rows) else self.scratch.prefill_rows;
+        const at = cache.len;
+        var end = @min(ids.len, at + cap);
+        // a mark ends a chunk, so the state there can be kept; the server's per-message chunk starts are not cut at: a row's
+        // bits do not depend on its chunk, and each cut costs a small chunk
+        for (stream.reuse.marks) |x| if (x > at and x < end) {
+            end = x;
+        };
+        const n = end - at;
+        const last = end == ids.len;
+        const to: ?fwd.B = if (self.tapped) .{ .buf = self.scratch.ptaps } else null;
+        try fwd.run(self.model, &self.scratch, cache, ids[at..end], .{ .logits = if (last) .last else .none, .prompt = true, .feature_taps = to });
+        if (to != null) {
+            self.tap_gen += 1;
+            const width = self.tapBytes();
+            cache.tap = .{ .buf = self.scratch.ptaps, .off = 0, .start = at, .rows = n, .gen = self.tap_gen };
+            if (self.sink) |k| try k.take(k.ptr, stream, .{ .buffer = @intFromPtr(self.scratch.ptaps.id), .rows = @intCast(n), .row_bytes = @intCast(width), .space = .device, .dtype = .bf16 }, at);
+            if (last) {
+                if (cache.last_tap == null) {
+                    const buf = try self.model.device.buffer(width, mtl.ResourceOptions.shared);
+                    if (cache.follow) |f| f.join(f.ctx, buf);
+                    cache.last_tap = buf;
+                }
+                @memcpy(cache.last_tap.?.slice(u8, width), self.scratch.ptaps.slice(u8, n * width)[(n - 1) * width ..][0..width]);
+                cache.last_tap_pos = ids.len - 1;
+            }
+        }
+        if (last) @memcpy(cache.logits.slice(u16, self.model.config.text.vocab), self.scratch.logits.slice(u16, self.model.config.text.vocab));
+        cache.len += n;
+        stream.fill_at.store(@intCast(cache.len), .release);
+        lanes.prefill_widths.completed(self.gpa, stream, n);
+        if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(cache.len)) != null) if (stream.reuse.hook) |k| k.at(k.ptr, stream, @intCast(cache.len));
+        return last;
+    }
+
+    fn cancelPrefillFn(_: *anyopaque, _: *lanes.Stream) !void {}
+
+    fn prefillFn(ptr: *anyopaque, stream: *lanes.Stream) !void {
+        const self = cast(ptr);
+        if (self.caches.contains(stream)) return error.InvalidInkling2Prompt;
+        while (!try prefillStepFn(ptr, stream, 0)) {}
     }
 
     /// The drafter's layers, told once before any forward. A forward taps the inputs of `fwd.tap_layers` and the finals
@@ -475,6 +507,13 @@ pub const Metal = struct {
     }
 };
 
+/// Admit a new stream cache under `budget`: when other streams hold part of the budget, return `error.LaneMemory` so the
+/// host requeues until a stream finishes; when no other stream is active, return `error.Inkling2CachesFull`.
+fn admitBudget(held: u64, need: u64, budget: u64, active: usize) !void {
+    if (held + need <= budget) return;
+    return if (active > 0) error.LaneMemory else error.Inkling2CachesFull;
+}
+
 /// Whether `taps` are the layers a forward taps, in order: the inputs of `fwd.tap_layers`, then the finals, named by the
 /// layer count.
 fn tapsAre(taps: []const u32, layers: u32) bool {
@@ -568,4 +607,12 @@ test "inkling2 backend: multi-stream facts enable shared rounds in lanes.Config"
     defer cfg1.deinit(std.testing.allocator);
     try std.testing.expect(!cfg1.family_streams);
     try std.testing.expectEqual(@as(u32, 1), cfg1.batch_streams);
+}
+
+test "inkling2 backend: cache budget admission requeues behind active streams and fails alone" {
+    try admitBudget(0, 100, 100, 0);
+    try admitBudget(50, 50, 100, 1);
+    try std.testing.expectError(error.LaneMemory, admitBudget(60, 50, 100, 1));
+    try std.testing.expectError(error.LaneMemory, admitBudget(0, 101, 100, 2));
+    try std.testing.expectError(error.Inkling2CachesFull, admitBudget(0, 101, 100, 0));
 }

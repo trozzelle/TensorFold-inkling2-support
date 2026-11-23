@@ -1,5 +1,5 @@
-//! Inkling 2 Small with EXL3 experts served by the lane host: one stream, plain and copy-drafted rounds, and the DSpark draft
-//! head's drafts when the model folder has its weights.
+//! Inkling 2 Small with EXL3 experts served by the lane host: one to eight streams, shared verify rounds, interleaved
+//! prefill, plain and copy-drafted rounds, and the DSpark draft head's drafts when the model folder has its weights.
 const std = @import("std");
 const mtl = @import("metal");
 const api = @import("engine_api");
@@ -48,10 +48,10 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = "--vision: the Inkling 2 EXL3 engine reads text only; serve without --vision";
         return null;
     }
-    if (o.lanes_fixed and o.lanes > 1) {
-        problem.* = "--parallel: the Inkling 2 EXL3 engine serves one stream; give --parallel 1";
+    const served = resolvedLanes(o) catch {
+        problem.* = "--parallel: the Inkling 2 EXL3 engine serves 1 to 8 streams; give --parallel 1 through 8";
         return null;
-    }
+    };
     if (o.prompt_cache_gib) |g| if (!std.math.isFinite(g) or g < 0) {
         problem.* = "--prompt-cache-gib: give a number of GiB at least 0 (0 turns the prompt cache off)";
         return null;
@@ -96,7 +96,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         };
     } else if (o.drafts) std.log.info("inkling2: no draft head loaded; serving plain and copy-drafted rounds", .{});
     errdefer if (draft) |d| d.deinit();
-    if (draft) |d| std.log.info("inkling2: DSpark draft head, {s} layers, {s}, {d:.2} GiB resident", .{ d.w.bits.label(), try drafting.describe(a), gib(d.residentBytes(1)) });
+    if (draft) |d| std.log.info("inkling2: DSpark draft head, {s} layers, {s}, {d:.2} GiB resident", .{ d.w.bits.label(), try drafting.describe(a), gib(d.residentBytes(served)) });
     // refusals that return null free what they hold themselves: errdefer runs only for errors
     var ram: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -112,8 +112,8 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     // the checkpoint's shards, the draft head's file and fold among them
     const weights: u64 = model.checkpoint.residentBytes();
     // what the caches' room is left after: those, the scratch but for the partials that grow with the context (`longest`
-    // counts them beside the caches), and the draft head's scratch and its one stream's state
-    const held = try fl.budget.held(model, if (draft) |d| d.extraBytes(1) else 0);
+    // counts them beside the caches), and the draft head's scratch and its served streams' states
+    const held = try fl.budget.held(model, if (draft) |d| d.extraBytes(served) else 0);
     const room = fl.budget.caches(ram, model.device.maxWorkingSet(), limit_gb, held) catch {
         free(model, draft);
         problem.* = "--load-limit-gb is not a load limit: give a number of GB above 0, or leave it out for 75% of RAM";
@@ -128,7 +128,14 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     }
     // the partials of this window come off what the caches may hold
     const budget = room - fl.state.partBytes(c, @as(usize, @intCast(window)) + 1);
-    std.log.info("inkling2: {d:.1} GiB of weights, {d:.1} GiB for caches, context up to {d} tokens (the caches fit {d})", .{ gib(weights), gib(budget), window, fits });
+    const fixed_one = fl.state.cacheBytes(c, 1, c.layers, model.prefill_rows);
+    if (!fitsFixedFloor(c, budget, model.prefill_rows, served)) {
+        const most_fit: u64 = budget / fixed_one;
+        problem.* = try std.fmt.allocPrint(a, "--parallel {d}: {d} Inkling 2 streams need {d:.2} GiB of fixed rings, more than the {d:.2} GiB left for caches ({d} fit)", .{ served, served, gib(@as(u64, served) * fixed_one), gib(budget), most_fit });
+        free(model, draft);
+        return null;
+    }
+    std.log.info("inkling2: {d:.1} GiB of weights, {d:.1} GiB for caches, context up to {d} tokens (the caches fit {d}), {d} stream(s)", .{ gib(weights), gib(budget), window, fits, served });
     std.log.info("inkling2: prompt chunks of {d} rows on the {s} path, {d:.2} GiB of scratch", .{ model.prefill_rows, @tagName(model.promptPath()), gib(try fl.state.scratchBytes(c, 0, model.chunking())) });
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
@@ -138,7 +145,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.resident = null;
     h.draft = draft;
     h.wrap = null;
-    h.metal = try fl.backend.Metal.init(gpa, model, .{ .capacity = @intCast(window), .budget = budget });
+    h.metal = try fl.backend.Metal.init(gpa, model, .{ .capacity = @intCast(window), .budget = budget, .streams = served });
     errdefer h.metal.deinit();
     try h.metal.warm();
     errdefer if (h.wrap) |*w| w.deinit();
@@ -149,6 +156,10 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         try h.metal.measure();
         var text: [256]u8 = undefined;
         std.log.info("inkling2: window forwards by rows, ms: {s}", .{costsText(&text, h.metal.facts().window_costs)});
+        if (served > 1) {
+            var shared_text: [256]u8 = undefined;
+            std.log.info("inkling2: shared forwards by rows, ms: {s}", .{costsText(&shared_text, h.metal.facts().shared_costs)});
+        }
         facts = fl.dspark.laneFacts(&h.wrap.?, h.metal.facts(), drafting.depth);
     }
     h.config = try lanes.Config.init(gpa, facts, fl.state.window_rows, fl.state.window_rows - 1);
@@ -156,7 +167,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, if (h.wrap) |*w| w.backend() else h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = 1, .context_window = @intCast(window), .prefill_step = model.prefill_rows, .structures = true, .logprobs = true });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = served, .context_window = @intCast(window), .prefill_step = model.prefill_rows, .decode_share = o.decode_share, .structures = true, .logprobs = true });
     h.cache = null;
     // kept states take what the streams leave, at most this: by default well under the room, which a load has never filled
     h.cache_cap = if (o.prompt_cache_gib) |g| blk: {
@@ -206,7 +217,9 @@ const Snaps = struct {
         return error.BackendRestores; // the prompt pass restores, before its first chunk
     }
     fn drop(ptr: *anyopaque, saved: *anyopaque) void {
-        M.snapDrop(host(ptr).metal, saved);
+        const h = host(ptr);
+        if (h.draft) |d| d.dropKeep(@ptrCast(@alignCast(saved)));
+        M.snapDrop(h.metal, saved);
     }
 };
 
@@ -222,6 +235,17 @@ fn fitCache(ctx: *anyopaque, bytes: u64, restoring: ?*anyopaque, prompt: []const
         }
     };
     _ = store.giveBack(restoring, prompt, Left{ .s = store });
+}
+
+fn resolvedLanes(o: api.Open) !u32 {
+    if (!o.lanes_fixed) return 1;
+    if (o.lanes == 0 or o.lanes > fl.state.max_streams) return error.InvalidParallel;
+    return o.lanes;
+}
+
+fn fitsFixedFloor(c: *const fl.config.Text, budget: u64, prefill_rows: usize, served: u32) bool {
+    const fixed_one = fl.state.cacheBytes(c, 1, c.layers, prefill_rows);
+    return @as(u64, served) * fixed_one <= budget;
 }
 
 fn gib(bytes: u64) f64 {
@@ -317,4 +341,49 @@ test "inkling2 host: bad prompt cache cap is refused before loading" {
         try std.testing.expectEqual(null, try open(std.testing.allocator, std.testing.allocator, std.testing.io, o, &problem));
         try std.testing.expectStringStartsWith(problem, "--prompt-cache-gib:");
     }
+}
+
+test "inkling2 host: parallel defaults to 1 when unset and refuses 0 or >8 before loading" {
+    try std.testing.expectEqual(@as(u32, 1), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 4, .lanes_fixed = false }));
+    try std.testing.expectEqual(@as(u32, 1), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 1, .lanes_fixed = true }));
+    try std.testing.expectEqual(@as(u32, 4), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 4, .lanes_fixed = true }));
+    try std.testing.expectEqual(@as(u32, 8), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 8, .lanes_fixed = true }));
+    var problem: []const u8 = "";
+    for ([_]u32{ 0, 9, 16 }) |bad| {
+        const o: api.Open = .{ .dir = "no-weights", .model_type = "inkling2", .lanes = bad, .lanes_fixed = true };
+        try std.testing.expectEqual(null, try open(std.testing.allocator, std.testing.allocator, std.testing.io, o, &problem));
+        try std.testing.expectStringStartsWith(problem, "--parallel:");
+    }
+}
+
+test "inkling2 host: fixed-floor check accepts streams that fit and refuses when fixed rings exceed budget" {
+    const c: fl.config.Text = .{
+        .hidden = 4608,
+        .layers = 48,
+        .vocab = 200704,
+        .unpadded_vocab = 200704,
+        .local = .{ .q = 32, .kv = 8, .dim = 128 },
+        .global = .{ .q = 32, .kv = 8, .dim = 128 },
+        .window = 2048,
+        .d_rel = 128,
+        .rel_extent = 131072,
+        .log_floor = 128,
+        .log_alpha = 1,
+        .eps = 1e-6,
+        .qk_clip = 0,
+        .rel_clip = 0,
+        .block = 4,
+        .experts = 64,
+        .topk = 4,
+        .expert_inter = 2048,
+        .route_scale = 1,
+        .gate_cap = 0,
+        .up_cap = 0,
+        .logit_cap = 0,
+        .max_context = 262144,
+    };
+    const fixed_one = fl.state.cacheBytes(&c, 1, c.layers, 4096);
+    try std.testing.expect(fitsFixedFloor(&c, 22 * (1 << 30), 4096, 4));
+    try std.testing.expect(fitsFixedFloor(&c, 4 * fixed_one, 4096, 4));
+    try std.testing.expect(!fitsFixedFloor(&c, 4 * fixed_one - 1, 4096, 4));
 }
