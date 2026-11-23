@@ -19,6 +19,7 @@ const cfg = @import("config.zig");
 const dw = @import("dspark_weights.zig");
 const Qmv = @import("dspark_qmv.zig").Qmv;
 const fwd = @import("forward.zig");
+const st = @import("state.zig");
 const snapshot = @import("snapshot.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
@@ -348,9 +349,9 @@ pub const Drafter = struct {
     /// buffer Metal reports no start for.
     absorbed_at: f64 = 0,
     absorb_end: f64 = 0,
-    /// The GPU seconds a hold is expected to take (0: none yet), for the wait: the target's rule (forward.zig's `waitWarm`), a
-    /// shorter hold believed at once and a longer one by a quarter.
-    expected: f64 = 0,
+    /// The GPU seconds a hold of each stream count is expected to take (0: none yet), for the wait: the target's rule
+    /// (forward.zig's `waitWarm`), a shorter hold believed at once and a longer one by a quarter.
+    expected: [st.max_streams + 1]f64 = @splat(0),
 
     /// The draft head over `model`'s taps with `weights` (the model's `draft`): its kernels, scratch and, when the head is not
     /// yet folded, the fold; then one hold timed for `facts`.
@@ -839,7 +840,8 @@ pub const Drafter = struct {
         e.end();
         const committed = fwd.seconds();
         cb.commit();
-        if (d.model.warm_wait) fwd.waitWarm(cb, d.expected, committed) else cb.wait();
+        const slot = @min(items.len, st.max_streams);
+        if (d.model.warm_wait) fwd.waitWarm(cb, d.expected[slot], committed) else cb.wait();
         d.sync() catch |err| {
             std.log.err("inkling2 drafter: the absorb before a hold failed: {s}", .{@errorName(err)});
             return err;
@@ -848,7 +850,8 @@ pub const Drafter = struct {
         // a hold queued behind an absorb starts no earlier than the absorb's end; without a reported start its span is
         // counted from there (or from its commit), never from the clock's zero
         d.hold_gpu = cb.gpuEnd() - cb.gpuStartOr(@max(committed, d.absorb_end));
-        d.expected = if (d.expected == 0 or d.hold_gpu < d.expected) d.hold_gpu else d.expected + (d.hold_gpu - d.expected) / 4;
+        const old = d.expected[slot];
+        d.expected[slot] = if (old == 0 or d.hold_gpu < old) d.hold_gpu else old + (d.hold_gpu - old) / 4;
         d.hold_ms = (now() - began) / @as(f64, @floatFromInt(items.len));
         for (items) |it| {
             const l = d.lanes.get(it.stream).?;
