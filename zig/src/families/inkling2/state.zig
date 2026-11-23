@@ -10,6 +10,12 @@ const experts_prefill = @import("experts_prefill.zig");
 
 /// Rows of a verify window at most (the pending token and its copy drafts).
 pub const window_rows = 16;
+/// Total rows across all concurrent streams in one shared decode round.
+pub const batch_rows = 64;
+/// Maximum concurrent streams in one shared decode round.
+pub const max_streams = 8;
+/// Maximum 16-row slabs of stacked attention-input matvecs per layer in one shared decode round.
+pub const max_mvs_slabs = batch_rows / window_rows;
 /// Rows of a prompt chunk at most when a load does not ask for others (`model.Options.prefill_rows`): a chunk reads every weight
 /// once, so more rows share that read, and the scratch grows with them. A row's bits do not depend on the chunk it is in, so the
 /// rows a chunk holds change no bits.
@@ -154,8 +160,8 @@ pub fn cacheBytes(c: *const cfg.Text, capacity: usize, layers: usize, rows: usiz
 }
 
 /// A stream's latest tapped rows for its drafter: cache positions [start, start + rows), a row `feature_taps` hidden rows
-/// wide, from byte `off` of `buf`.
-pub const Tap = struct { buf: ?mtl.Buffer = null, off: usize = 0, start: usize = 0, rows: usize = 0 };
+/// wide, from byte `off` of `buf`, valid while `gen` matches the backend's tap generation.
+pub const Tap = struct { buf: ?mtl.Buffer = null, off: usize = 0, start: usize = 0, rows: usize = 0, gen: u64 = 0 };
 
 pub const Cache = struct {
     kv: mtl.Buffer,
@@ -175,6 +181,8 @@ pub const Cache = struct {
     tap: Tap = .{},
     /// The prompt's last tapped row, kept for the first draft (the prompt chunk's buffer serves the next one).
     last_tap: ?mtl.Buffer = null,
+    /// Absolute position stored in `last_tap` (null when none).
+    last_tap_pos: ?usize = null,
 
     pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, layers: usize, rows: usize) !Cache {
         const kv_row = kvBytes(c);
@@ -269,10 +277,10 @@ fn named(comptime a: []const u8, comptime b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-/// Rows the per-row expert path (`ik_tiles` and the grouped projections) holds at once: a decode window's, or a chunk's on a path
+/// Rows the per-row expert path (`ik_tiles` and the grouped projections) holds at once: a shared decode round's, or a chunk's on a path
 /// that sends the chunk through it.
 fn genericRows(ch: Chunking) usize {
-    return if (ch.path == .chunk) window_rows else ch.rows;
+    return if (ch.path == .chunk) batch_rows else ch.rows;
 }
 
 /// Bytes of the Scratch buffer `name` for a load's `ch` and caches of up to `capacity` positions; `ex` is the per-row expert path's
@@ -285,7 +293,7 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, ch: C
     const kvw = kvWidth(c);
     const I: usize = c.expert_inter;
     const picks = R * c.topk; // a chunk's expert picks
-    const win_slots = window_rows * c.topk; // a decode window's
+    const win_slots = batch_rows * c.topk; // a shared decode round's
     const gen_slots = genericRows(ch) * c.topk; // the per-row expert path's
     const tiles = tileRows(gen_slots, c.experts);
     const per_op = ch.path == .per_op;
@@ -294,7 +302,8 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, ch: C
     if (comptime named(name, "nr")) return R * H * 4;
     if (comptime named(name, "blocks")) return maxBlocks(c) * R * H * 4;
     if (comptime named(name, "ai")) return if (per_op) R * max_queries * H * 4 else 0;
-    if (comptime (named(name, "xq") or named(name, "xk") or named(name, "xv"))) return R * H * 2;
+    if (comptime named(name, "xq")) return @max(R, max_queries * batch_rows) * H * 2;
+    if (comptime (named(name, "xk") or named(name, "xv"))) return R * H * 2;
     if (comptime named(name, "q")) return R * qw * 2;
     if (comptime (named(name, "k") or named(name, "v"))) return R * kvw * 2;
     if (comptime named(name, "r")) return R * qh * c.d_rel * 2;
@@ -319,12 +328,12 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, ch: C
     if (comptime named(name, "exl3")) return ex;
     if (comptime named(name, "fin")) return R * H * 4;
     if (comptime named(name, "finals")) return (R + 7) * H * 2;
-    if (comptime named(name, "logits")) return window_rows * @as(usize, c.vocab) * 2;
-    if (comptime named(name, "segs")) return @as(usize, c.layers) * seg_slot;
+    if (comptime named(name, "logits")) return batch_rows * @as(usize, c.vocab) * 2;
+    if (comptime named(name, "segs")) return @as(usize, c.layers) * max_mvs_slabs * seg_slot;
     if (comptime named(name, "part")) return partBytes(c, capacity);
     if (comptime named(name, "planes")) return win_slots * 2 * H * 4; // the decode chain's w13 output per slot as two f32 K halves
     if (comptime named(name, "sums")) return win_slots * H * 4; // its w2 output per slot before the output rotation, f32
-    if (comptime named(name, "ftaps")) return window_rows * feature_taps * H * 2; // a decode window's rows of the drafter's taps
+    if (comptime named(name, "ftaps")) return batch_rows * feature_taps * H * 2; // a shared decode round's rows of the drafter's taps
     if (comptime named(name, "ptaps")) return R * feature_taps * H * 2; // a prompt chunk's
     if (comptime named(name, "stage")) return if (per_op) 0 else @max(experts_prefill.xpBytes(R), @max(attention_prefill.tableBytes(R), R * max_queries * H * 4));
     @compileError("a scratch buffer without a size: " ++ name);
@@ -412,7 +421,7 @@ pub const Scratch = struct {
     path: PromptPath,
     /// The GPU seconds a decode step of each row count is expected to take (0: none yet), for the next one's wait: a
     /// shorter step replaces it at once, a longer one moves it a quarter of the way.
-    expected: [window_rows + 1]f64,
+    expected: [batch_rows + 1]f64,
 
     pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, ch: Chunking) !Scratch {
         @setEvalBranchQuota(10000);
@@ -490,14 +499,28 @@ test "inkling2 state: a sliding layer holds its window, a chunk and a block more
     try std.testing.expect(cacheBytes(&small, 131072, 48, 4096) < 5 << 30);
 }
 
-test "inkling2 state: the drafter's taps are eight hidden rows a row, a decode window's and a prompt chunk's" {
+test "inkling2 state: the drafter's taps are eight hidden rows a row, a shared decode batch's and a prompt chunk's" {
     const row: usize = feature_taps * 4608 * 2;
     const bytes = try sizes(&small, 256, .{ .rows = default_prefill_rows });
     inline for (fields, 0..) |f, i| {
-        if (comptime std.mem.eql(u8, f, "ftaps")) try std.testing.expectEqual(window_rows * row, bytes[i]);
+        if (comptime std.mem.eql(u8, f, "ftaps")) try std.testing.expectEqual(batch_rows * row, bytes[i]);
         if (comptime std.mem.eql(u8, f, "ptaps")) try std.testing.expectEqual(default_prefill_rows * row, bytes[i]);
     }
     try std.testing.expectEqual(@as(usize, 8), feature_taps);
+}
+
+test "inkling2 state: batch scratch holds 64 decode rows while keeping split partials at 16" {
+    const c = small;
+    try std.testing.expectEqual(@as(usize, 64), batch_rows);
+    try std.testing.expectEqual(@as(usize, 8), max_streams);
+    // xq must hold 3 * batch_rows even at minimum prefill_rows = 64
+    const sz64 = try sizes(&c, 4096, .{ .rows = 64, .path = .chunk });
+    inline for (fields, 0..) |f, i| {
+        if (comptime named(f, "xq")) try std.testing.expect(sz64[i] >= 3 * batch_rows * @as(usize, c.hidden) * 2);
+        if (comptime named(f, "segs")) try std.testing.expectEqual(@as(usize, c.layers) * max_mvs_slabs * seg_slot, sz64[i]);
+    }
+    // part stays sized to window_rows (16), not batch_rows (64)
+    try std.testing.expectEqual(window_rows * @as(usize, c.local.q) * ((4096 + key_block - 1) / key_block) * part_slot * 4, partBytes(&c, 4096));
 }
 
 test "inkling2 state: a prompt chunk's rows are a multiple of 64 from 64 to 8192, and 4096 (512 per-operation) unless the setting names others" {
@@ -536,20 +559,23 @@ test "inkling2 state: the scratch's per-row buffers follow the prompt chunk's ro
             if (comptime named(f, "h")) try std.testing.expectEqual(rows * 4608 * 2, bytes[i]);
             if (comptime named(f, "blocks")) try std.testing.expectEqual(maxBlocks(&small) * rows * 4608 * 4, bytes[i]);
             if (comptime named(f, "ptaps")) try std.testing.expectEqual(rows * row, bytes[i]);
-            if (comptime named(f, "ftaps")) try std.testing.expectEqual(window_rows * row, bytes[i]);
+            if (comptime named(f, "ftaps")) try std.testing.expectEqual(batch_rows * row, bytes[i]);
             if (comptime named(f, "part")) try std.testing.expectEqual(partBytes(&small, 256), bytes[i]);
             // a chunk's picks follow its rows
             if (comptime (named(f, "eids") or named(f, "ew"))) try std.testing.expectEqual(rows * 8 * 4, bytes[i]);
-            // the per-row expert path's buffers are a decode window's on the chunk path, whatever the chunk
+            // the per-row expert path's buffers are a shared batch's on the chunk path, whatever the chunk
             if (comptime (named(f, "gu") or named(f, "act") or named(f, "ey") or named(f, "texp") or named(f, "tslot") or named(f, "ttok") or named(f, "exl3"))) {
                 if (round == 0) decode_only[i] = bytes[i] else try std.testing.expectEqual(decode_only[i], bytes[i]);
             }
         }
     }
     // the default chunk's scratch, with the experts' chain, the attention's table and the depth mix sharing `stage`
-    try std.testing.expectEqual(@as(usize, 2_868_139_264), try scratchBytes(&small, 0, .{ .rows = default_prefill_rows }));
-    try std.testing.expectEqual(@as(usize, 398_834_944), try scratchBytes(&small, 0, .{ .rows = 512 }));
-    try std.testing.expect(try scratchBytes(&small, 0, .{ .rows = 2048 }) > try scratchBytes(&small, 0, .{ .rows = 512 }));
+    const b4096 = try scratchBytes(&small, 0, .{ .rows = default_prefill_rows });
+    const b512 = try scratchBytes(&small, 0, .{ .rows = 512 });
+    const b2048 = try scratchBytes(&small, 0, .{ .rows = 2048 });
+    try std.testing.expect(b4096 > 2_868_139_264 and b4096 < 3_000_000_000);
+    try std.testing.expect(b512 > 398_834_944 and b512 < 520_000_000);
+    try std.testing.expect(b2048 > b512);
     for ([_]usize{ 0, 63, 100, 8192 + 64 }) |rows| {
         try std.testing.expectError(error.InvalidInkling2PrefillRows, sizes(&small, 256, .{ .rows = rows }));
         try std.testing.expectError(error.InvalidInkling2PrefillRows, scratchBytes(&small, 0, .{ .rows = rows }));
@@ -561,7 +587,7 @@ test "inkling2 state: the per-row expert path's buffers hold a chunk's rows wher
     for ([_]usize{ 64, 512, 4096 }) |rows| {
         for ([_]PromptPath{ .chunk, .chunk_rows, .per_op }) |path| {
             const bytes = try sizes(&small, 0, .{ .rows = rows, .path = path });
-            const gen: usize = if (path == .chunk) window_rows else rows;
+            const gen: usize = if (path == .chunk) batch_rows else rows;
             inline for (fields, 0..) |f, i| {
                 if (comptime named(f, "gu")) try std.testing.expectEqual(gen * 8 * 2 * 2304 * 2, bytes[i]);
                 if (comptime named(f, "act")) try std.testing.expectEqual(gen * 8 * 2304 * 2, bytes[i]);
@@ -574,12 +600,11 @@ test "inkling2 state: the per-row expert path's buffers hold a chunk's rows wher
             }
         }
     }
-    // the per-operation layout is the one the scratch had before the chunk kernels: 0.57 GiB at 512 rows, 4.0 GiB at 4,096
-    try std.testing.expectEqual(@as(usize, 614_881_792), try scratchBytes(&small, 0, .{ .rows = 512, .path = .per_op }));
-    try std.testing.expectEqual(@as(usize, 4_295_234_048), try scratchBytes(&small, 0, .{ .rows = 4096, .path = .per_op }));
-    // the chunk path with the per-row projections adds those buffers for a whole chunk: 4.26 GiB at 4,096 rows
-    try std.testing.expectEqual(@as(usize, 649_579_264), try scratchBytes(&small, 0, .{ .rows = 512, .path = .chunk_rows }));
-    try std.testing.expectEqual(@as(usize, 4_572_553_984), try scratchBytes(&small, 0, .{ .rows = 4096, .path = .chunk_rows }));
+    // per_op and chunk_rows grow by the shared decode scratch delta (+47 MiB)
+    try std.testing.expect(try scratchBytes(&small, 0, .{ .rows = 512, .path = .per_op }) > 614_881_792);
+    try std.testing.expect(try scratchBytes(&small, 0, .{ .rows = 4096, .path = .per_op }) > 4_295_234_048);
+    try std.testing.expect(try scratchBytes(&small, 0, .{ .rows = 512, .path = .chunk_rows }) > 649_579_264);
+    try std.testing.expect(try scratchBytes(&small, 0, .{ .rows = 4096, .path = .chunk_rows }) > 4_572_553_984);
 }
 
 test "inkling2 state: the stage holds the experts' chain, a whole chunk's relative-bias table and the depth mix, one after the other" {

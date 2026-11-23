@@ -83,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[2], "dspark")) return @import("replay.zig").run(init, args);
     if (std.mem.eql(u8, args[2], "finals")) return finalsMode(init, args);
     if (std.mem.eql(u8, args[2], "exact")) return exactMode(init, args);
+    if (std.mem.eql(u8, args[2], "shared")) return sharedMode(init, args);
     if (std.mem.eql(u8, args[2], "greedy")) return greedyMode(init, args);
     if (std.mem.eql(u8, args[2], "profile")) return profileMode(init, args);
     if (std.mem.eql(u8, args[2], "wall")) return wallMode(init, args);
@@ -301,6 +302,138 @@ fn exactMode(init: std.process.Init, args: []const [:0]const u8) !void {
     }
     std.debug.print("{{\"exact_rows\": {d}, \"differ\": {d}, \"layers\": {d}}}\n", .{ cont, differ, m.layers });
     if (differ != 0) return error.Inkling2NotRowExact;
+}
+
+/// Multi-stream shared-round check: runs 2, 4, 8 streams at staggered positions and mixed window lengths (plus a 4x16
+/// 64-row batch) through `forward.runShared` with NaN-poisoned `s.part` against solo `forward.run` (and reversed
+/// segment order for strict cross-stream row independence).
+fn sharedMode(init: std.process.Init, args: []const [:0]const u8) !void {
+    if (args.len < 4) return error.ExpectedIds;
+    const L: ?u32 = if (args.len > 4) try std.fmt.parseInt(u32, args[4], 10) else null;
+    const ids = try readIds(init, args[3]);
+    defer ids.deinit();
+    const all = ids.value;
+    if (all.len < 450) return error.IdsTooShortForShared;
+    const m = try ik.Model.load(init.gpa, init.io, args[1], try options(L));
+    defer m.deinit();
+    const c = &m.config.text;
+    const H: usize = c.hidden;
+    const capacity = all.len + 1;
+    var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
+    defer s.deinit();
+
+    const Case = struct {
+        name: []const u8,
+        starts: []const usize,
+        lens: []const usize,
+        solo_exact: bool,
+    };
+    const cases = [_]Case{
+        .{ .name = "2x_xd_8rows", .starts = &.{ 17, 131 }, .lens = &.{ 3, 5 }, .solo_exact = true },
+        .{ .name = "4x_xp_18rows", .starts = &.{ 17, 64, 131, 255 }, .lens = &.{ 3, 5, 4, 6 }, .solo_exact = false },
+        .{ .name = "8x_xp_36rows", .starts = &.{ 17, 64, 131, 255, 290, 311, 350, 390 }, .lens = &.{ 1, 3, 5, 8, 2, 4, 6, 7 }, .solo_exact = false },
+        .{ .name = "4x16_xp_64rows", .starts = &.{ 17, 90, 200, 320 }, .lens = &.{ 16, 16, 16, 16 }, .solo_exact = false },
+    };
+
+    for (cases) |cs| {
+        const S = cs.starts.len;
+        var total: usize = 0;
+        for (cs.lens) |len| total += len;
+        const solo_out = try init.gpa.alloc(u16, total * H);
+        defer init.gpa.free(solo_out);
+        const shared_out = try init.gpa.alloc(u16, total * H);
+        defer init.gpa.free(shared_out);
+        const rev_out = try init.gpa.alloc(u16, total * H);
+        defer init.gpa.free(rev_out);
+
+        // 1. Solo reference per stream
+        var base: usize = 0;
+        for (cs.starts, cs.lens) |p0, len| {
+            var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
+            defer cache.deinit();
+            try ik.forward.run(m, &s, &cache, all[0..p0], .{ .logits = .none, .prompt = true });
+            cache.len = p0;
+            try ik.forward.run(m, &s, &cache, all[p0..][0..len], .{ .logits = .none });
+            @memcpy(solo_out[base * H ..][0 .. len * H], s.h.slice(u16, len * H));
+            base += len;
+        }
+
+        // 2. Shared forward (forward order) with NaN-poisoned s.part
+        var caches: [ik.state.max_streams]ik.state.Cache = undefined;
+        var made: usize = 0;
+        defer for (caches[0..made]) |*cc| cc.deinit();
+        var segs: [ik.state.max_streams]ik.forward.Segment = undefined;
+        var batch_ids: [ik.state.batch_rows]u32 = undefined;
+        base = 0;
+        for (cs.starts, cs.lens, 0..) |p0, len, idx| {
+            caches[idx] = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
+            made += 1;
+            try ik.forward.run(m, &s, &caches[idx], all[0..p0], .{ .logits = .none, .prompt = true });
+            caches[idx].len = p0;
+            segs[idx] = .{ .cache = &caches[idx], .rows = len };
+            @memcpy(batch_ids[base..][0..len], all[p0..][0..len]);
+            base += len;
+        }
+        @memset(s.part.slice(u32, s.part.length() / 4), 0x7fc0_0000);
+        try ik.forward.runShared(m, &s, segs[0..S], batch_ids[0..total], .{ .logits = .none });
+        @memcpy(shared_out, s.h.slice(u16, total * H));
+
+        // 3. Shared forward (reversed segment order) to prove strict cross-stream row independence
+        var rev_caches: [ik.state.max_streams]ik.state.Cache = undefined;
+        var rev_made: usize = 0;
+        defer for (rev_caches[0..rev_made]) |*cc| cc.deinit();
+        var rev_segs: [ik.state.max_streams]ik.forward.Segment = undefined;
+        var rev_ids: [ik.state.batch_rows]u32 = undefined;
+        var rbase: usize = 0;
+        for (0..S) |ri| {
+            const idx = S - 1 - ri;
+            const p0 = cs.starts[idx];
+            const len = cs.lens[idx];
+            rev_caches[ri] = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
+            rev_made += 1;
+            try ik.forward.run(m, &s, &rev_caches[ri], all[0..p0], .{ .logits = .none, .prompt = true });
+            rev_caches[ri].len = p0;
+            rev_segs[ri] = .{ .cache = &rev_caches[ri], .rows = len };
+            @memcpy(rev_ids[rbase..][0..len], all[p0..][0..len]);
+            rbase += len;
+        }
+        @memset(s.part.slice(u32, s.part.length() / 4), 0x7fc0_0000);
+        try ik.forward.runShared(m, &s, rev_segs[0..S], rev_ids[0..total], .{ .logits = .none });
+        const rev_h = s.h.slice(u16, total * H);
+        // Un-reverse back into original stream order
+        var src_off: usize = 0;
+        for (0..S) |ri| {
+            const idx = S - 1 - ri;
+            var dst_off: usize = 0;
+            for (0..idx) |k| dst_off += cs.lens[k];
+            const len = cs.lens[idx];
+            @memcpy(rev_out[dst_off * H ..][0 .. len * H], rev_h[src_off * H ..][0 .. len * H]);
+            src_off += len;
+        }
+
+        // Compare: (a) forward vs reversed must ALWAYS be bit-identical; (b) solo_exact must be bit-identical vs solo;
+        // (c) xp_batch must have 0 non-finite values and match solo within bf16 rounding tolerance (<= 1e-2 rel_rms).
+        var order_diff: usize = 0;
+        var solo_diff: usize = 0;
+        var nonfinite: usize = 0;
+        var sq: f64 = 0;
+        var dq: f64 = 0;
+        for (solo_out, shared_out, rev_out) |a_u, b_u, c_u| {
+            if (b_u != c_u) order_diff += 1;
+            if (a_u != b_u) solo_diff += 1;
+            const fa: f32 = @bitCast(@as(u32, a_u) << 16);
+            const fb: f32 = @bitCast(@as(u32, b_u) << 16);
+            if (!std.math.isFinite(fb)) nonfinite += 1;
+            sq += @as(f64, fa) * @as(f64, fa);
+            const d = @as(f64, fb) - @as(f64, fa);
+            dq += d * d;
+        }
+        const rel_rms = if (sq > 0) @sqrt(dq / sq) else 0;
+        std.debug.print("{{\"shared_case\": \"{s}\", \"streams\": {d}, \"rows\": {d}, \"order_diff\": {d}, \"solo_diff\": {d}, \"rel_rms\": {e:.2}, \"nonfinite\": {d}}}\n", .{ cs.name, S, total, order_diff, solo_diff, rel_rms, nonfinite });
+        if (nonfinite != 0 or order_diff != 0) return error.Inkling2SharedOrderMismatch;
+        if (cs.solo_exact and solo_diff != 0) return error.Inkling2SharedNotBitExact;
+        if (!cs.solo_exact and rel_rms > 1e-3) return error.Inkling2SharedDrift;
+    }
 }
 
 fn greedyMode(init: std.process.Init, args: []const [:0]const u8) !void {

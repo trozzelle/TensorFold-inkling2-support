@@ -133,7 +133,7 @@ fn gemm(init: std.process.Init) !void {
     }
     const shapes = [_][3]usize{ .{ 6144, 4608, 0 }, .{ 1024, 4608, 0 }, .{ 768, 4608, 0 }, .{ 48, 4608, 0 }, .{ 4608, 6144, 0 }, .{ 384, 4608, 0 }, .{ 201024, 4608, 0 } };
     const names = [_][]const u8{ "q|gate", "k|v", "r", "sink", "o", "router", "unembed" };
-    for (shapes, names) |sh, name| for ([_]usize{ 512, 2048, 4096 }) |m| {
+    for (shapes, names) |sh, name| for ([_]usize{ 8, 16, 24, 32, 48, 64, 512, 2048, 4096 }) |m| {
         g.m = m;
         g.n = sh[0];
         g.k = sh[1];
@@ -163,7 +163,7 @@ fn gemmRows(device: mtl.Device, q: mtl.Queue, gpa: std.mem.Allocator) !void {
     defer pipes.deinit();
     const shapes = [_][3]usize{ .{ 6144, 4608, 0 }, .{ 1024, 4608, 0 }, .{ 768, 4608, 0 }, .{ 48, 4608, 0 }, .{ 4608, 6144, 0 }, .{ 384, 4608, 1 }, .{ 32, 4608, 0 } };
     const names = [_][]const u8{ "q|gate", "k|v", "r", "sink", "o", "router f32", "dyn conv" };
-    for (shapes, names) |sh, name| for ([_]usize{ 512, 2048, 4096 }) |m| {
+    for (shapes, names) |sh, name| for ([_]usize{ 8, 16, 24, 32, 48, 64, 512, 2048, 4096 }) |m| {
         var g = RowsBench{ .pipes = &pipes, .x = undefined, .w = undefined, .y = undefined, .m = m, .n = sh[0], .k = sh[1], .out = if (sh[2] == 1) .f32 else .bf16 };
         const esz: usize = if (sh[2] == 1) 4 else 2;
         g.x = try device.buffer(m * g.k * 2, mtl.ResourceOptions.shared);
@@ -183,14 +183,19 @@ const Mv = struct { pipe: [6]mtl.Pipeline, x: mtl.Buffer, y: mtl.Buffer };
 const MvOp = struct { w: mtl.Buffer, rows: u32, n: u32, k: u32, kern: u32 = 0 };
 
 fn mvEncode(mv: *const Mv, e: mtl.ComputeEncoder, op: MvOp) void {
-    const cap = if (op.kern != 0) op.kern else op.rows;
-    const idx: usize = if (cap <= 1) 0 else if (cap <= 2) 1 else if (cap <= 4) 2 else if (cap <= 8) 3 else if (cap <= 16) 4 else 5;
-    e.setPipeline(mv.pipe[idx]);
-    e.setBuffer(mv.x, 0, 0);
-    e.setBuffer(op.w, 0, 1);
-    e.setValue(MvArgs{ .rows = op.rows, .n = op.n, .k = op.k, .ldy = op.n }, 2);
-    e.setBuffer(mv.y, 0, 3);
-    e.dispatchGroups(mtl.Size.of((op.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+    var r: u32 = 0;
+    while (r < op.rows) {
+        const k = @min(op.rows - r, 32);
+        const cap = if (op.kern != 0) op.kern else k;
+        const idx: usize = if (cap <= 1) 0 else if (cap <= 2) 1 else if (cap <= 4) 2 else if (cap <= 8) 3 else if (cap <= 16) 4 else 5;
+        e.setPipeline(mv.pipe[idx]);
+        e.setBuffer(mv.x, @as(usize, r) * op.k * 2, 0);
+        e.setBuffer(op.w, 0, 1);
+        e.setValue(MvArgs{ .rows = k, .n = op.n, .k = op.k, .ldy = op.n }, 2);
+        e.setBuffer(mv.y, @as(usize, r) * op.n * 2, 3);
+        e.dispatchGroups(mtl.Size.of((op.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+        r += k;
+    }
 }
 
 const Phase = struct { mv: *const Mv, ops: []const MvOp };
@@ -203,9 +208,9 @@ fn mvSetup(device: mtl.Device) !struct { mv: Mv, lib: mtl.Library } {
     const lib = try mtl.Library.fromSource(device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
     var mv: Mv = undefined;
     for ([_][:0]const u8{ "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32" }, 0..) |n, i| mv.pipe[i] = try mtl.Pipeline.init(device, lib, n, false);
-    mv.x = try device.buffer(8 * 18432 * 2, mtl.ResourceOptions.shared);
-    mv.y = try device.buffer(8 * 201024 * 2, mtl.ResourceOptions.shared);
-    fill(mv.x, 8 * 18432, 3);
+    mv.x = try device.buffer(64 * 18432 * 2, mtl.ResourceOptions.shared);
+    mv.y = try device.buffer(64 * 201024 * 2, mtl.ResourceOptions.shared);
+    fill(mv.x, 64 * 18432, 3);
     return .{ .mv = mv, .lib = lib };
 }
 
@@ -429,7 +434,8 @@ const Xd = struct {
     gu: mtl.Buffer,
     ey: mtl.Buffer,
 
-    const max_slots = 16 * 8;
+    const max_rows = 64;
+    const max_slots = max_rows * 8;
 
     fn init(device: mtl.Device, table: mtl.Buffer, ablate: XdAblate) !Xd {
         const lib = try mtl.Library.fromSource(device, ks.inkling2_glue ++ @embedFile("bench_probe.metal"), .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
@@ -458,7 +464,7 @@ const Xd = struct {
             .planes = try device.buffer(max_slots * 2 * H * 4, mtl.ResourceOptions.shared),
             .act = try device.buffer(max_slots * I * 2, mtl.ResourceOptions.shared),
             .sums = try device.buffer(max_slots * H * 4, mtl.ResourceOptions.shared),
-            .moe = try device.buffer(16 * H * 2, mtl.ResourceOptions.shared),
+            .moe = try device.buffer(max_rows * H * 2, mtl.ResourceOptions.shared),
             .gu = try device.buffer(max_slots * H * 2, mtl.ResourceOptions.shared),
             .ey = try device.buffer(max_slots * H * 2, mtl.ResourceOptions.shared),
         };
@@ -635,7 +641,7 @@ const XdProj = struct {
             .gu = try device.buffer(slots * 2 * xd_inner * 2, mtl.ResourceOptions.shared),
             .act = try device.buffer(slots * xd_inner * 2, mtl.ResourceOptions.shared),
             .y = try device.buffer(slots * xd_hidden * 2, mtl.ResourceOptions.shared),
-            .moe = try device.buffer(16 * xd_hidden * 2, mtl.ResourceOptions.shared),
+            .moe = try device.buffer(Xd.max_rows * xd_hidden * 2, mtl.ResourceOptions.shared),
         };
     }
 
@@ -742,7 +748,7 @@ fn xdRows(text: []const u8, out: *[8]usize) !usize {
     while (it.next()) |t| {
         if (n == out.len) return error.TooManyRowCounts;
         out[n] = try std.fmt.parseInt(usize, t, 10);
-        if (out[n] == 0 or out[n] > 16) return error.BadRows;
+        if (out[n] == 0 or out[n] > Xd.max_rows) return error.BadRows;
         n += 1;
     }
     if (n == 0) return error.BadRows;
