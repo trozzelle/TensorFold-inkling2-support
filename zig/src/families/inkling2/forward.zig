@@ -138,13 +138,20 @@ const part_group = [3]usize{ 32, 24, 1 };
 /// ik_attn_part_w's threadgroup: 6 simdgroups, one per q head in a key head's group, sharing each 32-key slice in threadgroup memory.
 const part_w_group = [3]usize{ 32, 6, 1 };
 
-/// out = in W^T on `e` for `rows` rows of the bf16 [d.n, d.k] matrix `d` (torch's Linear layout), in slabs of at most 32:
+/// A stream's rows in a forward: the next `rows` of ids at positions cache.len.., its keys and values into its cache.
+pub const Segment = struct { cache: *st.Cache, rows: usize };
+
+/// Multi-stream shared decode rounds at or above this total row count switch routed experts to the sorted tensor-unit
+/// chain (`xp`) when available, saving ~42-66% of expert GPU time while keeping solo rounds on `xd`.
+pub const batch_xp_from: usize = 12;
+
+/// out = in W^T on `e` for `rows` rows of the bf16 [d.n, d.k] matrix `d` (torch's Linear layout), in slabs of at most 16:
 /// the row-count kernel of the slab, whose bits do not depend on the slab. `in` rows are d.k wide, `out` rows d.n.
 pub fn matvec(e: mtl.ComputeEncoder, m: *const Model, d: wts.Dense, in: B, out: B, rows: usize) void {
     var r: usize = 0;
     while (r < rows) {
-        const k = @min(rows - r, 32);
-        const g: Glue = if (k <= 8) .matvec_8 else if (k <= 16) .matvec_16 else .matvec_32;
+        const k = @min(rows - r, st.window_rows);
+        const g: Glue = if (k <= 8) .matvec_8 else .matvec_16;
         e.setPipeline(m.pipe(g));
         e.setBuffer(in.buf, in.off + r * d.k * 2, 0);
         e.setBuffer(d.t.buffer, d.t.offset, 1);
@@ -159,12 +166,13 @@ const Enc = struct {
     e: *mtl.ComputeEncoder,
     m: *const Model,
     s: *st.Scratch,
-    cache: *st.Cache,
     n: usize,
     /// Whether this forward takes the decode path.
     decode: bool = false,
     /// Whether this forward's rows run on the tensor-unit chunk kernels (the GEMM and the attention): a chunk, on a load that has them.
     tensor: bool = false,
+    /// Whether a multi-stream decode round routes its experts through the sorted tensor-unit chain (`xp`).
+    xp_batch: bool = false,
     spans: ?*counters.Recorder = null,
     ablate: ?*Ablation = null,
 
@@ -223,14 +231,14 @@ const Enc = struct {
         try x.end();
     }
 
-    /// out = in W^T for `rows` rows in slabs of at most 32 (one row's bits do not depend on the slab).
+    /// out = in W^T for `rows` rows in slabs of at most 16 (one row's bits do not depend on the slab).
     fn mv(x: Enc, d: wts.Dense, in: B, out: B, rows: usize) void {
         switch (x.ablateMode()) {
             .skip => return,
             .stub => {
                 var r: usize = 0;
                 while (r < rows) {
-                    const k = @min(rows - r, 32);
+                    const k = @min(rows - r, st.window_rows);
                     x.e.setPipeline(x.m.pipe(.nop));
                     x.e.dispatchGroups(mtl.Size.of((d.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
                     r += k;
@@ -254,74 +262,107 @@ const Enc = struct {
         dense_prefill.gemmRows(x.e.*, &x.m.chunk.?.dense, view(dense_prefill.Mat, in), .{ .buf = d.t.buffer, .off = d.t.offset, .n = d.n, .k = d.k }, view(dense_prefill.Mat, out), kind, rows, d.n);
     }
 
-    /// Up to `max_segs` matvecs over the same k in one dispatch (at most `window_rows` rows). The segment table lives
-    /// in layer `slot`'s part of `s.segs`, so no slot is rewritten within a command buffer; the kernel reaches its
-    /// buffers by address, so they are declared on the encoder here.
-    fn mvs(x: Enc, slot: usize, segs: []const Seg, rows: usize) void {
-        std.debug.assert(segs.len <= st.max_segs and rows <= st.window_rows);
+    /// Up to `max_segs` matvecs over the same k in slabs of at most `window_rows` rows (up to `batch_rows` total).
+    /// Each slab writes its segment table into its own slot of `s.segs`, so no slot is rewritten within a command buffer.
+    fn mvs(x: Enc, layer_i: usize, segs: []const Seg, rows: usize) void {
+        std.debug.assert(segs.len <= st.max_segs and rows <= st.batch_rows);
         switch (x.ablateMode()) {
             .skip => return,
             .stub => {
                 var total: u32 = 0;
                 for (segs) |sg| total += sg.w.n;
-                x.e.setPipeline(x.m.pipe(.nop));
-                x.e.dispatchGroups(mtl.Size.of((total + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+                var r: usize = 0;
+                while (r < rows) : (r += st.window_rows) {
+                    x.e.setPipeline(x.m.pipe(.nop));
+                    x.e.dispatchGroups(mtl.Size.of((total + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+                }
                 return;
             },
             .run => {},
         }
-        const off = slot * st.seg_slot;
-        const bytes = x.s.segs.slice(u8, off + st.seg_slot)[off..][0 .. segs.len * @sizeOf(IkSeg)];
-        const table: []IkSeg = @alignCast(std.mem.bytesAsSlice(IkSeg, bytes));
-        var first: u32 = 0;
-        for (segs, table) |sg, *e| {
-            e.* = .{ .x = sg.x.buf.gpuAddress() + sg.x.off, .w = sg.w.t.buffer.gpuAddress() + sg.w.t.offset, .y = sg.y.buf.gpuAddress() + sg.y.off, .n = sg.w.n, .k = sg.w.k, .ldy = sg.w.n, .first = first };
-            first += sg.w.n;
-            x.e.useResource(sg.x.buf, mtl.ResourceUsage.read);
-            x.e.useResource(sg.w.t.buffer, mtl.ResourceUsage.read);
-            x.e.useResource(sg.y.buf, mtl.ResourceUsage.write);
+        var r: usize = 0;
+        var slab: usize = 0;
+        while (r < rows) : (slab += 1) {
+            const k = @min(rows - r, st.window_rows);
+            const slot = layer_i * st.max_mvs_slabs + slab;
+            const off = slot * st.seg_slot;
+            const bytes = x.s.segs.slice(u8, off + st.seg_slot)[off..][0 .. segs.len * @sizeOf(IkSeg)];
+            const table: []IkSeg = @alignCast(std.mem.bytesAsSlice(IkSeg, bytes));
+            var first: u32 = 0;
+            for (segs, table) |sg, *e| {
+                e.* = .{
+                    .x = sg.x.buf.gpuAddress() + sg.x.off + r * @as(usize, sg.w.k) * 2,
+                    .w = sg.w.t.buffer.gpuAddress() + sg.w.t.offset,
+                    .y = sg.y.buf.gpuAddress() + sg.y.off + r * @as(usize, sg.w.n) * 2,
+                    .n = sg.w.n,
+                    .k = sg.w.k,
+                    .ldy = sg.w.n,
+                    .first = first,
+                };
+                first += sg.w.n;
+                x.e.useResource(sg.x.buf, mtl.ResourceUsage.read);
+                x.e.useResource(sg.w.t.buffer, mtl.ResourceUsage.read);
+                x.e.useResource(sg.y.buf, mtl.ResourceUsage.write);
+            }
+            x.e.setPipeline(x.m.pipe(if (k <= 8) .mvs_8 else .mvs_16));
+            x.e.setBuffer(x.s.segs, off, 0);
+            x.e.setValue(MvsArgs{ .rows = @intCast(k), .nseg = @intCast(segs.len), .total = first }, 1);
+            x.e.dispatchGroups(mtl.Size.of((first + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+            r += k;
         }
-        x.e.setPipeline(x.m.pipe(if (rows <= 8) .mvs_8 else .mvs_16));
-        x.e.setBuffer(x.s.segs, off, 0);
-        x.e.setValue(MvsArgs{ .rows = @intCast(rows), .nseg = @intCast(segs.len), .total = first }, 1);
-        x.e.dispatchGroups(mtl.Size.of((first + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
     }
 
-    /// A short convolution of `in` (width `w`) into `out` over ring `which` of layer `l`, then the ring advanced; a
-    /// dynamic one's projection is a dense span, the convolution an attention_prepare span. The decode path advances the
-    /// ring in the convolution's own dispatch.
-    fn conv(x: Enc, cv: wts.Conv, in: B, dyn_in: B, out: B, l: usize, which: usize, w: usize, kv: u32) !void {
-        const ring = bo(x.cache.conv, x.cache.ringAt(l, which));
-        const n = x.n;
-        var a = Args{ .rows = @intCast(n), .width = @intCast(w), .pos = @intCast(x.cache.len), .heads = kv };
+    /// A short convolution of `in` (width `w`) into `out` over ring `which` of layer `l` for each segment, then the ring
+    /// advanced; a dynamic one's projection runs once across all rows in a dense span, the convolution per segment.
+    fn conv(x: Enc, segments: []const Segment, cv: wts.Conv, in: B, dyn_in: B, out: B, l: usize, which: usize, w: usize, kv: u32) !void {
         switch (cv) {
             .static => |taps| {
-                a.scale = @sqrt(5.0);
                 try x.begin(.attention_prepare);
-                x.glue(if (x.decode) .conv_ring else .conv, a, &.{ in, ring, t(taps), out }, .{ w, n, 1 }, .{ 256, 1, 1 }, false);
+                var base: usize = 0;
+                for (segments) |seg| {
+                    const ring = bo(seg.cache.conv, seg.cache.ringAt(l, which));
+                    const a = Args{ .rows = @intCast(seg.rows), .width = @intCast(w), .pos = @intCast(seg.cache.len), .heads = kv, .scale = @sqrt(5.0) };
+                    const in_seg = bo(in.buf, in.off + base * w * 2);
+                    const out_seg = bo(out.buf, out.off + base * w * 2);
+                    x.glue(if (x.decode) .conv_ring else .conv, a, &.{ in_seg, ring, t(taps), out_seg }, .{ w, seg.rows, 1 }, .{ 256, 1, 1 }, false);
+                    if (!x.decode) x.glue(.ring, a, &.{ in_seg, ring }, .{ w, @min(seg.rows, st.ring), 1 }, .{ 256, 1, 1 }, false);
+                    base += seg.rows;
+                }
+                try x.end();
             },
             .dynamic => |d| {
                 try x.begin(.dense);
-                x.proj(d.proj, dyn_in, b(x.s.dyn), n);
+                x.proj(d.proj, dyn_in, b(x.s.dyn), x.n);
                 try x.end();
-                a.scale = 3;
                 try x.begin(.attention_prepare);
-                x.glue(if (x.decode) .conv_dyn_ring else .conv_dyn, a, &.{ in, ring, t(d.taps), b(x.s.dyn), out }, .{ w, n, 1 }, .{ 256, 1, 1 }, false);
+                var base: usize = 0;
+                for (segments) |seg| {
+                    const ring = bo(seg.cache.conv, seg.cache.ringAt(l, which));
+                    const a = Args{ .rows = @intCast(seg.rows), .width = @intCast(w), .pos = @intCast(seg.cache.len), .heads = kv, .scale = 3 };
+                    const in_seg = bo(in.buf, in.off + base * w * 2);
+                    const dyn_seg = bo(x.s.dyn, base * @as(usize, kv) * 4 * 2);
+                    const out_seg = bo(out.buf, out.off + base * w * 2);
+                    x.glue(if (x.decode) .conv_dyn_ring else .conv_dyn, a, &.{ in_seg, ring, t(d.taps), dyn_seg, out_seg }, .{ w, seg.rows, 1 }, .{ 256, 1, 1 }, false);
+                    if (!x.decode) x.glue(.ring, a, &.{ in_seg, ring }, .{ w, @min(seg.rows, st.ring), 1 }, .{ 256, 1, 1 }, false);
+                    base += seg.rows;
+                }
+                try x.end();
             },
         }
-        if (!x.decode) x.glue(.ring, a, &.{ in, ring }, .{ w, @min(n, st.ring), 1 }, .{ 256, 1, 1 }, false);
-        try x.end();
     }
 
-    /// The decode path's MLP branch in one dispatch: the convolution of `in` over ring 3 of layer `l`, the ring
-    /// advanced, and the layer's output `h` = bf16(`res` + the convolution), in a norm span.
-    fn convOut(x: Enc, taps: wts.Tensor, in: B, res: B, h: B, l: usize, w: usize) !void {
+    /// The decode path's MLP branch per segment: convolution of `in` over ring 3 of layer `l`, ring advanced, and
+    /// `h` = bf16(`res` + convolution), in a norm span.
+    fn convOut(x: Enc, segments: []const Segment, taps: wts.Tensor, in: B, res: B, h: B, l: usize, w: usize) !void {
         std.debug.assert(x.decode);
-        const ring = bo(x.cache.conv, x.cache.ringAt(l, 3));
-        const n = x.n;
-        const a = Args{ .rows = @intCast(n), .width = @intCast(w), .pos = @intCast(x.cache.len), .scale = @sqrt(5.0) };
         try x.begin(.norm);
-        x.glue(.conv_out, a, &.{ in, ring, t(taps), res, h }, .{ w, n, 1 }, .{ 256, 1, 1 }, false);
+        var base: usize = 0;
+        for (segments) |seg| {
+            const ring = bo(seg.cache.conv, seg.cache.ringAt(l, 3));
+            const a = Args{ .rows = @intCast(seg.rows), .width = @intCast(w), .pos = @intCast(seg.cache.len), .scale = @sqrt(5.0) };
+            x.glue(.conv_out, a, &.{ bo(in.buf, in.off + base * w * 2), ring, t(taps), bo(res.buf, res.off + base * w * 4), bo(h.buf, h.off + base * w * 2) }, .{ w, seg.rows, 1 }, .{ 256, 1, 1 }, false);
+            base += seg.rows;
+        }
         try x.end();
     }
 
@@ -346,7 +387,7 @@ const Enc = struct {
     fn xd(x: Enc, l: *const wts.Layer, rows: usize) void {
         const c = &x.m.config.text;
         const s = x.s;
-        std.debug.assert(rows <= st.window_rows);
+        std.debug.assert(rows <= st.batch_rows);
         const slots = rows * c.topk;
         const a = Args{ .rows = @intCast(slots), .cap = c.gate_cap, .thr = c.up_cap };
         const w13 = bo(l.w13.descriptors.buffer, l.w13.descriptors.offset);
@@ -358,32 +399,43 @@ const Enc = struct {
         x.glue(.xd_finish, a, &.{ b(s.sums), b(s.eids), w2, b(s.ew), b(s.moe) }, .{ l.w2.n / 128, rows, 1 }, .{ 256, 1, 1 }, true);
     }
 
-    /// The layer's routed experts for the chunk's rows through the tensor-unit chain (experts_prefill.zig): the picks sorted by
-    /// expert, w13, the capped SwiGLU, w2 and the weighted sum, from s.xm with the picks and weights in s.eids and s.ew into
-    /// s.moe, in the scratch's stage. The chain needs the encoder to be serial, the layer's trellis, scales and descriptor
-    /// tables declared on it (`resources`), and every expert of both tables K2 or K3 (the layer's `xd_ok`).
+    /// The layer's routed experts for the chunk's (or shared decode batch's) rows through the tensor-unit chain
+    /// (experts_prefill.zig): picks sorted by expert, w13, capped SwiGLU, w2 and weighted sum, from s.xm into s.moe.
     fn xp(x: Enc, l: *const wts.Layer) void {
         const c = &x.m.config.text;
         const s = x.s;
         const e = experts_prefill;
-        std.debug.assert(x.tensor and l.xd_ok);
+        std.debug.assert((x.tensor or x.xp_batch) and l.xd_ok);
         e.encode(x.e.*, &x.m.chunk.?.experts, .{ .w13 = l.w13, .w2 = l.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
     }
 };
 
-/// `ids` at positions cache.len.. through the loaded layers (cache.len unmoved): the last command buffer waited. A decode step
-/// commits its first `m.first_chunk` layers in a command buffer of their own and encodes the rest meanwhile, so the GPU
-/// starts while the host is still encoding. A chunk's layers go in command buffers of bounded rows times layers (`commitEvery`),
-/// each committed as soon as it is encoded. The queue runs the buffers in order, the one's results the other's inputs.
+/// `ids` at positions cache.len.. through the loaded layers (cache.len unmoved): the last command buffer waited.
 pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, out: Out) !void {
+    return runShared(m, s, &.{.{ .cache = cache, .rows = ids.len }}, ids, out);
+}
+
+/// Several streams' rows in one forward, each segment's convs and attention over its own cache (cache.len unmoved).
+/// A decode step commits its first `m.first_chunk` layers in a command buffer of their own and encodes the rest meanwhile;
+/// a chunk's layers go in command buffers of bounded rows times layers (`commitEvery`).
+pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids: []const u32, out: Out) !void {
     const c = &m.config.text;
     const n = ids.len;
-    if (n == 0 or n > s.prefill_rows or (out.logits == .all and n > st.window_rows)) return error.Inkling2RowsExceeded;
-    if (out.prompt and n > cache.rows) return error.Inkling2CacheRingShort;
-    if (cache.len + n > cache.capacity) return error.Inkling2ContextFull;
-    const decode = !out.prompt and n <= st.window_rows;
-    // the decode path's split attention keeps one partial for each 256-key block of the cache so far
-    if (decode and cache.len + n > s.capacity) return error.Inkling2ScratchShort;
+    if (segments.len == 0 or n == 0 or n > s.prefill_rows) return error.Inkling2RowsExceeded;
+    if (out.logits == .all and n > st.batch_rows) return error.Inkling2RowsExceeded;
+    if (segments.len > 1 and (out.prompt or n > st.batch_rows or segments.len > st.max_streams)) return error.Inkling2RowsExceeded;
+    const decode = !out.prompt and (segments.len > 1 or n <= st.window_rows);
+    var total_rows: usize = 0;
+    for (segments) |seg| {
+        if (seg.rows == 0) return error.Inkling2RowsExceeded;
+        if (segments.len > 1 and seg.rows > st.window_rows) return error.Inkling2RowsExceeded;
+        if (out.prompt and seg.rows > seg.cache.rows) return error.Inkling2CacheRingShort;
+        if (seg.cache.len + seg.rows > seg.cache.capacity) return error.Inkling2ContextFull;
+        // the decode path's split attention keeps one partial for each 256-key block of the cache so far
+        if (decode and seg.cache.len + seg.rows > s.capacity) return error.Inkling2ScratchShort;
+        total_rows += seg.rows;
+    }
+    if (total_rows != n) return error.Inkling2RowsExceeded;
     if ((out.finals or out.feature_taps != null or out.logits != .none) and m.layers != c.layers) return error.Inkling2PartialModel;
     // a chunk takes the path the model does, and the scratch's buffers are made for it
     if (!decode and s.path != m.promptPath()) return error.Inkling2ScratchForAnotherPromptPath;
@@ -396,7 +448,8 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     var done: Committed = .{}; // the command buffers committed before `cb`, when the forward is in several
     var enc = cb.compute(.serial);
     var open = true; // `enc` is not yet ended
-    const x = Enc{ .e = &enc, .m = m, .s = s, .cache = cache, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .spans = out.spans, .ablate = out.ablate };
+    const xp_batch = decode and segments.len > 1 and n >= batch_xp_from and m.chunk != null and s.path != .per_op;
+    const x = Enc{ .e = &enc, .m = m, .s = s, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .xp_batch = xp_batch, .spans = out.spans, .ablate = out.ablate };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
         enc.end();
         return err;
@@ -418,7 +471,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
             if (out.taps) |tp| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(tp.h, k * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
             if (out.feature_taps) |ft| try x.tap(ft, b(s.h), k);
         };
-        try layer(x, @intCast(i));
+        try layer(x, segments, @intCast(i));
         if (out.taps) |tp| {
             // eight u32 picks a row are sixteen 16-bit words: the bf16 copy moves them bit for bit
             x.glue(.copy, .{ .rows = nr, .width = 16 }, &.{ b(s.eids), bo(tp.eids, i * n * 32) }, .{ 16, n, 1 }, .{ 16, 1, 1 }, false);
@@ -511,10 +564,9 @@ pub fn waitWarm(cb: mtl.CommandBuffer, expected: f64, committed: f64) void {
     cb.wait(); // returns at once after the spin saw the end; it also orders the GPU's writes before the host's reads
 }
 
-fn layer(x: Enc, i: u32) !void {
+fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     const m = x.m;
     const s = x.s;
-    const cache = x.cache;
     const c = &m.config.text;
     const p = m.plan.at(i);
     const w = &m.weights.layers[i];
@@ -522,18 +574,18 @@ fn layer(x: Enc, i: u32) !void {
     const nr: u32 = @intCast(n);
     const H: usize = c.hidden;
     const hd = p.heads;
+    const qw: usize = @as(usize, hd.q) * hd.dim;
     const kvw: usize = @as(usize, hd.kv) * hd.dim;
     const K: u32 = p.blocks_in;
     const stride: u32 = @intCast(s.prefill_rows);
     const slab: usize = s.prefill_rows * H * 4;
     const glob = p.kind == .global;
-    const pos: u32 = @intCast(cache.len);
     const one = .{ 1024, 1, 1 };
     const scale_h: f32 = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(H))));
     // the input's unweighted norm; a boundary layer's goes straight into its block slot
     const nrd = if (p.boundary) bo(s.blocks, K * slab) else b(s.nr);
     const Q: u32 = if (glob) 3 else 1;
-    // the decode path's three inputs share s.xq, a query's rows a window apart
+    // the decode path's three inputs share s.xq, a query's rows a batch apart
     const xrow: usize = n * H * 2;
     const xin = [3]B{ b(s.xq), if (x.decode) bo(s.xq, xrow) else b(s.xk), if (x.decode) bo(s.xq, 2 * xrow) else b(s.xv) };
     const xq = xin[0];
@@ -568,43 +620,70 @@ fn layer(x: Enc, i: u32) !void {
         x.proj(w.sink, xq, b(s.sink), n);
     }
     try x.end();
-    try x.conv(w.k_conv, b(s.k), xk, b(s.kc), i, 0, kvw, hd.kv);
-    try x.conv(w.v_conv, b(s.v), xv, b(s.vc), i, 1, kvw, hd.kv);
-    const keys = bo(cache.kv, cache.keys(i));
-    const values = bo(cache.kv, cache.values(i));
-    const ring = cache.ring(i);
+    try x.conv(segments, w.k_conv, b(s.k), xk, b(s.kc), i, 0, kvw, hd.kv);
+    try x.conv(segments, w.v_conv, b(s.v), xv, b(s.vc), i, 1, kvw, hd.kv);
     try x.begin(.attention_prepare);
-    x.glue(.prep, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .flags = if (glob) global else 0, .ring = ring, .eps = c.eps, .cap = c.qk_clip, .thr = c.rel_clip, .alpha = c.log_alpha, .floor_n = @floatFromInt(c.log_floor) }, &.{ b(s.q), b(s.kc), b(s.vc), b(s.r), t(w.q_scale), t(w.rel_scale), b(s.qn), keys, values, b(s.reln) }, .{ 2 * hd.q + 2 * hd.kv, n, 1 }, .{ 32, 1, 1 }, true);
-    // the decode path's attention forms the relative bias itself from reln and the projection, and so do the chunk kernels (as a table
-    // built right before the attention reads it); the per-operation path builds the table here
-    if (!x.decode and !x.tensor) x.glue(.relbias, .{ .rows = nr, .heads = hd.q, .extent = p.extent, .dim = c.d_rel }, &.{ b(s.reln), t(w.rel_proj), b(s.pb) }, .{ p.extent, hd.q, n }, .{ 256, 1, 1 }, false);
+    {
+        var base: usize = 0;
+        for (segments) |seg| {
+            const keys = bo(seg.cache.kv, seg.cache.keys(i));
+            const values = bo(seg.cache.kv, seg.cache.values(i));
+            const ring = seg.cache.ring(i);
+            const pos: u32 = @intCast(seg.cache.len);
+            const sr: u32 = @intCast(seg.rows);
+            x.glue(.prep, .{ .rows = sr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .flags = if (glob) global else 0, .ring = ring, .eps = c.eps, .cap = c.qk_clip, .thr = c.rel_clip, .alpha = c.log_alpha, .floor_n = @floatFromInt(c.log_floor) }, &.{ bo(s.q, base * qw * 2), bo(s.kc, base * kvw * 2), bo(s.vc, base * kvw * 2), bo(s.r, base * @as(usize, hd.q) * c.d_rel * 2), t(w.q_scale), t(w.rel_scale), bo(s.qn, base * qw * 2), keys, values, bo(s.reln, base * @as(usize, hd.q) * c.d_rel * 2) }, .{ 2 * hd.q + 2 * hd.kv, seg.rows, 1 }, .{ 32, 1, 1 }, true);
+            // the decode path's attention forms the relative bias itself from reln and the projection, and so do the chunk kernels (as a table
+            // built right before the attention reads it); the per-operation path builds the table here
+            if (!x.decode and !x.tensor) x.glue(.relbias, .{ .rows = sr, .heads = hd.q, .extent = p.extent, .dim = c.d_rel }, &.{ bo(s.reln, base * @as(usize, hd.q) * c.d_rel * 2), t(w.rel_proj), bo(s.pb, base * @as(usize, hd.q) * p.extent * 2) }, .{ p.extent, hd.q, seg.rows }, .{ 256, 1, 1 }, false);
+            base += seg.rows;
+        }
+    }
     try x.end();
     try x.begin(.attention);
     const window: u32 = if (glob) 0 else c.window;
     const scale: f32 = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(hd.dim))));
     if (x.decode) {
-        // 256-key blocks at absolute positions, from the block of the first row's first visible key to the block of the
-        // last row's position: the blocks a row's keys do not lie in are empty for it and skipped by the merge, so its
-        // bits are the same alone or in any window
-        const first: u32 = if (window > 0 and pos + 1 > window) pos + 1 - window else 0;
-        const f0 = first / st.key_block;
-        const blocks = (pos + nr - 1) / st.key_block - f0 + 1;
-        const a: Args = .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .ring = ring, .blocks = blocks, .queries = f0, .scale = scale };
-        // Shared-KV global window attention wins once there are enough 256-key blocks to saturate the GPU; shorter contexts
-        // keep per-row threadgroups for full occupancy.
-        const shared_part = glob and ((n >= 3 and blocks >= 96) or (n >= 2 and blocks >= 256));
-        if (shared_part) {
-            x.glue(.attn_part_w, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, 1, blocks }, part_w_group, true);
-        } else {
-            x.glue(.attn_part, a, &.{ b(s.qn), keys, values, b(s.reln), t(w.rel_proj), b(s.part) }, .{ hd.kv, n, blocks }, part_group, true);
+        var base: usize = 0;
+        for (segments) |seg| {
+            const keys = bo(seg.cache.kv, seg.cache.keys(i));
+            const values = bo(seg.cache.kv, seg.cache.values(i));
+            const ring = seg.cache.ring(i);
+            const pos: u32 = @intCast(seg.cache.len);
+            const sr: u32 = @intCast(seg.rows);
+            // 256-key blocks at absolute positions, from the block of the first row's first visible key to the block of the
+            // last row's position: the blocks a row's keys do not lie in are empty for it and skipped by the merge, so its
+            // bits are the same alone or in any window
+            const first: u32 = if (window > 0 and pos + 1 > window) pos + 1 - window else 0;
+            const f0 = first / st.key_block;
+            const blocks = (pos + sr - 1) / st.key_block - f0 + 1;
+            const a: Args = .{ .rows = sr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .ring = ring, .blocks = blocks, .queries = f0, .scale = scale };
+            // Shared-KV global window attention wins once there are enough 256-key blocks to saturate the GPU; shorter contexts
+            // keep per-row threadgroups for full occupancy.
+            const shared_part = glob and ((seg.rows >= 3 and blocks >= 96) or (seg.rows >= 2 and blocks >= 256));
+            if (shared_part) {
+                x.glue(.attn_part_w, a, &.{ bo(s.qn, base * qw * 2), keys, values, bo(s.reln, base * @as(usize, hd.q) * c.d_rel * 2), t(w.rel_proj), b(s.part) }, .{ hd.kv, 1, blocks }, part_w_group, true);
+            } else {
+                x.glue(.attn_part, a, &.{ bo(s.qn, base * qw * 2), keys, values, bo(s.reln, base * @as(usize, hd.q) * c.d_rel * 2), t(w.rel_proj), b(s.part) }, .{ hd.kv, seg.rows, blocks }, part_group, true);
+            }
+            x.glue(.attn_merge, a, &.{ b(s.part), bo(s.sink, base * @as(usize, hd.q) * 2), bo(s.gate, base * qw * 2), bo(s.att, base * qw * 2) }, .{ hd.q, seg.rows, 1 }, .{ 32, 1, 1 }, true);
+            base += seg.rows;
         }
-        x.glue(.attn_merge, a, &.{ b(s.part), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
     } else if (x.tensor) {
+        const cache = segments[0].cache;
+        const keys = bo(cache.kv, cache.keys(i));
+        const values = bo(cache.kv, cache.values(i));
+        const ring = cache.ring(i);
+        const pos: u32 = @intCast(cache.len);
         // the table of the chunk's relative biases is built in the stage and read by the tiled attention, 32 query rows of a head
         // a threadgroup; every view is at the chunk's first row
         const io: attention.Io = .{ .q = view(attention.B, b(s.qn)), .k = view(attention.B, keys), .v = view(attention.B, values), .sink = view(attention.B, b(s.sink)), .gate = view(attention.B, b(s.gate)), .out = view(attention.B, b(s.att)) };
         attention.encodeChunk(x.e.*, &m.chunk.?.attention, .{ .rows = nr, .p0 = pos, .global = @intFromBool(glob), .ring = ring }, io, view(attention.B, b(s.reln)), view(attention.B, t(w.rel_proj)), view(attention.B, b(s.stage)), s.prefill_rows);
     } else {
+        const cache = segments[0].cache;
+        const keys = bo(cache.kv, cache.keys(i));
+        const values = bo(cache.kv, cache.values(i));
+        const ring = cache.ring(i);
+        const pos: u32 = @intCast(cache.len);
         // one simdgroup a (head, row) over the keys one by one, reading the table the per-operation path built
         x.glue(.attn, .{ .rows = nr, .heads = hd.q, .kv = hd.kv, .dim = hd.dim, .pos = pos, .window = window, .extent = p.extent, .ring = ring, .scale = scale }, &.{ b(s.qn), keys, values, b(s.pb), b(s.sink), b(s.gate), b(s.att) }, .{ hd.q, n, 1 }, .{ 32, 1, 1 }, true);
     }
@@ -612,7 +691,7 @@ fn layer(x: Enc, i: u32) !void {
     try x.begin(.dense);
     x.proj(w.o, b(s.att), b(s.o), n);
     try x.end();
-    try x.conv(.{ .static = w.attn_conv }, b(s.o), b(s.o), b(s.ya), i, 2, H, 0);
+    try x.conv(segments, .{ .static = w.attn_conv }, b(s.o), b(s.o), b(s.ya), i, 2, H, 0);
     try x.begin(.norm);
     if (x.decode) {
         x.glue(.rrdn, .{ .rows = nr, .width = c.hidden, .blocks = K, .stride = stride, .flags = if (p.boundary) boundary else 0, .eps = c.eps, .scale = scale_h }, &.{ b(s.h), b(s.ya), b(s.res), b(s.blocks), b(s.ns), t(w.mlp_query), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
@@ -628,9 +707,8 @@ fn layer(x: Enc, i: u32) !void {
         x.gemm(w.router, b(s.xm), b(s.logits32), n, .f32);
     } else x.glue(.router, .{ .rows = nr, .width = c.experts, .dim = c.hidden }, &.{ b(s.xm), t(w.router.t), b(s.logits32) }, .{ (c.experts + 7) / 8, n, 1 }, .{ 256, 1, 1 }, true);
     x.glue(.route, .{ .rows = nr, .width = c.experts, .eps = 1e-20, .scale = c.route_scale }, &.{ b(s.logits32), t(w.bias), b(s.eids), b(s.ew) }, .{ n * 32, 1, 1 }, .{ 32, 1, 1 }, false);
-    // a layer's experts take a chain when it can (the decode chain in a window, the tensor-unit chain in a chunk on the chunk kernels)
-    // and the per-row path (ik_tiles, the grouped projections, the SwiGLU and the combine) when it cannot or the chunk has no chain: the
-    // chains read the picks as routed and sort them themselves, and only the grouped projections need them sorted into tiles
+    // a layer's experts take a chain when it can (the decode chain in a window, or the tensor-unit chain in a chunk or
+    // wide shared decode batch) and the per-row path when it cannot: the chains read picks as routed and sort them themselves
     const slots = n * c.topk;
     const rows = st.tileRows(slots, c.experts);
     const chain = w.xd_ok and (x.decode or x.tensor);
@@ -639,7 +717,7 @@ fn layer(x: Enc, i: u32) !void {
     const I: usize = c.expert_inter;
     try x.begin(.experts);
     if (chain) {
-        if (x.tensor) x.xp(w) else x.xd(w, n);
+        if (x.tensor or x.xp_batch) x.xp(w) else x.xd(w, n);
     } else {
         try x.experts(w.w13, b(s.xm), H, n, b(s.gu), slots, rows, s.ttok);
         x.glue(.swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.gu), b(s.act) }, .{ I, slots, 1 }, .{ 256, 1, 1 }, false);
@@ -648,9 +726,9 @@ fn layer(x: Enc, i: u32) !void {
     }
     try x.end();
     if (x.decode) {
-        try x.convOut(w.mlp_conv, b(s.moe), b(s.res), b(s.h), i, H);
+        try x.convOut(segments, w.mlp_conv, b(s.moe), b(s.res), b(s.h), i, H);
     } else {
-        try x.conv(.{ .static = w.mlp_conv }, b(s.moe), b(s.moe), b(s.ym), i, 3, H, 0);
+        try x.conv(segments, .{ .static = w.mlp_conv }, b(s.moe), b(s.moe), b(s.ym), i, 3, H, 0);
         try x.begin(.norm);
         x.glue(.out, .{ .rows = nr, .width = c.hidden }, &.{ b(s.res), b(s.ym), b(s.h) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
         try x.end();
