@@ -5,7 +5,7 @@ TensorFold serves `thinkingmachines/Inkling-2-Small` on one Mac with 256 GB of m
   2 to 4 bits;
 - everything else in the source checkpoint's bf16.
 
-Text only, one stream; drafts come from the checkpoint's DSpark draft head, with an in-memory prompt cache for multi-turn reuse. No image tower yet.
+Text only, one to eight concurrent streams (`--parallel 1` through `8`, default `1`); drafts come from the checkpoint's DSpark draft head, with an in-memory prompt cache for multi-turn reuse and chunked prefill interleaving (`--decode-share`). No image tower yet.
 
 ## Model directory
 
@@ -35,7 +35,8 @@ checks that each row's result is independent of the rows beside it, and that a N
 
     tf-inkling-run MODEL check                             # load; report expert widths and size
     tf-inkling-run MODEL exact ids.json 448                # steps, 16-row windows and one chunk: identical bits
-    tensorfold-native serve MODEL --name inkling2 --context 32768 --parallel 1 --load-limit-gb 236
+    tf-inkling-run MODEL shared ids.json 1                 # 2/4/8-stream shared forward vs solo + order invariance
+    tensorfold-native serve MODEL --name inkling2 --context 262144 --parallel 4 --load-limit-gb 236
 
 - The published 2.59 bpw pack loads as 190.2 GiB (14,976 K2 and 21,888 K3 expert projections) in about 31 s on an
   M5 Ultra.
@@ -47,7 +48,9 @@ checks that each row's result is independent of the rows beside it, and that a N
     scratch instead.
 - Sliding layers (40 of 48, 1,024-token window) keep a ring of keys and values sized to `alignForward(window + prefill_rows + 64, 256)` slots (5,376 slots at the default 4,096-row chunk, 1,792 at 512), while the 8 global layers keep every position. Past the ring, context grows at 32 KiB a token (plus ~1.5 KiB of split-attention partials), over 0.87 GiB of sliding rings and convolution state at the default chunk (a 131,072-token stream takes 5.05 GiB).
 - When `--context` is unset, the server advertises up to 131,072 tokens (or less if fewer fit); `--context` accepts any length up to what the caches fit, which the startup line reports.
-- Prompt cache (`--prompt-cache-gib`, default 8 GiB; `0` turns it off): kept states hold the global layers' first `at` keys and values, the sliding layers' live window aligned to a 64-key block, the convolution rings, and (with drafts on) the draft head's five context rings (20.3 MiB), taking 32 KiB a token plus up to 223 MiB (about 1.2 GiB at 32k tokens). States are saved at prompt-pass marks and restored into any cache capacity with identical output bits; a follow-up turn prefills the previous reply and the new message from the history mark. Streams take cache memory first and kept states evict before any stream is refused.
+- `--parallel` accepts `1` through `8` (default `1` when omitted; values outside `1..8` are refused before weights load). Startup checks that the fixed sliding-ring and convolution floor (`0.89 GiB` per stream at the default 4,096-row chunk) fits the cache budget; each admitted stream allocates its own KV cache dynamically (`0.89 GiB` fixed plus `32 KiB` per context token). If a new request's cache would push active streams over the cache budget, prompt snapshots evict first, and if active streams still fill the budget the request queues automatically until an active stream finishes.
+- Concurrent decode rounds batch active streams into one shared forward pass (up to 64 total rows, 16 rows per stream). Solo streams and small batches (`< 12` rows) use the rate-grouped decode expert path (`xd`); multi-stream batches of `12..64` rows switch routed experts to the GPU-sorted chunk path (`xp`, saving 1.7×–3.0× on expert time across 16–64 rows) while capping dense matvec slabs at 16 rows. Prompt passes run one chunk at a time (`prefill_step`) so live decoders run between chunks; `--decode-share` caps interleaved prompt chunks at 512 rows to keep decode gaps tighter beside cold prompts.
+- Prompt cache (`--prompt-cache-gib`, default 8 GiB; `0` turns it off): kept states hold the global layers' first `at` keys and values, the sliding layers' live window aligned to a 64-key block, the convolution rings, and (with drafts on) the draft head's five context rings (20.3 MiB), taking 32 KiB a token plus up to 223 MiB (about 1.2 GiB at 32k tokens). States are saved at prompt-pass marks and restored into any cache capacity with identical output bits; a follow-up turn prefills the previous reply and the new message from the history mark. Streams take cache memory first and kept states evict before any stream is queued or refused.
 - Started by launchd (a router run as a LaunchDaemon or LaunchAgent), the server needs two things:
   - `ProcessType` `Interactive` in the job's plist. Without it, launchd clamps the job and its children to
     background priority, a decode step's wait wakes tens of milliseconds late, and drafted decode drops to about
@@ -143,6 +146,21 @@ Measured on an M5 Ultra (256 GB), served, one stream, 256-token replies over a b
 | Decode with drafts, sampled (temperature 0.7, no truncation) | 56.8 tok/s |
 | Decode, sampled (temperature 0.7; four short prompts with top_p 0.95, top_p 0.95 and top_k 20, min_p 0.05, none) | 44.7 tok/s with drafts; 38.7 tok/s with `--no-drafts` |
 
+Multi-stream served suite on an M5 Ultra (256 GB, `--context 262144 --parallel 4 --load-limit-gb 236`, drafts on, 1,024-token outputs except 256 for cached):
+
+| Workload | Concurrency | Prompt tokens | TTFT p50 | Decode (tok/s) | Aggregate E2E (tok/s) | Peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| Short decode (`c=1`) | 1 | 139 | 0.37 s | 65.5 | 64.7 | 197.3 GiB |
+| Short decode (`c=2`) | 2 | 139 | 0.40 s | 41.7 | 82.1 (1.27×) | 198.0 GiB |
+| Short decode (`c=4`) | 4 | 139 | 0.49 s | 28.1 | 102.6 (1.59×) | 199.1 GiB |
+| 8k context (`c=1`) | 1 | 10,274 | 5.81 s | 51.6 | 40.0 | 202.1 GiB |
+| 32k context (`c=1`) | 1 | 40,269 | 23.40 s | 56.1 | 24.2 | 206.0 GiB |
+| 128k context (`c=1`) | 1 | 155,163 | 112.80 s | 42.2 | 7.5 | 209.5 GiB |
+| 32k context (`c=4`) | 4 | 40,270 | 35.18 s | 9.4 | 28.2 | 211.7 GiB |
+| 32k cached (`c=1`, 100% hit) | 1 | 40,247 | 0.23 s | 51.0 | 49.0 | 205.3 GiB |
+
+Shared forward calibration at startup (48 layers, tapped): `16` rows `81.4 ms`, `24` rows `101.5 ms`, `32` rows `114.5 ms`, `48` rows `150.2 ms`, `64` rows `181.0 ms` (vs single-stream `1..8` rows `25.4..67.4 ms`). Interleaved prefill with a cold 57k-token prompt arriving beside an active decoder keeps the decoder streaming between every 4,096-row prefill chunk (max inter-token gap `2.45 s` vs `31.89 s` total prefill).
+
 Decode steps of up to 16 rows take a decode path: the experts run a rate-grouped EXL3 chain (adapted from Sushi), and
 attention, norms and the attention-input matvecs have their own kernels. On global layers at long contexts (at least 96
 blocks of 256 keys for windows of 3 or more rows, or 256 blocks for 2 or more rows), split-K attention switches to
@@ -169,7 +187,7 @@ kernels (the path a GPU without tensor units still takes); the chunk path was th
 
 ## Limits
 
-- One stream; `--parallel` above 1 is refused.
+- Up to 8 concurrent streams (`--parallel 1` through `8`, default `1`); values outside `1..8` are refused.
 - `--vision` is refused.
 - The server does not yet split Inkling's reply channels: a thinking reply's `reasoning_content` starts with the
   raw channel markers (`<|message_model|><|content_thinking|>`). Send
