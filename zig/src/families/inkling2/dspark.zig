@@ -349,10 +349,9 @@ pub const Drafter = struct {
     /// buffer Metal reports no start for.
     absorbed_at: f64 = 0,
     absorb_end: f64 = 0,
-    /// The GPU seconds a hold of each stream count is expected to take (0: none yet), for the wait: the target's rule
-    /// (forward.zig's `waitWarm`), a shorter hold believed at once and a longer one by a quarter.
+    /// Expected GPU seconds per hold by stream count (0: unset), updated like `forward.waitWarm`.
     expected: [st.max_streams + 1]f64 = @splat(0),
-    /// A prompt snapshot saved at a `prefill_step` mark before `Drafted.prefillStep` absorbs that chunk's rows; filled on absorb.
+    /// Prompt snapshot saved at a `prefill_step` mark before `Drafted.prefillStep` absorbs it; filled on absorb.
     deferred_keep: ?struct { stream: *Stream, snap: *snapshot.Snap } = null,
 
     /// The draft head over `model`'s taps with `weights` (the model's `draft`): its kernels, scratch and, when the head is not
@@ -503,8 +502,7 @@ pub const Drafter = struct {
         return 2 * draft_layers * ringBytes();
     }
 
-    /// Stream `s`'s context rings copied into `snap` when its lane stands at the snapshot's position with absorbed rows.
-    /// During `prefill_step`, the snapshot hook fires just before the wrapper absorbs the chunk; defer until that absorb lands.
+    /// Copies `s`'s context rings into `snap` at `snap.at`, deferring if `prefill_step` has not absorbed yet.
     pub fn keepLane(d: *Drafter, s: *Stream, snap: *snapshot.Snap) !void {
         const l = d.lanes.get(s) orelse {
             d.deferred_keep = .{ .stream = s, .snap = snap };
