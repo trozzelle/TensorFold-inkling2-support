@@ -19,7 +19,9 @@ const cfg = @import("config.zig");
 const dw = @import("dspark_weights.zig");
 const Qmv = @import("dspark_qmv.zig").Qmv;
 const fwd = @import("forward.zig");
+const dense_prefill = @import("dense_prefill.zig");
 const st = @import("state.zig");
+const wts = @import("weights.zig");
 const snapshot = @import("snapshot.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
@@ -61,14 +63,16 @@ const prior = [max_depth]f64{ 0.857, 0.859, 0.861, 0.875, 0.901, 0.902, 0.905 };
 /// The fields of a draft layer that are projections (dw.Proj).
 const proj_fields = [_][]const u8{ "q", "k", "v", "k_ctx", "v_ctx", "o", "gate", "up", "down" };
 
-const kernel_names = [_][:0]const u8{ "ikd_mix", "ikd_ctx_prep", "ikd_block_prep", "ikd_attn_part", "ikd_attn_merge", "ikd_swiglu", "ikd_add", "ikd_rnn_proj", "ikd_gru", "ikd_fold_pick", "ikd_pick", "ikd_fold_t" };
-const Kernel = enum { mix, ctx_prep, block_prep, attn_part, attn_merge, swiglu, add, rnn_proj, gru, fold_pick, pick, fold_t };
+const kernel_names = [_][:0]const u8{ "ikd_mix", "ikd_ctx_prep", "ikd_block_prep", "ikd_attn_part", "ikd_attn_merge", "ikd_swiglu", "ikd_add", "ikd_rnn_proj", "ikd_gru", "ikd_fold_pick", "ikd_fold_pick_batch", "ikd_pick", "ikd_fold_t" };
+const Kernel = enum { mix, ctx_prep, block_prep, attn_part, attn_merge, swiglu, add, rnn_proj, gru, fold_pick, fold_pick_batch, pick, fold_t };
 
 comptime {
     const members = @typeInfo(Kernel).@"enum".field_names;
     std.debug.assert(members.len == kernel_names.len);
     for (members, kernel_names) |member, name| std.debug.assert(std.mem.eql(u8, "ikd_" ++ member, name));
 }
+
+const max_batch = st.max_streams;
 
 // The kernels' argument structs, field for field.
 const MixArgs = extern struct { rows: u32, width: u32, tap_stride: u32, mix_stride: u32, eps: f32 };
@@ -77,7 +81,12 @@ const AttnArgs = extern struct { heads: u32, kv: u32, end: u32, window: u32, rin
 const EwArgs = extern struct { rows: u32, width: u32 };
 const ProjArgs = extern struct { n: u32, at: u32, hidden: u32 };
 const FoldArgs = extern struct { vocab: u32, valid: u32, flags: u32, cap: f32 };
+const FoldBatchArgs = extern struct { vocab: u32, valid: u32, flags: u32, count: u32, base_stride: u32, cap: f32, slot_map: [max_batch]u32 };
 const PickArgs = extern struct { groups: u32, step: u32, flags: u32 };
+
+comptime {
+    std.debug.assert(max_batch == 8 and @sizeOf(FoldBatchArgs) == 56);
+}
 /// ikd_fold_pick's flags: also write every id's logit, and (with ikd_pick's) the step's probability of the pick.
 const write_logits: u32 = 1;
 const write_mass: u32 = 2;
@@ -194,6 +203,91 @@ const Scratch = struct {
 
 comptime {
     std.debug.assert(@typeInfo(Scratch).@"struct".field_names.len == Scratch.made.len + 1);
+}
+
+/// Lazily allocated scratch for batched multi-stream holds (up to `max_batch` streams). Allocated on the first
+/// multi-stream hold without logit capture so single-stream workloads pay zero extra memory. Every field is a buffer,
+/// so a residency hook joins them all.
+const BatchScratch = struct {
+    h0: mtl.Buffer, // [max_batch][8][hidden]: rows 1..7 initialized to mask_embed per stream slot
+    h: mtl.Buffer, // [max_batch][8][hidden]
+    x: mtl.Buffer, // [max_batch][8][hidden]
+    y: mtl.Buffer, // [max_batch][8][hidden]
+    q: mtl.Buffer, // [max_batch][8][q_heads * head_dim]
+    qn: mtl.Buffer, // [max_batch][8][q_heads * head_dim]
+    att: mtl.Buffer, // [max_batch][8][q_heads * head_dim]
+    k: mtl.Buffer, // [max_batch][8][kv_width]
+    v: mtl.Buffer,
+    kb: mtl.Buffer,
+    vb: mtl.Buffer,
+    gate: mtl.Buffer, // [max_batch][8][inter]
+    up: mtl.Buffer,
+    act: mtl.Buffer,
+    hn: mtl.Buffer, // [max_batch][max_depth][hidden]: final norm of rows 1..7 per stream
+    base: mtl.Buffer, // [max_batch][max_depth][vocab]: unembedding output
+    latent: mtl.Buffer, // [max_batch][rank]
+    best: mtl.Buffer, // f32 [max_batch][groups]
+    best_id: mtl.Buffer, // u32 [max_batch][groups]
+    mass: mtl.Buffer, // f32 [max_batch][groups]
+
+    const made = [_][]const u8{ "h0", "h", "x", "y", "q", "qn", "att", "k", "v", "kb", "vb", "gate", "up", "act", "hn", "base", "latent", "best", "best_id", "mass" };
+
+    fn bytes(m: cfg.Mtp) [made.len]usize {
+        const rows = max_batch * block;
+        const h: usize = m.hidden;
+        const q_heads: usize = m.q_heads;
+        const inter: usize = m.inter;
+        const vocab: usize = m.vocab;
+        const groups = (vocab + pick_group - 1) / pick_group;
+        return .{
+            rows * h * 2,
+            rows * h * 2,
+            rows * h * 2,
+            rows * h * 2,
+            rows * q_heads * head_dim * 2,
+            rows * q_heads * head_dim * 2,
+            rows * q_heads * head_dim * 2,
+            rows * kv_width * 2,
+            rows * kv_width * 2,
+            rows * kv_width * 2,
+            rows * kv_width * 2,
+            rows * inter * 2,
+            rows * inter * 2,
+            rows * inter * 2,
+            max_batch * max_depth * h * 2,
+            max_batch * max_depth * vocab * 2,
+            max_batch * rank * 2,
+            max_batch * groups * 4,
+            max_batch * groups * 4,
+            max_batch * groups * 4,
+        };
+    }
+
+    fn init(device: mtl.Device, m: cfg.Mtp, w: *const dw.Weights) !BatchScratch {
+        const sz = bytes(m);
+        const h: usize = m.hidden;
+        var bs: BatchScratch = undefined;
+        var done: [made.len]bool = @splat(false);
+        errdefer inline for (made, 0..) |f, i| if (done[i]) @field(bs, f).deinit();
+        inline for (made, 0..) |f, i| {
+            @field(bs, f) = try device.buffer(@max(sz[i], 16), mtl.ResourceOptions.shared);
+            done[i] = true;
+        }
+        const rows = bs.h0.slice(u16, max_batch * block * h);
+        const mask = w.mask_embed.host(u16);
+        for (0..max_batch) |si| {
+            for (1..block) |r| @memcpy(rows[(si * block + r) * h ..][0..h], mask);
+        }
+        return bs;
+    }
+
+    fn deinit(bs: *BatchScratch) void {
+        inline for (made) |f| @field(bs.*, f).deinit();
+    }
+};
+
+comptime {
+    std.debug.assert(@typeInfo(BatchScratch).@"struct".field_names.len == BatchScratch.made.len);
 }
 
 /// One stream's draft state: each layer's context ring (slots 0..mtp.layers), the Markov feature of its newest absorbed
@@ -338,6 +432,8 @@ pub const Drafter = struct {
     options: Options,
     pipes: [kernel_names.len]mtl.Pipeline,
     s: Scratch,
+    /// Lazily allocated scratch for batched multi-stream holds; null while only single-stream holds run.
+    batch: ?BatchScratch = null,
     /// The tiles of the 8-bit projections, when the layers are quantized.
     qmv: ?Qmv = null,
     lanes: std.AutoHashMapUnmanaged(*Stream, *Lane) = .empty,
@@ -400,6 +496,7 @@ pub const Drafter = struct {
         var it = d.lanes.valueIterator();
         while (it.next()) |l| d.dropLane(l.*);
         d.lanes.deinit(d.gpa);
+        if (d.batch) |*bs| bs.deinit();
         d.s.deinit();
         if (d.qmv) |*q| q.deinit();
         for (d.pipes) |p| p.deinit();
@@ -453,15 +550,23 @@ pub const Drafter = struct {
     pub fn setResident(d: *Drafter, hook: ?mtl.ResidencySet.Follow) void {
         if (d.follow) |f| {
             mtl.resident.fields.apply(&d.s, f, false);
+            if (d.batch) |*bs| mtl.resident.fields.apply(bs, f, false);
             var it = d.lanes.valueIterator();
             while (it.next()) |l| d.applyLaneResident(l.*, f, false);
         }
         d.follow = hook;
         if (hook) |f| {
             mtl.resident.fields.apply(&d.s, f, true);
+            if (d.batch) |*bs| mtl.resident.fields.apply(bs, f, true);
             var it = d.lanes.valueIterator();
             while (it.next()) |l| d.applyLaneResident(l.*, f, true);
         }
+    }
+
+    fn ensureBatch(d: *Drafter) !void {
+        if (d.batch != null) return;
+        d.batch = try BatchScratch.init(d.device, d.mtp, d.w);
+        if (d.follow) |f| mtl.resident.fields.apply(&d.batch.?, f, true);
     }
 
     /// Device bytes one stream's draft state takes: layer rings, Markov feature, state, token row and probabilities.
@@ -485,13 +590,16 @@ pub const Drafter = struct {
         return d.w.bytes + d.w.fold_w.?.t.bytes + d.w.fold_b.?.bytes + d.extraBytes(streams);
     }
 
-    /// Device bytes of the scratch (with the step logits' buffer, if it is made).
+    /// Device bytes of the scratch (with the step logits' buffer and batch scratch, if made).
     pub fn scratchBytes(d: *const Drafter) usize {
         var total: usize = 0;
         inline for (@typeInfo(Scratch).@"struct".field_names) |name| {
             const v = @field(d.s, name);
             if (@TypeOf(v) == mtl.Buffer) total += v.length() else if (v) |buf| total += buf.length();
         }
+        if (d.batch) |bs| inline for (BatchScratch.made) |name| {
+            total += @field(bs, name).length();
+        };
         return total;
     }
 
@@ -718,6 +826,35 @@ pub const Drafter = struct {
         }
     }
 
+    /// Tensor-unit GEMM for bf16 dense projections when `d.model.chunk != null`.
+    fn gemm(d: *const Drafter, e: mtl.ComputeEncoder, w: wts.Dense, in: B, out: B, rows: usize) void {
+        dense_prefill.gemmRows(
+            e,
+            &d.model.chunk.?.dense,
+            .{ .buf = in.buf, .off = in.off },
+            .{ .buf = w.t.buffer, .off = w.t.offset, .n = w.n, .k = w.k },
+            .{ .buf = out.buf, .off = out.off },
+            .bf16,
+            rows,
+            w.n,
+        );
+    }
+
+    /// Batched projection over `rows` rows across concurrent streams: uses tensor-unit GEMM for bf16 when available
+    /// and `rows >= 16`, else `mv`.
+    fn mvBatch(d: *Drafter, e: mtl.ComputeEncoder, p: dw.Proj, in: B, out: B, rows: usize) !void {
+        switch (p) {
+            .bf16 => |x| {
+                if (d.model.chunk != null and rows >= 16) {
+                    d.gemm(e, x, in, out, rows);
+                } else {
+                    fwd.matvec(e, d.model, x, in, out, rows);
+                }
+            },
+            .q8 => |x| try d.qmv.?.encode(e, x, in, out, rows),
+        }
+    }
+
     /// log2 of the rotary base, as mlx's rope takes it (the angle is the position times 2^(-(i / 64) * this)).
     fn rope(d: *const Drafter) f32 {
         return @floatCast(std.math.log2(@as(f64, d.mtp.rope_theta)));
@@ -801,6 +938,117 @@ pub const Drafter = struct {
             const out = if (s.capture) |c| bo(c, k * vocab * 2) else b(s.latent);
             d.launch(e, .fold_pick, FoldArgs{ .vocab = @intCast(vocab), .valid = text.unpadded_vocab, .flags = flags, .cap = text.logit_cap }, &.{ bo(s.base, k * vocab * 2), b(s.latent), t(fold_w), t(fold_b), b(s.best), b(s.best_id), out, b(s.mass) }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
             d.launch(e, .pick, PickArgs{ .groups = @intCast(groups), .step = step, .flags = mass }, &.{ b(s.best), b(s.best_id), b(l.seq), b(s.mass), b(l.prob) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 });
+        }
+    }
+
+    /// Batched hold for `items` (`2 <= items.len <= max_batch`, no logit capture): shares draft-layer projections,
+    /// target unembedding, and fold-pick weight reads across all concurrent streams.
+    fn encodeHoldBatch(d: *Drafter, e: mtl.ComputeEncoder, items: []const dr.Hold) !void {
+        std.debug.assert(items.len >= 2 and items.len <= max_batch and d.s.capture == null);
+        const c = items.len;
+        const bs = &d.batch.?;
+        const m = d.model;
+        const text = &m.config.text;
+        const h: usize = d.mtp.hidden;
+        const h32: u32 = d.mtp.hidden;
+        const q_heads: usize = d.mtp.q_heads;
+        const q_heads32: u32 = d.mtp.q_heads;
+        const gqa: usize = q_heads / kv_heads;
+        const eps = d.mtp.eps;
+        const inter: usize = d.mtp.inter;
+        const total_rows = c * block;
+        const total_rows32: u32 = @intCast(total_rows);
+        var lanes_buf: [max_batch]*const Lane = undefined;
+        for (items, 0..) |it, si| {
+            const l = d.lanes.get(it.stream).?;
+            lanes_buf[si] = l;
+            d.glue(e, .embed, .{ .rows = 1, .width = h32, .eps = text.eps }, &.{ b(l.seq), t(m.weights.embed.t), t(m.weights.embed_norm), bo(bs.h0, si * block * h * 2) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, true);
+        }
+        const q_stride = block * q_heads * head_dim * 2;
+        const kv_stride = block * kv_width * 2;
+        const attn_scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, head_dim)));
+        const row_add = EwArgs{ .rows = total_rows32, .width = h32 };
+        var prev = b(bs.h0);
+        for (d.w.layers, 0..) |*layer, i| {
+            d.norm(e, layer.input, prev, b(bs.x), total_rows);
+            try d.mvBatch(e, layer.q, b(bs.x), b(bs.q), total_rows);
+            try d.mvBatch(e, layer.k, b(bs.x), b(bs.k), total_rows);
+            try d.mvBatch(e, layer.v, b(bs.x), b(bs.v), total_rows);
+            for (lanes_buf[0..c], 0..) |l, si| {
+                const end: u32 = @intCast(l.end);
+                const win: u32 = @intCast(@min(@as(u64, window), l.end - l.from));
+                const blocks = attnBlocks(end, win);
+                const q_off = si * q_stride;
+                const kv_off = si * kv_stride;
+                const pa = PrepArgs{ .rows = block, .heads = q_heads32, .kv = kv_heads, .pos = end, .ring = ring, .eps = eps, .base_log2 = d.rope() };
+                d.launch(e, .block_prep, pa, &.{ bo(bs.q, q_off), bo(bs.k, kv_off), bo(bs.v, kv_off), t(layer.q_norm), t(layer.k_norm), bo(bs.qn, q_off), bo(bs.kb, kv_off), bo(bs.vb, kv_off) }, .{ (q_heads + kv_heads + 7) / 8, block, 1 }, .{ 256, 1, 1 });
+                const aa = AttnArgs{ .heads = q_heads32, .kv = kv_heads, .end = end, .window = win, .ring = ring, .blocks = blocks, .scale = attn_scale };
+                d.launch(e, .attn_part, aa, &.{ bo(bs.qn, q_off), b(l.k[i]), b(l.v[i]), bo(bs.kb, kv_off), bo(bs.vb, kv_off), b(d.s.part) }, .{ kv_heads, 1, blocks }, .{ gqa * 32, 1, 1 });
+                d.launch(e, .attn_merge, aa, &.{ b(d.s.part), bo(bs.att, q_off) }, .{ q_heads, block, 1 }, .{ 32, 1, 1 });
+            }
+            try d.mvBatch(e, layer.o, b(bs.att), b(bs.y), total_rows);
+            d.launch(e, .add, row_add, &.{ prev, b(bs.y), b(bs.h) }, .{ h / 256, total_rows, 1 }, .{ 256, 1, 1 });
+            d.norm(e, layer.post, b(bs.h), b(bs.x), total_rows);
+            try d.mvBatch(e, layer.gate, b(bs.x), b(bs.gate), total_rows);
+            try d.mvBatch(e, layer.up, b(bs.x), b(bs.up), total_rows);
+            d.launch(e, .swiglu, EwArgs{ .rows = total_rows32, .width = @intCast(inter) }, &.{ b(bs.gate), b(bs.up), b(bs.act) }, .{ (inter + 255) / 256, total_rows, 1 }, .{ 256, 1, 1 });
+            try d.mvBatch(e, layer.down, b(bs.act), b(bs.y), total_rows);
+            d.launch(e, .add, row_add, &.{ b(bs.h), b(bs.y), b(bs.h) }, .{ h / 256, total_rows, 1 }, .{ 256, 1, 1 });
+            prev = b(bs.h);
+        }
+        // Final norm of rows 1..7 per stream into contiguous [c][max_depth][h], then one batched unembed.
+        for (0..c) |si| {
+            d.norm(e, d.w.norm, bo(bs.h, (si * block + 1) * h * 2), bo(bs.hn, si * max_depth * h * 2), max_depth);
+        }
+        const base_rows = c * max_depth;
+        if (m.chunk != null) {
+            d.gemm(e, m.weights.unembed, b(bs.hn), b(bs.base), base_rows);
+        } else {
+            fwd.matvec(e, m, m.weights.unembed, b(bs.hn), b(bs.base), base_rows);
+        }
+        const vocab: usize = text.vocab;
+        const groups = (vocab + pick_group - 1) / pick_group;
+        const fold_w = d.w.fold_w.?.t;
+        const fold_b = d.w.fold_b.?;
+        const mass: u32 = if (d.keepsProbabilities()) write_mass else 0;
+        var max_it_depth: u32 = 0;
+        for (items) |it| max_it_depth = @max(max_it_depth, it.depth);
+        for (0..max_it_depth) |k| {
+            const step: u32 = @intCast(k);
+            var act_si: [max_batch]u32 = undefined;
+            var na: usize = 0;
+            for (items, 0..) |it, si| {
+                if (step < it.depth) {
+                    act_si[na] = @intCast(si);
+                    na += 1;
+                }
+            }
+            for (0..na) |ai| {
+                const si: usize = act_si[ai];
+                const l = lanes_buf[si];
+                d.launch(e, .rnn_proj, ProjArgs{ .n = 3 * rank, .at = step, .hidden = h32 }, &.{ b(l.state), t(d.w.markov.w1.t), b(l.seq), bo(bs.hn, (si * max_depth + k) * h * 2), b(l.f_rnn), t(d.w.markov.rnn.t), t(d.w.markov.rnn_b), b(d.s.proj) }, .{ 3 * rank / 8, 1, 1 }, .{ 256, 1, 1 });
+                d.launch(e, .gru, {}, &.{ b(d.s.proj), b(l.state), b(l.state), bo(bs.latent, ai * rank * 2) }, .{ 1, 1, 1 }, .{ rank, 1, 1 });
+            }
+            if (na == 1) {
+                const si: usize = act_si[0];
+                d.launch(e, .fold_pick, FoldArgs{ .vocab = @intCast(vocab), .valid = text.unpadded_vocab, .flags = mass, .cap = text.logit_cap }, &.{ bo(bs.base, (si * max_depth + k) * vocab * 2), b(bs.latent), t(fold_w), t(fold_b), b(bs.best), b(bs.best_id), b(bs.latent), b(bs.mass) }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
+            } else {
+                var fa: FoldBatchArgs = .{
+                    .vocab = @intCast(vocab),
+                    .valid = text.unpadded_vocab,
+                    .flags = mass,
+                    .count = @intCast(na),
+                    .base_stride = @intCast(max_depth * vocab),
+                    .cap = text.logit_cap,
+                    .slot_map = @splat(0),
+                };
+                for (0..na) |ai| fa.slot_map[ai] = act_si[ai];
+                d.launch(e, .fold_pick_batch, fa, &.{ bo(bs.base, k * vocab * 2), b(bs.latent), t(fold_w), t(fold_b), b(bs.best), b(bs.best_id), b(bs.mass) }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
+            }
+            for (0..na) |ai| {
+                const l = lanes_buf[act_si[ai]];
+                d.launch(e, .pick, PickArgs{ .groups = @intCast(groups), .step = step, .flags = mass }, &.{ bo(bs.best, ai * groups * 4), bo(bs.best_id, ai * groups * 4), b(l.seq), bo(bs.mass, ai * groups * 4), b(l.prob) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 });
+            }
         }
     }
 
@@ -905,6 +1153,8 @@ pub const Drafter = struct {
             if (it.pending >= vocab) return error.InvalidDraftToken;
         }
         if (items.len == 0) return;
+        const use_batch = items.len > 1 and d.s.capture == null;
+        if (use_batch) try d.ensureBatch();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const began = now();
@@ -914,10 +1164,30 @@ pub const Drafter = struct {
             const l = d.lanes.get(it.stream).?;
             l.seq.slice(u32, block)[0] = it.pending;
             @memset(l.state.slice(u8, rank * 2), 0);
-            d.encodeHold(e, l, it) catch |err| {
-                e.end();
-                return err;
-            };
+        }
+        if (use_batch) {
+            var at: usize = 0;
+            while (at < items.len) {
+                const n = @min(items.len - at, max_batch);
+                const chunk = items[at..][0..n];
+                const res = if (chunk.len == 1)
+                    d.encodeHold(e, d.lanes.get(chunk[0].stream).?, chunk[0])
+                else
+                    d.encodeHoldBatch(e, chunk);
+                res catch |err| {
+                    e.end();
+                    return err;
+                };
+                at += n;
+            }
+        } else {
+            for (items) |it| {
+                const l = d.lanes.get(it.stream).?;
+                d.encodeHold(e, l, it) catch |err| {
+                    e.end();
+                    return err;
+                };
+            }
         }
         e.end();
         const committed = fwd.seconds();

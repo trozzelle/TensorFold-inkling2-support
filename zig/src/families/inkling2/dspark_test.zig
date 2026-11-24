@@ -1285,3 +1285,189 @@ test "inkling2 dspark mini: depth sweep 1 to 7 and kept draft rings restore full
     try dv.held(&.{&s_res}, &.{&got});
     try t.expectEqualSlices(u32, &want, &got);
 }
+
+/// Multi-stream batched hold (`count` in 2..8, mixed context lengths and depths, probabilities on) produces
+/// bit-identical proposals and probabilities to solo holds when `chunk == null`, and allocates no batch scratch
+/// until a multi-stream hold actually runs.
+fn batchHoldMatchesSolo(config_json: []const u8, bits: dw.Bits, counts: []const usize) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.makeFor(arena.allocator(), config_json, bits) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const d = try f.drafterWith(.{ .depth = 7, .probabilities = true });
+    defer d.deinit();
+    const dv = d.drafter();
+    const rb = d.tapRowBytes();
+    // Single-stream warm-up never allocates BatchScratch.
+    try t.expect(d.batch == null);
+    const max_c = 8;
+    const ns = [max_c]usize{ 12, 300, 1150, 64, 512, 1024, 255, 1300 };
+    const depths = [max_c]u32{ 7, 4, 6, 1, 5, 3, 7, 2 };
+    var taps: [max_c]mtl.Buffer = undefined;
+    var prompts: [max_c][]u32 = undefined;
+    var streams: [max_c]lanes.Stream = undefined;
+    for (0..max_c) |i| {
+        taps[i] = try tapsBufferFor(f.device, ns[i] + 1, rb, 101 + i);
+        prompts[i] = try gpa.alloc(u32, ns[i]);
+        for (prompts[i], 0..) |*x, j| x.* = tokenAt(j + 7 * i);
+        streams[i] = try lanes.Stream.init(gpa, .{ .id = "batch", .prompt = prompts[i], .max_new = 8 });
+    }
+    defer for (0..max_c) |i| {
+        taps[i].deinit();
+        gpa.free(prompts[i]);
+        streams[i].deinit(gpa);
+    };
+    var alone_props: [max_c][7]u32 = undefined;
+    var alone_probs: [max_c][7]f64 = undefined;
+    for (0..max_c) |i| {
+        try dv.open(&streams[i]);
+        defer dv.release(&streams[i]);
+        try dv.absorb(&.{.{ .stream = &streams[i], .features = featuresFor(taps[i], 0, ns[i], rb), .start = 0, .follow = &.{}, .prompt = true }});
+        try dv.hold(&.{.{ .stream = &streams[i], .pending = tokenAt(ns[i] + i), .position = ns[i] + 1, .depth = depths[i] }});
+        try dv.held(&.{&streams[i]}, &.{alone_props[i][0..depths[i]]});
+        try t.expect(try dv.chances(&streams[i], alone_probs[i][0..depths[i]]));
+    }
+    // Solo holds alone still allocate zero batch scratch.
+    try t.expect(d.batch == null);
+    var res_c: Counter = .{};
+    d.setResident(res_c.follow());
+    defer {
+        d.setResident(null);
+        std.debug.assert(res_c.joined == res_c.left and res_c.joined_bytes == res_c.left_bytes);
+    }
+    const base_scratch = d.scratchBytes();
+    for (counts) |count| {
+        var absorbs: [max_c]dr.Absorb = undefined;
+        var holds: [max_c]dr.Hold = undefined;
+        for (0..count) |i| {
+            try dv.open(&streams[i]);
+            absorbs[i] = .{ .stream = &streams[i], .features = featuresFor(taps[i], 0, ns[i], rb), .start = 0, .follow = &.{}, .prompt = true };
+            holds[i] = .{ .stream = &streams[i], .pending = tokenAt(ns[i] + i), .position = ns[i] + 1, .depth = depths[i] };
+        }
+        defer for (0..count) |i| dv.release(&streams[i]);
+        try dv.absorb(absorbs[0..count]);
+        try dv.hold(holds[0..count]);
+        try t.expect(d.batch != null);
+        try t.expect(d.scratchBytes() > base_scratch);
+        for (0..count) |i| {
+            var got_props: [7]u32 = undefined;
+            var got_probs: [7]f64 = undefined;
+            try dv.held(&.{&streams[i]}, &.{got_props[0..depths[i]]});
+            try t.expect(try dv.chances(&streams[i], got_probs[0..depths[i]]));
+            try t.expectEqualSlices(u32, alone_props[i][0..depths[i]], got_props[0..depths[i]]);
+            try t.expectEqualSlices(f64, alone_probs[i][0..depths[i]], got_probs[0..depths[i]]);
+        }
+    }
+}
+
+test "inkling2 dspark: batched multi-stream hold matches solo holds bit-for-bit across bf16 and 8-bit" {
+    for ([_]dw.Bits{ .sixteen, .eight }) |bits| {
+        try batchHoldMatchesSolo(config_test.real, bits, &.{ 2, 4, 8 });
+    }
+}
+
+test "inkling2 dspark mini: batched multi-stream hold matches solo holds bit-for-bit across bf16 and 8-bit" {
+    for ([_]dw.Bits{ .sixteen, .eight }) |bits| {
+        try batchHoldMatchesSolo(config_test.mini, bits, &.{ 2, 4, 8 });
+    }
+}
+
+test "inkling2 dspark: batched multi-stream hold with tensor-unit GEMM is valid and batch-size invariant" {
+    const Chunk = @import("model.zig").Chunk;
+    for ([_][]const u8{ config_test.mini, config_test.real }) |cfg_json| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const f = Fixture.makeFor(arena.allocator(), cfg_json, .sixteen) catch |err| switch (err) {
+            error.NoDevice => return error.SkipZigTest,
+            else => return err,
+        };
+        defer f.deinit();
+        if (!f.device.tensorUnits()) return;
+        f.model.chunk = try Chunk.initFor(f.device, gpa, f.model.config.text.local.q, f.model.config.text.local.kv, f.model.config.quant);
+        defer {
+            f.model.chunk.?.deinit();
+            f.model.chunk = null;
+        }
+        const d = try f.drafterWith(.{ .depth = 7, .probabilities = true });
+        defer d.deinit();
+        const dv = d.drafter();
+        const rb = d.tapRowBytes();
+        const max_c = 8;
+        const ns = [max_c]usize{ 24, 300, 1100, 80, 500, 1024, 255, 1250 };
+        const depths = [max_c]u32{ 7, 4, 6, 2, 5, 3, 7, 1 };
+        var taps: [max_c]mtl.Buffer = undefined;
+        var prompts: [max_c][]u32 = undefined;
+        var streams: [max_c]lanes.Stream = undefined;
+        for (0..max_c) |i| {
+            taps[i] = try tapsBufferFor(f.device, ns[i] + 1, rb, 201 + i);
+            prompts[i] = try gpa.alloc(u32, ns[i]);
+            for (prompts[i], 0..) |*x, j| x.* = tokenAt(j + 11 * i);
+            streams[i] = try lanes.Stream.init(gpa, .{ .id = "gemm-batch", .prompt = prompts[i], .max_new = 8 });
+        }
+        defer for (0..max_c) |i| {
+            taps[i].deinit();
+            gpa.free(prompts[i]);
+            streams[i].deinit(gpa);
+        };
+        var solo_probs: [4][7]f64 = undefined;
+        for (0..4) |i| {
+            try dv.open(&streams[i]);
+            defer dv.release(&streams[i]);
+            try dv.absorb(&.{.{ .stream = &streams[i], .features = featuresFor(taps[i], 0, ns[i], rb), .start = 0, .follow = &.{}, .prompt = true }});
+            try dv.hold(&.{.{ .stream = &streams[i], .pending = tokenAt(ns[i] + i), .position = ns[i] + 1, .depth = depths[i] }});
+            try t.expect(try dv.chances(&streams[i], solo_probs[i][0..depths[i]]));
+        }
+        // Run C = 4 and C = 8 on the tensor-unit GEMM path: first 4 streams must be bit-identical across batch sizes,
+        // and all tokens/probabilities must be valid and close to solo matvec probabilities.
+        var props4: [4][7]u32 = undefined;
+        var probs4: [4][7]f64 = undefined;
+        {
+            var absorbs: [4]dr.Absorb = undefined;
+            var holds: [4]dr.Hold = undefined;
+            for (0..4) |i| {
+                try dv.open(&streams[i]);
+                absorbs[i] = .{ .stream = &streams[i], .features = featuresFor(taps[i], 0, ns[i], rb), .start = 0, .follow = &.{}, .prompt = true };
+                holds[i] = .{ .stream = &streams[i], .pending = tokenAt(ns[i] + i), .position = ns[i] + 1, .depth = depths[i] };
+            }
+            defer for (0..4) |i| dv.release(&streams[i]);
+            try dv.absorb(&absorbs);
+            try dv.hold(&holds);
+            for (0..4) |i| {
+                try dv.held(&.{&streams[i]}, &.{props4[i][0..depths[i]]});
+                try t.expect(try dv.chances(&streams[i], probs4[i][0..depths[i]]));
+                for (props4[i][0..depths[i]]) |tok| try t.expect(tok < valid);
+                for (probs4[i][0..depths[i]], solo_probs[i][0..depths[i]]) |got, want| {
+                    try t.expect(got > 0 and got <= 1);
+                    try t.expectApproxEqRel(want, got, 0.05);
+                }
+            }
+        }
+        {
+            var absorbs: [max_c]dr.Absorb = undefined;
+            var holds: [max_c]dr.Hold = undefined;
+            for (0..max_c) |i| {
+                try dv.open(&streams[i]);
+                absorbs[i] = .{ .stream = &streams[i], .features = featuresFor(taps[i], 0, ns[i], rb), .start = 0, .follow = &.{}, .prompt = true };
+                holds[i] = .{ .stream = &streams[i], .pending = tokenAt(ns[i] + i), .position = ns[i] + 1, .depth = depths[i] };
+            }
+            defer for (0..max_c) |i| dv.release(&streams[i]);
+            try dv.absorb(&absorbs);
+            try dv.hold(&holds);
+            for (0..max_c) |i| {
+                var got_props: [7]u32 = undefined;
+                var got_probs: [7]f64 = undefined;
+                try dv.held(&.{&streams[i]}, &.{got_props[0..depths[i]]});
+                try t.expect(try dv.chances(&streams[i], got_probs[0..depths[i]]));
+                for (got_props[0..depths[i]]) |tok| try t.expect(tok < valid);
+                for (got_probs[0..depths[i]]) |p| try t.expect(p > 0 and p <= 1);
+                if (i < 4) {
+                    try t.expectEqualSlices(u32, props4[i][0..depths[i]], got_props[0..depths[i]]);
+                    try t.expectEqualSlices(f64, probs4[i][0..depths[i]], got_probs[0..depths[i]]);
+                }
+            }
+        }
+    }
+}
