@@ -50,3 +50,29 @@ test "inkling2 draft weights: alpha is the bf16 of a softmax over each fuse_weig
         }
     }
 }
+
+test "inkling2 draft weights: alpha softmax matches host at Mini's 4-row 4-tap shape" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: config.Why = .{};
+    const c = try config.parse(a, config_test.mini, &why);
+    const m = c.mtp.?;
+    const rows: usize = m.layers + 1;
+    const cols: usize = m.taps_n;
+    try t.expectEqual(@as(usize, 4), rows);
+    try t.expectEqual(@as(usize, 4), cols);
+    const fuse = try a.alloc(u16, rows * cols);
+    var prng = std.Random.DefaultPrng.init(0x5eed2);
+    for (fuse) |*v| v.* = bf16Of((prng.random().float(f32) - 0.5) * 6);
+    var got: [max_rows][max_taps]u16 = undefined;
+    softmaxRows(fuse, rows, cols, &got);
+    for (0..rows) |r| {
+        var sum: f32 = 0;
+        for (0..cols) |j| {
+            try t.expectEqual(hostSoftmaxBf16(fuse[r * cols ..][0..cols], j), got[r][j]);
+            sum += f32Of(got[r][j]);
+        }
+        try t.expectApproxEqAbs(@as(f32, 1), sum, 0.02);
+    }
+}

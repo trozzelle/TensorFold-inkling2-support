@@ -150,6 +150,9 @@ test "inkling2 draft weights: a tiny mtp.safetensors loads with every shape chec
         try t.expectEqual(want[r][j], w.alpha[r][j]);
         try t.expectEqual(want[r][j], packed_alpha[r * w.taps + j]);
     };
+    const packed_norms = w.dflare_norms.slice(u16, w.rows * m.hidden);
+    for (w.layers, 0..) |layer, i| try t.expectEqualSlices(u16, layer.dflare.host(u16), packed_norms[i * m.hidden ..][0..m.hidden]);
+    try t.expectEqualSlices(u16, w.markov.dflare.host(u16), packed_norms[w.layers.len * m.hidden ..][0..m.hidden]);
     try t.expect(w.fold_w == null and w.fold_b == null);
     try t.expectEqual(dw.Bits.sixteen, w.bits);
     // the file's shard is all the checkpoint holds, and the weights record its bytes for the budget
@@ -223,12 +226,33 @@ test "inkling2 draft weights: the real mtp.safetensors at 8 bits holds the layer
 }
 
 test "inkling2 draft weights: the setting's text is 8 or 16 and unset or blank means 8" {
-    for ([_]?[]const u8{ null, "", " \t" }) |text| try t.expectEqual(dw.Bits.eight, try dw.Bits.parse(text));
+    for ([_]?[]const u8{ null, "", " \t" }) |text| {
+        try t.expectEqual(dw.Bits.eight, try dw.Bits.parse(text));
+        try t.expectEqual(@as(?dw.Bits, null), try dw.Bits.parseOpt(text));
+    }
     try t.expectEqual(dw.Bits.eight, try dw.Bits.parse("8"));
+    try t.expectEqual(@as(?dw.Bits, .eight), try dw.Bits.parseOpt(" 8 "));
     try t.expectEqual(dw.Bits.sixteen, try dw.Bits.parse(" 16 "));
-    for ([_][]const u8{ "0", "4", "bf16", "08", "16.0", "8 bit", "-8", "32" }) |text| try t.expectError(error.BadDraftBits, dw.Bits.parse(text));
+    try t.expectEqual(@as(?dw.Bits, .sixteen), try dw.Bits.parseOpt(" \t16 "));
+    for ([_][]const u8{ "0", "4", "bf16", "08", "16.0", "8 bit", "-8", "32" }) |text| {
+        try t.expectError(error.BadDraftBits, dw.Bits.parse(text));
+        try t.expectError(error.BadDraftBits, dw.Bits.parseOpt(text));
+    }
     try t.expectEqualStrings("8-bit", dw.Bits.eight.label());
     try t.expectEqualStrings("bf16", dw.Bits.sixteen.label());
+}
+
+test "inkling2 draft weights: Bits.defaultFor selects bf16 for Mini and 8-bit for Small" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: config.Why = .{};
+    const mini = try config.parse(a, config_test.mini, &why);
+    const small = try config.parse(a, config_test.real, &why);
+    const tiny = try config.parse(a, config_test.tiny, &why);
+    try t.expectEqual(dw.Bits.sixteen, dw.Bits.defaultFor(mini.mtp.?));
+    try t.expectEqual(dw.Bits.eight, dw.Bits.defaultFor(small.mtp.?));
+    try t.expectEqual(dw.Bits.sixteen, dw.Bits.defaultFor(tiny.mtp.?));
 }
 
 test "inkling2 draft weights: at 8 bits a tiny file's nine projections a layer are quantized buffers equal to the quantizer's, the bf16 never resident" {
