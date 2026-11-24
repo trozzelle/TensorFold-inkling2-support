@@ -38,7 +38,7 @@ const MixArgs = extern struct { rows: u32, width: u32, tap_stride: u32, mix_stri
 const PrepArgs = extern struct { rows: u32, heads: u32, kv: u32, pos: u32, ring: u32, eps: f32, base_log2: f32 };
 const AttnArgs = extern struct { heads: u32, kv: u32, end: u32, window: u32, ring: u32, blocks: u32, scale: f32 };
 const EwArgs = extern struct { rows: u32, width: u32 };
-const ProjArgs = extern struct { n: u32, at: u32 };
+const ProjArgs = extern struct { n: u32, at: u32, hidden: u32 };
 const FoldArgs = extern struct { vocab: u32, valid: u32, flags: u32, cap: f32 };
 const PickArgs = extern struct { groups: u32, step: u32, flags: u32 };
 const TArgs = extern struct { vocab: u32 };
@@ -109,6 +109,9 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseMass(c, r);
     try caseFoldT(c, r);
     try caseQmv(c, r);
+    try caseMixMini(g, r);
+    try caseAttnMini(c, r);
+    try caseProjMini(c, r);
     try timeAttn(c, r);
 }
 
@@ -168,13 +171,13 @@ fn pin(c: *h.Check, off: usize, of: usize) void {
 }
 
 fn softmaxBf16(r: std.Random, out: []u16) void {
-    var e: [TAPS]f64 = undefined;
+    var e: [16]f64 = undefined;
     var z: f64 = 0;
-    for (&e) |*x| {
+    for (e[0..out.len]) |*x| {
         x.* = @exp(r.float(f64) * 3 - 1.5);
         z += x.*;
     }
-    for (out, e) |*o, x| o.* = h.bf(x / z);
+    for (out, e[0..out.len]) |*o, x| o.* = h.bf(x / z);
 }
 
 // ---- ikd_mix ----
@@ -186,20 +189,15 @@ fn caseMix(c: Ctx, r: std.Random) !void {
     const rows = 3;
     const taps = try g.buf(rows * TAPS * H * 2);
     const alpha = try g.buf(MIXES * TAPS * 2);
+    const norms = try g.buf(MIXES * H * 2);
     const out = try g.buf(MIXES * rows * H * 2);
-    var wb: [MIXES]mtl.Buffer = undefined;
-    for (&wb) |*w| w.* = try g.buf(H * 2);
-    defer {
-        for ([_]mtl.Buffer{ taps, alpha, out }) |b| b.deinit();
-        for (wb) |b| b.deinit();
-    }
+    defer for ([_]mtl.Buffer{ taps, alpha, norms, out }) |b| b.deinit();
     const tv = h.fill16(taps, rows * TAPS * H, r, 3.0);
     const av = alpha.slice(u16, MIXES * TAPS);
     for (0..MIXES) |m| softmaxBf16(r, av[m * TAPS ..][0..TAPS]);
-    var wv: [MIXES][]u16 = undefined;
-    for (&wv, wb) |*s, w| s.* = h.fill16(w, H, r, 1.5);
+    const wv = h.fill16(norms, MIXES * H, r, 1.5);
     const a: MixArgs = .{ .rows = rows, .width = H, .tap_stride = TAPS * H, .mix_stride = rows * H, .eps = 1e-6 };
-    const slots = [_]h.Slot{ bytes(&a), bs(taps), bs(alpha), bs(wb[0]), bs(wb[1]), bs(wb[2]), bs(wb[3]), bs(wb[4]), bs(wb[5]), bs(out) };
+    const slots = [_]h.Slot{ bytes(&a), bs(taps), bs(alpha), bs(norms), bs(out) };
     var ch: h.Check = .{ .name = "mix" };
     var off: usize = 0;
     const saved = try std.heap.page_allocator.alloc(u8, MIXES * rows * H * 2);
@@ -226,7 +224,7 @@ fn caseMix(c: Ctx, r: std.Random) !void {
             }
             const inv = 1 / @sqrt(ss / H + 1e-6);
             for (0..H) |i| {
-                const w = h.fb(wv[m][i]);
+                const w = h.fb(wv[m * H + i]);
                 pinnedAbs(&ch, &off, ys[(m * rows + t) * H + i], w * (x[i] * inv), @abs(w) * inv * mag[i] * 4e-7);
             }
         };
@@ -768,7 +766,7 @@ fn caseProj(c: Ctx, r: std.Random) !void {
     const sq = seq.slice(u32, 8);
     @memset(sq, 0);
     sq[3] = 37;
-    const a: ProjArgs = .{ .n = n, .at = 3 };
+    const a: ProjArgs = .{ .n = n, .at = 3, .hidden = H };
     try c.go("ikd_rnn_proj", &.{ bytes(&a), bs(state), bo(table, 8), bs(seq), bs(hid), bs(frnn), bo(w, 8), bs(bias), bs(proj) }, .{ n / 8, 1, 1 }, .{ 256, 1, 1 });
     var ch: h.Check = .{ .name = "rnn_proj" };
     var off: usize = 0;
@@ -1369,4 +1367,224 @@ fn timeQmv(c: Ctx, qmv: *Qmv, n: usize, k: usize, r: std.Random) !void {
         }
     }
     std.debug.print("time qmv {d} x {d}, 8 rows: 8-bit {d:.2} us, bf16 matvec {d:.2} us\n", .{ n, k, q8 / reps * 1e6, bf / reps * 1e6 });
+}
+
+// ---- Mini shapes (H=2304, Q=24, KV=8, G=3, 3 layers, 4 taps) ----
+
+/// Tap mix at Mini's shape (4 taps, 4 mixes, width 2304, threadgroup 160 / 320) against FP64 + NaN containment.
+fn caseMixMini(g: *const h.Gpu, r: std.Random) !void {
+    const gpa = std.heap.page_allocator;
+    const src = try tf.inkling2.dspark.sourceFor(gpa, 4);
+    defer gpa.free(src);
+    const lib = try g.library(src);
+    defer lib.deinit();
+    const c: Ctx = .{ .g = g, .lib = lib };
+    const hm = 2304;
+    const tm = 4;
+    const mm = 4;
+    const rows = 3;
+    const taps = try g.buf(rows * tm * hm * 2);
+    const alpha = try g.buf(mm * tm * 2);
+    const norms = try g.buf(mm * hm * 2);
+    const out = try g.buf(mm * rows * hm * 2);
+    defer for ([_]mtl.Buffer{ taps, alpha, norms, out }) |b| b.deinit();
+    const tv = h.fill16(taps, rows * tm * hm, r, 3.0);
+    const av = alpha.slice(u16, mm * tm);
+    for (0..mm) |m| softmaxBf16(r, av[m * tm ..][0..tm]);
+    const wv = h.fill16(norms, mm * hm, r, 1.5);
+    const a: MixArgs = .{ .rows = rows, .width = hm, .tap_stride = tm * hm, .mix_stride = rows * hm, .eps = 1e-6 };
+    const slots = [_]h.Slot{ bytes(&a), bs(taps), bs(alpha), bs(norms), bs(out) };
+    var ch: h.Check = .{ .name = "mix mini (4 taps, H=2304)" };
+    var off: usize = 0;
+    const saved = try gpa.alloc(u8, mm * rows * hm * 2);
+    defer gpa.free(saved);
+    for ([_]usize{ 160, 320 }) |nt| {
+        @memset(out.slice(u8, mm * rows * hm * 2), 0xff);
+        try c.go("ikd_mix", &slots, .{ rows, mm, 1 }, .{ nt, 1, 1 });
+        const ys = out.slice(u16, mm * rows * hm);
+        for (0..mm) |m| for (0..rows) |t| {
+            var x: [hm]f64 = undefined;
+            var mag: [hm]f64 = undefined;
+            var ss: f64 = 0;
+            for (0..hm) |i| {
+                var s: f64 = 0;
+                var a_s: f64 = 0;
+                for (0..tm) |j| {
+                    const term = h.fb(av[m * tm + j]) * h.fb(tv[(t * tm + j) * hm + i]);
+                    s += term;
+                    a_s += @abs(term);
+                }
+                x[i] = s;
+                mag[i] = a_s;
+                ss += s * s;
+            }
+            const inv = 1 / @sqrt(ss / hm + 1e-6);
+            for (0..hm) |i| {
+                const w = h.fb(wv[m * hm + i]);
+                pinnedAbs(&ch, &off, ys[(m * rows + t) * hm + i], w * (x[i] * inv), @abs(w) * inv * mag[i] * 4e-7);
+            }
+        };
+        if (nt == 160) @memcpy(saved, out.slice(u8, mm * rows * hm * 2));
+    }
+    pin(&ch, off, 2 * mm * rows * hm);
+    tv[(1 * tm + 2) * hm + 13] = 0x7fc0;
+    try c.go("ikd_mix", &slots, .{ rows, mm, 1 }, .{ 160, 1, 1 });
+    for (0..mm) |m| for ([_]usize{ 0, 2 }) |t| {
+        const at = (m * rows + t) * hm * 2;
+        ch.same(out.slice(u8, mm * rows * hm * 2)[at..][0 .. hm * 2], saved[at..][0 .. hm * 2]);
+    };
+    try ch.done();
+}
+
+/// Block attention at Mini's GQA=3 geometry (24 q heads, 8 kv heads, 96 threads per group) against FP64.
+fn caseAttnMini(c: Ctx, r: std.Random) !void {
+    const g = c.g;
+    const hq = 24;
+    const grp = hq / KV;
+    const q = try g.buf(ROWS * hq * D * 2);
+    const rk = try g.buf(SLOTS * KV * D * 2);
+    const rv = try g.buf(SLOTS * KV * D * 2);
+    const bk = try g.buf(ROWS * KV * D * 2);
+    const bv = try g.buf(ROWS * KV * D * 2);
+    const part = try g.buf(ROWS * hq * MAX_BLOCKS * SLOT * 4);
+    const att = try g.buf(ROWS * hq * D * 2);
+    defer for ([_]mtl.Buffer{ q, rk, rv, bk, bv, part, att }) |b| b.deinit();
+    const qv = h.fill16(q, ROWS * hq * D, r, 2.5);
+    const rkv = mirrored(h.fill16(rk, SLOTS * KV * D, r, 2.5));
+    const rvv = mirrored(h.fill16(rv, SLOTS * KV * D, r, 1.0));
+    const bkv = h.fill16(bk, ROWS * KV * D, r, 2.5);
+    const bvv = h.fill16(bv, ROWS * KV * D, r, 1.0);
+    const alloc = std.heap.page_allocator;
+    const orig_k = try alloc.dupe(u16, rkv);
+    const orig_v = try alloc.dupe(u16, rvv);
+    const kf = try alloc.alloc(f64, RING * KV * D);
+    const vf = try alloc.alloc(f64, RING * KV * D);
+    const qf = try alloc.alloc(f64, ROWS * hq * D);
+    const bkf = try alloc.alloc(f64, ROWS * KV * D);
+    const bvf = try alloc.alloc(f64, ROWS * KV * D);
+    const first = try alloc.alloc(u8, ROWS * hq * D * 2);
+    defer {
+        alloc.free(orig_k);
+        alloc.free(orig_v);
+        for ([_][]f64{ kf, vf, qf, bkf, bvf }) |s| alloc.free(s);
+        alloc.free(first);
+    }
+    for (kf, rkv[0 .. RING * KV * D]) |*o, v| o.* = h.fb(v);
+    for (vf, rvv[0 .. RING * KV * D]) |*o, v| o.* = h.fb(v);
+    for (qf, qv) |*o, v| o.* = h.fb(v);
+    for (bkf, bkv) |*o, v| o.* = h.fb(v);
+    for (bvf, bvv) |*o, v| o.* = h.fb(v);
+    const scale = 1 / @sqrt(@as(f64, D));
+    var scores: [RING + ROWS]f64 = undefined;
+    var ch: h.Check = .{ .name = "attention mini (Q=24, GQA=3)" };
+    for ([_]u32{ 0, 1, 7, 255, 256, 1023, 1500, 5000 }) |end| {
+        const lo = blocksOf(end).lo;
+        var live: [RING]bool = @splat(false);
+        for (lo..end) |p| live[p % RING] = true;
+        for (0..RING) |s| for ([_][]u16{ rkv, rvv }, [_][]const u16{ orig_k, orig_v }, [_]u16{ 0x7f7f, NAN16 }) |dst, src, poison| {
+            const row = s * KV * D;
+            if (live[s]) @memcpy(dst[row..][0 .. KV * D], src[row..][0 .. KV * D]) else @memset(dst[row..][0 .. KV * D], poison);
+        };
+        _ = mirrored(rkv);
+        _ = mirrored(rvv);
+        const a: AttnArgs = .{ .heads = hq, .kv = KV, .end = end, .window = WINDOW, .ring = RING, .blocks = blocksOf(end).n, .scale = @floatCast(scale) };
+        @memset(part.slice(f32, ROWS * hq * a.blocks * SLOT), std.math.nan(f32));
+        @memset(att.slice(u16, ROWS * hq * D), NAN16);
+        try c.go("ikd_attn_part", &.{ bytes(&a), bs(q), bs(rk), bs(rv), bs(bk), bs(bv), bs(part) }, .{ KV, 1, a.blocks }, .{ grp * 32, 1, 1 });
+        try c.go("ikd_attn_merge", &.{ bytes(&a), bs(part), bs(att) }, .{ hq, ROWS, 1 }, .{ 32, 1, 1 });
+        @memcpy(first, att.slice(u8, ROWS * hq * D * 2));
+        const got = att.slice(u16, ROWS * hq * D);
+        for (0..ROWS) |t| for (0..hq) |hd| {
+            const grp_idx = hd / grp;
+            const qh = qf[(t * hq + hd) * D ..][0..D];
+            var n: usize = 0;
+            var m: f64 = -std.math.inf(f64);
+            for (lo..end) |p| {
+                const kr = kf[((p % RING) * KV + grp_idx) * D ..][0..D];
+                var s: f64 = 0;
+                for (qh, kr) |qd, kd| s += qd * kd;
+                scores[n] = s * scale;
+                m = @max(m, scores[n]);
+                n += 1;
+            }
+            for (0..ROWS) |j| {
+                const kr = bkf[(j * KV + grp_idx) * D ..][0..D];
+                var s: f64 = 0;
+                for (qh, kr) |qd, kd| s += qd * kd;
+                scores[n] = s * scale;
+                m = @max(m, scores[n]);
+                n += 1;
+            }
+            var z: f64 = 0;
+            var o: [D]f64 = @splat(0);
+            n = 0;
+            for (lo..end) |p| {
+                const w = @exp(scores[n] - m);
+                n += 1;
+                z += w;
+                const vr = vf[((p % RING) * KV + grp_idx) * D ..][0..D];
+                for (&o, vr) |*od, vd| od.* += w * vd;
+            }
+            for (0..ROWS) |j| {
+                const w = @exp(scores[n] - m);
+                n += 1;
+                z += w;
+                const vr = bvf[(j * KV + grp_idx) * D ..][0..D];
+                for (&o, vr) |*od, vd| od.* += w * vd;
+            }
+            for (0..D) |d| close(&ch, got[(t * hq + hd) * D + d], o[d] / z, 2, 1e-6);
+        };
+        try c.go("ikd_attn_part", &.{ bytes(&a), bs(q), bs(rk), bs(rv), bs(bk), bs(bv), bs(part) }, .{ KV, 1, a.blocks }, .{ grp * 32, 1, 1 });
+        try c.go("ikd_attn_merge", &.{ bytes(&a), bs(part), bs(att) }, .{ hq, ROWS, 1 }, .{ 32, 1, 1 });
+        ch.same(att.slice(u8, ROWS * hq * D * 2), first);
+    }
+    try ch.done();
+}
+
+/// Markov projection at Mini's hidden width (H=2304, IN=5120) against FP64.
+fn caseProjMini(c: Ctx, r: std.Random) !void {
+    const g = c.g;
+    const hm = 2304;
+    const inm = 2 * RANK + 2 * hm;
+    const n = 3 * RANK;
+    const tokens = 40;
+    const w = try g.buf(n * inm * 2 + 16);
+    const bias = try g.buf(n * 2);
+    const table = try g.buf(tokens * RANK * 2 + 16);
+    const state = try g.buf(RANK * 2);
+    const hid = try g.buf(hm * 2);
+    const frnn = try g.buf(hm * 2);
+    const seq = try g.buf(8 * 4);
+    const proj = try g.buf(n * 2);
+    defer for ([_]mtl.Buffer{ w, bias, table, state, hid, frnn, seq, proj }) |b| b.deinit();
+    const wv = h.fill16(w, n * inm + 8, r, 0.15)[4..];
+    const bv = h.fill16(bias, n, r, 1.0);
+    const tv = h.fill16(table, tokens * RANK + 8, r, 1.0)[4..];
+    const sv = h.fill16(state, RANK, r, 1.0);
+    const hv = h.fill16(hid, hm, r, 2.0);
+    const fv = h.fill16(frnn, hm, r, 2.0);
+    const sq = seq.slice(u32, 8);
+    @memset(sq, 0);
+    sq[2] = 19;
+    const a: ProjArgs = .{ .n = n, .at = 2, .hidden = hm };
+    try c.go("ikd_rnn_proj", &.{ bytes(&a), bs(state), bo(table, 8), bs(seq), bs(hid), bs(frnn), bo(w, 8), bs(bias), bs(proj) }, .{ n / 8, 1, 1 }, .{ 256, 1, 1 });
+    var ch: h.Check = .{ .name = "rnn_proj mini (H=2304)" };
+    var off: usize = 0;
+    var x: [inm]f64 = undefined;
+    for (0..RANK) |i| x[i] = h.fb(sv[i]);
+    for (0..RANK) |i| x[RANK + i] = h.fb(tv[19 * RANK + i]);
+    for (0..hm) |i| x[2 * RANK + i] = h.fb(hv[i]);
+    for (0..hm) |i| x[2 * RANK + hm + i] = h.fb(fv[i]);
+    for (0..n) |j| {
+        var s: f64 = 0;
+        var mag: f64 = @abs(h.fb(bv[j]));
+        for (0..inm) |k| {
+            const term = h.fb(wv[j * inm + k]) * x[k];
+            s += term;
+            mag += @abs(term);
+        }
+        pinnedAbs(&ch, &off, proj.slice(u16, n)[j], s + h.fb(bv[j]), mag * 4e-6);
+    }
+    pin(&ch, off, n);
+    try ch.done();
 }

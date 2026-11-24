@@ -3,11 +3,11 @@
 // fold's pick. Its own library, built with precise math functions. The dense projections are not here: they are the target's
 // bf16 matvec kernels.
 //
-// Shapes: width 4608, 48 q heads over 8 kv heads of 128 dims, a block of 8 rows, Markov rank 256, vocabulary 201024. Layouts, bf16
-// unless stated: taps [rows][8][4608]; mixed rows [mix][rows][4608] (mixes 0-4 the layers' context rows, 5 the Markov feature);
-// ring K and V [slot][8][128] (a.ring + IKD_PAD slots); block q [8][48][128]; block K and V [8][8][128]; attention partials f32
-// [row][head][block][130]. Tensors from the checkpoint file are 8-byte aligned only: kernels read them in bfloat4 pieces or less.
-// Every argument struct is u32 and f32 fields in the order declared here.
+// Shapes: hidden width a multiple of 256, q heads = gqa * kv heads (gqa in {3, 6}, kv = 8, head dim 128), block of 8
+// rows, Markov rank 256. Layouts, bf16 unless stated: taps [rows][IKD_TAPS][width]; mixed rows [mix][rows][width]
+// (draft layers' context rows, then the Markov feature); ring K and V [slot][kv][128] (a.ring + IKD_PAD slots); block q
+// [8][heads][128]; block K and V [8][kv][128]; attention partials f32 [row][head][block][130]. Checkpoint tensors are
+// 8-byte aligned only: kernels read them in bfloat4 pieces or less. Argument structs are u32 and f32 fields in order.
 //
 // The drafter's flow over these kernels:
 //   absorb: ikd_mix; per layer the k_ctx and v_ctx matvecs, ikd_ctx_prep.
@@ -44,24 +44,24 @@ inline float ikd_sigmoid(float x) {
 
 // ---- tap mix -----------------------------------------------------------------------------------------------------------
 
-constant uint IKD_TAPS = 8; // taps a row: the target layers 5, 11, .., 41 and the final norm
+#ifndef IKD_TAPS
+#define IKD_TAPS 8
+#endif
 
 struct ikd_mix_args { uint rows, width, tap_stride, mix_stride; float eps; };
 
-// out[m][row] = bf16(w_m * (x * rsqrt(mean(x^2) + eps))) with x = sum over the 8 taps j in index order of alpha[m][j] * tap[row][j],
-// in f32 throughout (mlx's mix_rmsnorm: the f32 norm rounds once, at the end). One threadgroup per (row, mix m < 6): mixes 0-4 are
-// the layers' context rows, mix 5 the Markov feature. taps: row stride a.tap_stride elements, tap j at j * a.width; alpha [6][8];
-// w0..w5 the six norm weights [width]; out: mix m at m * a.mix_stride elements, rows a.width apart. Dispatch (rows, 6) groups of
-// nt threads, 4 * 4 * nt >= width (288 for 4608); width a multiple of 4.
+// out[m][row] = bf16(w_m * (x * rsqrt(mean(x^2) + eps))) with x = sum over IKD_TAPS taps j in index order of
+// alpha[m][j] * tap[row][j], in f32 throughout (f32 norm rounds once, at the end). One threadgroup per (row, mix m):
+// draft layers' context rows, then the Markov feature. taps: row stride a.tap_stride elements, tap j at j * a.width;
+// alpha [mixes][IKD_TAPS]; norms [mixes][width] contiguous norm weights; out: mix m at m * a.mix_stride elements, rows
+// a.width apart. Dispatch (rows, mixes) groups of nt threads (multiple of 32), 16 * nt >= width; width multiple of 4.
 [[kernel, max_total_threads_per_threadgroup(1024)]] void ikd_mix(constant ikd_mix_args& a [[buffer(0)]],
-    const device bfloat* taps [[buffer(1)]], const device bfloat* alpha [[buffer(2)]], const device bfloat* w0 [[buffer(3)]],
-    const device bfloat* w1 [[buffer(4)]], const device bfloat* w2 [[buffer(5)]], const device bfloat* w3 [[buffer(6)]],
-    const device bfloat* w4 [[buffer(7)]], const device bfloat* w5 [[buffer(8)]], device bfloat* out [[buffer(9)]],
-    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    const device bfloat* taps [[buffer(1)]], const device bfloat* alpha [[buffer(2)]], const device bfloat* norms [[buffer(3)]],
+    device bfloat* out [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint2 nts [[threads_per_threadgroup]]) {
   threadgroup float buf[32];
   const uint row = tg.x, m = tg.y, nt = nts.x;
-  const device bfloat* w = m == 0 ? w0 : m == 1 ? w1 : m == 2 ? w2 : m == 3 ? w3 : m == 4 ? w4 : w5;
+  const device bfloat* w = norms + ulong(m) * a.width;
   float al[IKD_TAPS];
   _Pragma("clang loop unroll(full)")
   for (uint j = 0; j < IKD_TAPS; ++j) al[j] = float(alpha[m * IKD_TAPS + j]);
@@ -183,23 +183,19 @@ struct ikd_attn_args {
 // The first ring position attended.
 inline uint ikd_lo(constant ikd_attn_args& a) { return a.end > a.window ? a.end - a.window : 0; }
 
-// One (kv head, block) a threadgroup of 6 simdgroups, one for each q head of the kv group (heads = 6 kv; dispatch (kv heads, 1,
-// a.blocks) groups of 192 threads). A simdgroup holds its head's 8 query rows as one matrix tile and runs the block's keys 32 at
-// a time on the matrix unit: the scores (8 rows by 8 keys a tile) as q . k over 16 steps of 8 dims, the chunk's maximum, the
-// weights exp((score - maximum) * a.scale) of the live keys, and the weighted values added to the head's accumulator (an online
-// softmax as the chunks go: the partial it ends with is (m, l, acc) of the whole block). With lo = max(a.end - a.window, 0) the
-// ring's blocks are those of the absolute positions [IKD_KEYS b, IKD_KEYS (b + 1)) that meet [lo, a.end), b from lo / IKD_KEYS
-// (none when a.end = 0), so a.blocks = (a.end - 1) / IKD_KEYS - lo / IKD_KEYS + 2; a position is read from ring slot
-// position % a.ring of rk, rv [slot][kv][128]. The last block is the 8 keys of bk, bv [8][kv][128], seen by every row (the
-// block's rows attend one another without a causal mask). Keys of a tile beyond the block's keys are not data: their scores are
-// dropped and their values read as zero. A partial is f32 [row][head][block][130]: m (the largest scaled score), l, acc[128].
-// qn [8][heads][128].
+// One (kv head, block) a threadgroup of gqa = a.heads / a.kv simdgroups, one for each q head of the kv group: dispatch
+// (kv heads, 1, a.blocks) groups of gqa * 32 threads (192 for gqa = 6, 96 for gqa = 3). Each simdgroup holds its head's
+// 8 query rows as one matrix tile and steps through the block's keys 32 at a time on the matrix unit (scores as q . k,
+// online softmax, weighted values accumulated into (m, l, acc)). Ring blocks cover absolute positions [IKD_KEYS b,
+// IKD_KEYS (b + 1)) meeting [max(a.end - a.window, 0), a.end), read from slot pos % a.ring of rk, rv [slot][kv][128].
+// The last block is bk, bv [8][kv][128], seen by every row without a causal mask. Out-of-range keys are masked out.
+// Partials are f32 [row][head][block][130] (m, l, acc[128]); qn [8][heads][128].
 [[kernel, max_total_threads_per_threadgroup(192)]] void ikd_attn_part(constant ikd_attn_args& a [[buffer(0)]],
     const device bfloat* qn [[buffer(1)]], const device bfloat* rk [[buffer(2)]], const device bfloat* rv [[buffer(3)]],
     const device bfloat* bk [[buffer(4)]], const device bfloat* bv [[buffer(5)]], device float* part [[buffer(6)]],
     uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  const uint g = tg.x, z = tg.z, head = g * 6 + sg;
+  const uint g = tg.x, z = tg.z, gqa = a.heads / a.kv, head = g * gqa + sg;
   const bool own = z + 1 == a.blocks;
   uint n = IKD_ROWS, slot0 = 0;
   if (!own) {
@@ -342,7 +338,7 @@ struct ikd_ew_args { uint rows, width; };
 
 // ---- Markov head -------------------------------------------------------------------------------------------------------
 
-struct ikd_proj_args { uint n, at; };
+struct ikd_proj_args { uint n, at, hidden; };
 
 // Eight products of a weight row piece and an input piece, summed as two float4 dots.
 inline float ikd_dot8(const device bfloat* w, const device bfloat* x) {
@@ -350,9 +346,9 @@ inline float ikd_dot8(const device bfloat* w, const device bfloat* x) {
       dot(float4(*(const device bfloat4*)(w + 4)), float4(*(const device bfloat4*)(x + 4)));
 }
 
-// proj[j] = bf16(sum over x of W[j][x] * x[x] + bias[j]), one rounding of the f32 sum and the bias (addmm), over the rnn_proj input
-// x = [state (256), w1[seq[a.at]] (256), hid (4608), frnn (4608)] read from its four places: no row is assembled. W [n][9728],
-// w1 [vocab][256], bias [n]. One simdgroup an output, 8 outputs a threadgroup: dispatch (n / 8) groups of 256 threads.
+// proj[j] = bf16(sum_x W[j][x] * x[x] + bias[j]), one rounding of the f32 sum + bias, over the four-part input
+// x = [state (256), w1[seq[a.at]] (256), hid (a.hidden), frnn (a.hidden)]. W [n][2 * 256 + 2 * a.hidden],
+// w1 [vocab][256], bias [n]; a.hidden is a multiple of 256. Dispatch (n / 8) groups of 256 threads (8 outputs/group).
 [[kernel, max_total_threads_per_threadgroup(256)]] void ikd_rnn_proj(constant ikd_proj_args& a [[buffer(0)]],
     const device bfloat* state [[buffer(1)]], const device bfloat* w1 [[buffer(2)]], const device uint* seq [[buffer(3)]],
     const device bfloat* hid [[buffer(4)]], const device bfloat* frnn [[buffer(5)]], const device bfloat* W [[buffer(6)]],
@@ -360,11 +356,11 @@ inline float ikd_dot8(const device bfloat* w, const device bfloat* x) {
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   const uint j = tg.x * 8 + sg, o = 8 * lane;
   if (j >= a.n) return;
-  const device bfloat* w = W + ulong(j) * (2 * IKD_RANK + 2 * 4608);
+  const device bfloat* w = W + ulong(j) * (2 * IKD_RANK + 2 * ulong(a.hidden));
   float acc = ikd_dot8(w + o, state + o);
   acc += ikd_dot8(w + IKD_RANK + o, w1 + ulong(seq[a.at]) * IKD_RANK + o);
-  for (uint i = 0; i < 4608; i += 256) acc += ikd_dot8(w + 2 * IKD_RANK + i + o, hid + i + o);
-  for (uint i = 0; i < 4608; i += 256) acc += ikd_dot8(w + 2 * IKD_RANK + 4608 + i + o, frnn + i + o);
+  for (uint i = 0; i < a.hidden; i += 256) acc += ikd_dot8(w + 2 * IKD_RANK + i + o, hid + i + o);
+  for (uint i = 0; i < a.hidden; i += 256) acc += ikd_dot8(w + 2 * IKD_RANK + a.hidden + i + o, frnn + i + o);
   const float s = simd_sum(acc);
   if (lane == 0) proj[j] = bfloat(s + float(bias[j]));
 }

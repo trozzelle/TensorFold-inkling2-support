@@ -23,16 +23,31 @@ pub const Bits = enum(u8) {
     eight = 8,
     sixteen = 16,
 
-    /// What an unset or blank INKLING_DRAFT_BITS means.
+    /// What an unset or blank INKLING_DRAFT_BITS means when no head shape is known.
     pub const default: Bits = .eight;
 
-    /// The setting's text: null or blank is the default, else `8` or `16`.
-    pub fn parse(text: ?[]const u8) error{BadDraftBits}!Bits {
+    /// The default width for a draft head: bf16 when the layers' projections fit in 1 GiB, else 8-bit.
+    pub fn defaultFor(m: config.Mtp) Bits {
+        const h: u64 = m.hidden;
+        const qw: u64 = @as(u64, m.q_heads) * m.head_dim;
+        const kvw: u64 = @as(u64, m.kv_heads) * m.head_dim;
+        const inter: u64 = m.inter;
+        const per_layer = h * (2 * qw + 4 * kvw + 3 * inter) * 2;
+        return if (@as(u64, m.layers) * per_layer <= (1 << 30)) .sixteen else .eight;
+    }
+
+    /// The setting's text: null or blank returns null (caller picks default), else `8` or `16`.
+    pub fn parseOpt(text: ?[]const u8) error{BadDraftBits}!?Bits {
         const t = std.mem.trim(u8, text orelse "", " \t");
-        if (t.len == 0) return default;
+        if (t.len == 0) return null;
         if (std.mem.eql(u8, t, "8")) return .eight;
         if (std.mem.eql(u8, t, "16")) return .sixteen;
         return error.BadDraftBits;
+    }
+
+    /// The setting's text: null or blank is the default, else `8` or `16`.
+    pub fn parse(text: ?[]const u8) error{BadDraftBits}!Bits {
+        return (try parseOpt(text)) orelse default;
     }
 
     /// How a log names the layers' weights.
@@ -128,6 +143,8 @@ pub const Weights = struct {
     alpha: [mix.max_rows][mix.max_taps]u16,
     /// The same bits, [rows][taps] packed, in a buffer for the kernels.
     alpha_buffer: mtl.Buffer,
+    /// Contiguous dflare norm weights, bf16 [rows][hidden]: layers[0..layers.len].dflare then markov.dflare.
+    dflare_norms: mtl.Buffer,
     rows: u32,
     taps: u32,
     mask_embed: Tensor, // [hidden]
@@ -141,6 +158,7 @@ pub const Weights = struct {
     bytes: usize = 0,
 
     pub fn deinit(w: *Weights, gpa: std.mem.Allocator) void {
+        w.dflare_norms.deinit();
         w.alpha_buffer.deinit();
         gpa.free(w.layers);
     }
@@ -310,11 +328,16 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Check
     defer projections.deinit();
     for (layers, 0..) |*l, i| l.* = try layerTensors(c, &projections, m, i);
     if (bits == .eight) c.closeFiles();
+    const alpha_buffer = try device.buffer(rows * taps * @sizeOf(u16), mtl.ResourceOptions.shared);
+    errdefer alpha_buffer.deinit();
+    const dflare_norms = try device.buffer(rows * h * @sizeOf(u16), mtl.ResourceOptions.shared);
+    errdefer dflare_norms.deinit();
     var w: Weights = .{
         .layers = layers,
         .bits = bits,
         .alpha = std.mem.zeroes([mix.max_rows][mix.max_taps]u16),
-        .alpha_buffer = try device.buffer(rows * taps * @sizeOf(u16), mtl.ResourceOptions.shared),
+        .alpha_buffer = alpha_buffer,
+        .dflare_norms = dflare_norms,
         .rows = @intCast(rows),
         .taps = @intCast(taps),
         .mask_embed = mask_embed,
@@ -325,6 +348,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, c: *ck.Check
     mix.softmaxRows(fuse.host(u16), rows, taps, &w.alpha);
     const packed_alpha = w.alpha_buffer.slice(u16, rows * taps);
     for (0..rows) |r| @memcpy(packed_alpha[r * taps ..][0..taps], w.alpha[r][0..taps]);
+    const packed_norms = w.dflare_norms.slice(u16, rows * h);
+    for (layers, 0..) |l, i| @memcpy(packed_norms[i * h ..][0..h], l.dflare.host(u16));
+    @memcpy(packed_norms[layers.len * h ..][0..h], markov.dflare.host(u16));
     return w;
 }
 

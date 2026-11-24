@@ -1,5 +1,5 @@
 //! tf-inkling-run's `dspark` mode: the DSpark draft head over recorded taps, as the reference drove it. For each listed sequence
-//! (`seq-NNNNN.taps.bin`, bf16 [T][8][H], and `seq-NNNNN.tokens.json`, the prompt's length and the T + 1 tokens) the whole
+//! (`seq-NNNNN.taps.bin`, bf16 [T][taps][H], and `seq-NNNNN.tokens.json`, prompt length and T + 1 tokens): the whole
 //! prompt's rows are absorbed and a block is held after it (the anchor is the token after the prompt's last row); then, one
 //! generated row at a time, the row is absorbed and a block held with the next token as anchor. It writes
 //!   seq-NNNNN.props.bin   int32 [T][7]: the proposals made after committed row p in row p, -1 where no hold ran
@@ -7,16 +7,14 @@
 //!                         the softcapped, vocabulary-masked row: 1 / sum_v exp(logit_v - the largest)), -1 where no hold ran
 //!   seq-NNNNN.logits.bin  bf16 [16][7][vocab]: the first 16 holds' steps' logits after the bias, the softcap and the padded
 //!                         vocabulary's mask
-//! The model loads without its layers (the embedding, the unembedding and the draft head: about 8 GB with bf16 draft layers,
-//! about 6 GB with 8-bit ones, which `--bits` picks as INKLING_DRAFT_BITS does when serving).
+//! The model loads without its layers (embedding, unembedding, and draft head; `--bits` picks draft layer width
+//! as INKLING_DRAFT_BITS does when serving).
 const std = @import("std");
 const mtl = @import("metal");
 const tf = @import("tensorfold");
 const ik = tf.inkling2;
 const lanes = tf.lanes;
 
-const H = 4608;
-const row_bytes = ik.state.feature_taps * H * 2;
 /// Holds whose steps' logits are written, and the proposals of a hold (the block's rows after the first).
 const saved_holds = 16;
 const steps = ik.dspark.max_depth;
@@ -95,6 +93,7 @@ fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, tap
     const tokens = meta.value.tokens;
     if (L == 0 or tokens.len < L + 1) return error.BadTokensFile;
     const T = tokens.len - 1;
+    const row_bytes = drafter.tapRowBytes();
     const taps_path = try path(gpa, taps_dir, seq, "taps.bin");
     defer gpa.free(taps_path);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, taps_path, gpa, .limited(8 << 30));
@@ -127,7 +126,7 @@ fn replay(init: std.process.Init, m: *ik.Model, drafter: *ik.dspark.Drafter, tap
     var p: usize = L - 1;
     while (p < T) : (p += 1) {
         const rows = p + 1 - next;
-        const f: lanes.backend.Features = .{ .buffer = @intFromPtr(taps.id), .offset = next * row_bytes, .rows = @intCast(rows), .row_bytes = row_bytes, .space = .device, .dtype = .bf16 };
+        const f: lanes.backend.Features = .{ .buffer = @intFromPtr(taps.id), .offset = next * row_bytes, .rows = @intCast(rows), .row_bytes = @intCast(row_bytes), .space = .device, .dtype = .bf16 };
         try dv.absorb(&.{.{ .stream = &stream, .features = f, .start = next, .follow = tokens[next + 1 ..][0..rows], .prompt = p == L - 1 }});
         try dv.hold(&.{.{ .stream = &stream, .pending = tokens[p + 1], .position = p + 2, .depth = depth }});
         var held: [steps]u32 = undefined;

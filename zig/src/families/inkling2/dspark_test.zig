@@ -89,6 +89,10 @@ const Fixture = struct {
     }
 
     fn make(a: std.mem.Allocator, bits: dw.Bits) !*Fixture {
+        return makeFor(a, config_test.real, bits);
+    }
+
+    fn makeFor(a: std.mem.Allocator, config_json: []const u8, bits: dw.Bits) !*Fixture {
         const device = try mtl.Device.init();
         errdefer device.deinit();
         const f = try gpa.create(Fixture);
@@ -97,11 +101,12 @@ const Fixture = struct {
         errdefer gpa.destroy(f.model);
         errdefer f.free();
         var why: config.Why = .{};
-        var cfg = try config.parse(a, config_test.real, &why);
+        var cfg = try config.parse(a, config_json, &why);
         cfg.text.vocab = vocab;
         cfg.text.unpadded_vocab = valid;
         cfg.mtp.?.vocab = vocab;
         const m = cfg.mtp.?;
+        const h: usize = m.hidden;
         const lib = try mtl.Library.fromSource(device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
         defer lib.deinit();
         var made: usize = 0;
@@ -113,46 +118,56 @@ const Fixture = struct {
         const qw = m.q_heads * m.head_dim;
         const kvw = m.kv_heads * m.head_dim;
         const shared: dw.Layer = .{
-            .dflare = try f.norm(hidden),
-            .input = try f.norm(hidden),
-            .post = try f.norm(hidden),
+            .dflare = try f.norm(h),
+            .input = try f.norm(h),
+            .post = try f.norm(h),
             .q_norm = try f.norm(m.head_dim),
             .k_norm = try f.norm(m.head_dim),
             .k_norm_ctx = try f.norm(m.head_dim),
-            .q = try f.proj(qw, hidden, 0.02),
-            .k = try f.proj(kvw, hidden, 0.02),
-            .v = try f.proj(kvw, hidden, 0.02),
-            .k_ctx = try f.proj(kvw, hidden, 0.02),
-            .v_ctx = try f.proj(kvw, hidden, 0.02),
-            .o = try f.proj(hidden, qw, 0.02),
-            .gate = try f.proj(m.inter, hidden, 0.02),
-            .up = try f.proj(m.inter, hidden, 0.02),
-            .down = try f.proj(hidden, m.inter, 0.02),
+            .q = try f.proj(qw, h, 0.02),
+            .k = try f.proj(kvw, h, 0.02),
+            .v = try f.proj(kvw, h, 0.02),
+            .k_ctx = try f.proj(kvw, h, 0.02),
+            .v_ctx = try f.proj(kvw, h, 0.02),
+            .o = try f.proj(h, qw, 0.02),
+            .gate = try f.proj(m.inter, h, 0.02),
+            .up = try f.proj(m.inter, h, 0.02),
+            .down = try f.proj(h, m.inter, 0.02),
         };
         const layers = try gpa.alloc(dw.Layer, m.layers);
         errdefer gpa.free(layers);
         for (layers) |*l| {
             l.* = shared;
-            l.dflare = try f.norm(hidden);
-            l.input = try f.norm(hidden);
-            l.post = try f.norm(hidden);
+            l.dflare = try f.norm(h);
+            l.input = try f.norm(h);
+            l.post = try f.norm(h);
         }
+        const rows_n: usize = @as(usize, m.layers) + 1;
+        const alpha_buffer = try device.buffer(rows_n * m.taps_n * 2, mtl.ResourceOptions.shared);
+        errdefer alpha_buffer.deinit();
+        const dflare_norms = try device.buffer(rows_n * h * 2, mtl.ResourceOptions.shared);
+        errdefer dflare_norms.deinit();
+        const markov_dflare = try f.norm(h);
+        const packed_norms = dflare_norms.slice(u16, rows_n * h);
+        for (layers, 0..) |l, i| @memcpy(packed_norms[i * h ..][0..h], l.dflare.host(u16));
+        @memcpy(packed_norms[layers.len * h ..][0..h], markov_dflare.host(u16));
         var w: dw.Weights = .{
             .layers = layers,
             .bits = bits,
             .alpha = std.mem.zeroes([mix.max_rows][mix.max_taps]u16),
-            .alpha_buffer = try device.buffer((m.layers + 1) * m.taps_n * 2, mtl.ResourceOptions.shared),
+            .alpha_buffer = alpha_buffer,
+            .dflare_norms = dflare_norms,
             .rows = m.layers + 1,
             .taps = m.taps_n,
-            .mask_embed = try f.tensor(&.{hidden}, 1.0),
-            .norm = try f.norm(hidden),
+            .mask_embed = try f.tensor(&.{h}, 1.0),
+            .norm = try f.norm(h),
             .markov = .{
-                .dflare = try f.norm(hidden),
+                .dflare = markov_dflare,
                 .w1 = try f.dense(vocab, m.rank, 1.0),
-                .rnn = try f.dense(3 * m.rank, 2 * m.rank + 2 * hidden, 0.05),
+                .rnn = try f.dense(3 * m.rank, 2 * m.rank + 2 * h, 0.05),
                 .rnn_b = try f.tensor(&.{3 * m.rank}, 0.5),
-                .hidden_out = try f.dense(hidden, m.rank, 0.05),
-                .hidden_out_b = try f.tensor(&.{hidden}, 0.5),
+                .hidden_out = try f.dense(h, m.rank, 0.05),
+                .hidden_out_b = try f.tensor(&.{h}, 0.5),
             },
         };
         errdefer w.deinit(gpa);
@@ -171,11 +186,11 @@ const Fixture = struct {
             .layers = 0,
             .checkpoint = ck.Checkpoint.init(gpa),
             .weights = .{
-                .embed = try f.dense(vocab, hidden, 0.5),
-                .unembed = try f.dense(vocab, hidden, 0.5),
-                .embed_norm = try f.norm(hidden),
-                .norm = try f.norm(hidden),
-                .out_query = try f.tensor(&.{hidden}, 1.0),
+                .embed = try f.dense(vocab, h, 0.5),
+                .unembed = try f.dense(vocab, h, 0.5),
+                .embed_norm = try f.norm(h),
+                .norm = try f.norm(h),
+                .out_query = try f.tensor(&.{h}, 1.0),
                 .layers = &.{},
                 .tables = &.{},
                 .expert_buffers = &.{},
@@ -217,14 +232,22 @@ const Fixture = struct {
 };
 
 /// `rows` rows of taps, random bf16 of the scale hidden states have.
-fn tapsBuffer(device: mtl.Device, rows: usize, seed: u64) !mtl.Buffer {
-    const b = try device.buffer(rows * row_bytes, mtl.ResourceOptions.shared);
-    fill(b, 0, rows * row_bytes / 2, 3.0, seed);
+fn tapsBufferFor(device: mtl.Device, rows: usize, rb: usize, seed: u64) !mtl.Buffer {
+    const b = try device.buffer(rows * rb, mtl.ResourceOptions.shared);
+    fill(b, 0, rows * rb / 2, 3.0, seed);
     return b;
 }
 
+fn tapsBuffer(device: mtl.Device, rows: usize, seed: u64) !mtl.Buffer {
+    return tapsBufferFor(device, rows, row_bytes, seed);
+}
+
+fn featuresFor(taps: mtl.Buffer, start: usize, n: usize, rb: usize) be.Features {
+    return .{ .buffer = @intFromPtr(taps.id), .offset = start * rb, .rows = @intCast(n), .row_bytes = @intCast(rb), .space = .device, .dtype = .bf16 };
+}
+
 fn features(taps: mtl.Buffer, start: usize, n: usize) be.Features {
-    return .{ .buffer = @intFromPtr(taps.id), .offset = start * row_bytes, .rows = @intCast(n), .row_bytes = row_bytes, .space = .device, .dtype = .bf16 };
+    return featuresFor(taps, start, n, row_bytes);
 }
 
 fn tokenAt(i: u64) u32 {
@@ -284,12 +307,13 @@ test "inkling2 dspark: the fold is the unembedding applied to hidden_out, each s
 /// when `prompt`), the proposals and the steps' logits.
 fn held(d: *dspark.Drafter, s: *lanes.Stream, taps: mtl.Buffer, n: usize, chunk: usize, prompt: bool, depth: u32, out: []u32, logits: []u16) !void {
     const dv = d.drafter();
+    const rb = d.tapRowBytes();
     try dv.open(s);
     defer dv.release(s);
     var at: usize = 0;
     while (at < n) : (at += chunk) {
         const rows = @min(chunk, n - at);
-        try dv.absorb(&.{.{ .stream = s, .features = features(taps, at, rows), .start = at, .follow = &.{}, .prompt = prompt }});
+        try dv.absorb(&.{.{ .stream = s, .features = featuresFor(taps, at, rows, rb), .start = at, .follow = &.{}, .prompt = prompt }});
     }
     try dv.hold(&.{.{ .stream = s, .pending = tokenAt(n), .position = n + 1, .depth = depth }});
     try dv.held(&.{s}, &.{out[0..depth]});
@@ -407,7 +431,7 @@ const Sweep = struct {
     }
 
     fn rows(h: *Sweep, start: u64, n: u64, prompt: bool) dr.Absorb {
-        return .{ .stream = &h.stream, .features = features(h.taps, @intCast(start), @intCast(n)), .start = start, .follow = &.{}, .prompt = prompt };
+        return .{ .stream = &h.stream, .features = featuresFor(h.taps, @intCast(start), @intCast(n), h.a.tapRowBytes()), .start = start, .follow = &.{}, .prompt = prompt };
     }
 
     fn begin(ctx: *anyopaque, n: usize) anyerror!sweep.Case {
@@ -1103,6 +1127,160 @@ test "inkling2 dspark: kept draft rings restore full-window proposals across a l
     defer dv.release(&s_res);
     try dv.absorb(&.{.{ .stream = &s_res, .features = features(taps, restore_at, total - restore_at), .start = restore_at, .follow = &.{}, .prompt = true }});
     try dv.hold(&.{.{ .stream = &s_res, .pending = tokenAt(total + 11), .position = total + 1, .depth = 7 }});
+    var got: [7]u32 = undefined;
+    try dv.held(&.{&s_res}, &.{&got});
+    try t.expectEqualSlices(u32, &want, &got);
+}
+
+test "inkling2 dspark mini: facts, taps, laneBytes, keptBytesFor, residency hook and supported checks" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = Fixture.makeFor(a, config_test.mini, .sixteen) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const m = f.model.config.mtp.?;
+    try t.expect(dspark.Drafter.supported(&m, &f.model.config.text));
+    // Refusals: unsupported GQA, layer count, width alignment, final tap mismatch
+    var bad_gqa = m;
+    bad_gqa.q_heads = 32;
+    try t.expect(!dspark.Drafter.supported(&bad_gqa, &f.model.config.text));
+    var bad_layers = m;
+    bad_layers.layers = 9;
+    try t.expect(!dspark.Drafter.supported(&bad_layers, &f.model.config.text));
+    var bad_hidden = m;
+    var bad_text = f.model.config.text;
+    bad_hidden.hidden = 2400;
+    bad_text.hidden = 2400;
+    try t.expect(!dspark.Drafter.supported(&bad_hidden, &bad_text));
+    var bad_tap = m;
+    bad_tap.taps[bad_tap.taps_n - 1] = 24;
+    try t.expect(!dspark.Drafter.supported(&bad_tap, &f.model.config.text));
+
+    const d = try f.drafter(7);
+    defer d.deinit();
+    const dv = d.drafter();
+    try t.expectEqualSlices(u32, &.{ 5, 23, 41, 48 }, dv.taps());
+    try t.expectEqual(@as(usize, 4 * 2304 * 2), d.tapRowBytes());
+    const ring_bytes = (1031 + 7) * 1024 * 2;
+    try t.expectEqual(@as(usize, 2 * 3 * ring_bytes + 2304 * 2 + 256 * 2 + 8 * 4 + 8 * 4), d.laneBytes());
+    try t.expectEqual(@as(u64, 2 * 3 * ring_bytes), dspark.Drafter.keptBytesFor(m));
+    // Residency hook only touches the 3 active layer pairs (6 rings + f_rnn + state + seq + prob = 10 buffers)
+    var c: Counter = .{};
+    d.setResident(c.follow());
+    const scratch = c.joined;
+    try t.expectEqual(d.scratchBytes(), c.joined_bytes);
+    var s = try lanes.Stream.init(gpa, .{ .id = "mini-res", .prompt = &.{ 5, 6 }, .max_new = 1 });
+    defer s.deinit(gpa);
+    try dv.open(&s);
+    try t.expectEqual(scratch + 10, c.joined);
+    try t.expectEqual(d.laneBytes(), c.joined_bytes - d.scratchBytes());
+    dv.release(&s);
+    try t.expectEqual(@as(usize, 10), c.left);
+    d.setResident(null);
+    try t.expectEqual(c.joined, c.left);
+    try t.expectEqual(c.joined_bytes, c.left_bytes);
+}
+
+test "inkling2 dspark mini: bf16 and 8-bit contexts absorbed in any chunking hold the same block" {
+    for ([_]dw.Bits{ .sixteen, .eight }) |bits| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const f = Fixture.makeFor(arena.allocator(), config_test.mini, bits) catch |err| switch (err) {
+            error.NoDevice => return error.SkipZigTest,
+            else => return err,
+        };
+        defer f.deinit();
+        const d = try f.drafter(7);
+        defer d.deinit();
+        try d.captureLogits();
+        const n = 1500;
+        const taps = try tapsBufferFor(f.device, n + 1, d.tapRowBytes(), 17);
+        defer taps.deinit();
+        const prompt = try gpa.alloc(u32, n);
+        defer gpa.free(prompt);
+        for (prompt, 0..) |*x, i| x.* = tokenAt(i);
+        var s = try lanes.Stream.init(gpa, .{ .id = "mini-chunks", .prompt = prompt, .max_new = 8 });
+        defer s.deinit(gpa);
+        const a_logits = try gpa.alloc(u16, 7 * vocab);
+        defer gpa.free(a_logits);
+        const b_logits = try gpa.alloc(u16, 7 * vocab);
+        defer gpa.free(b_logits);
+        var a_props: [7]u32 = undefined;
+        var b_props: [7]u32 = undefined;
+        try held(d, &s, taps, n, n, false, 7, &a_props, a_logits);
+        for (a_props) |x| try t.expect(x < valid);
+        for ([_]struct { chunk: usize, prompt: bool }{ .{ .chunk = 37, .prompt = false }, .{ .chunk = 512, .prompt = true }, .{ .chunk = n, .prompt = true } }) |c| {
+            try held(d, &s, taps, n, c.chunk, c.prompt, 7, &b_props, b_logits);
+            try t.expectEqualSlices(u32, &a_props, &b_props);
+            try t.expectEqualSlices(u16, a_logits, b_logits);
+        }
+    }
+}
+
+test "inkling2 dspark mini: depth sweep 1 to 7 and kept draft rings restore full-window proposals" {
+    const snapshot = @import("snapshot.zig");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const f = Fixture.makeFor(arena.allocator(), config_test.mini, .sixteen) catch |err| switch (err) {
+        error.NoDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer f.deinit();
+    const a_dr = try f.drafter(5);
+    defer a_dr.deinit();
+    const b_dr = try f.drafter(7);
+    defer b_dr.deinit();
+    const rb = a_dr.tapRowBytes();
+    const sweep_taps = try tapsBufferFor(f.device, 400, rb, 23);
+    defer sweep_taps.deinit();
+    var h: Sweep = .{ .taps = sweep_taps, .a = a_dr, .b = b_dr };
+    const r = try sweep.sweep(gpa, h.harness(), .{ .block = 7, .prompts = &.{ 6, 40 }, .rounds = 8 });
+    try t.expectEqual(sweep.Report{ .runs = 16, .rounds = 128, .drafts = 2 * (8 * 28 + 32) }, r);
+
+    // Late prompt resume with kept 3-layer draft rings
+    const dv = b_dr.drafter();
+    const total: usize = 1204;
+    const restore_at: usize = 1200;
+    const taps = try tapsBufferFor(f.device, total, rb, 99);
+    defer taps.deinit();
+    const prompt = try gpa.alloc(u32, total);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*x, i| x.* = tokenAt(i + 13);
+    var s_full = try lanes.Stream.init(gpa, .{ .id = "mini-full", .prompt = prompt, .max_new = 4 });
+    defer s_full.deinit(gpa);
+    try dv.open(&s_full);
+    defer dv.release(&s_full);
+    try dv.absorb(&.{.{ .stream = &s_full, .features = featuresFor(taps, 0, total, rb), .start = 0, .follow = &.{}, .prompt = true }});
+    try dv.hold(&.{.{ .stream = &s_full, .pending = tokenAt(total + 13), .position = total + 1, .depth = 7 }});
+    var want: [7]u32 = undefined;
+    try dv.held(&.{&s_full}, &.{&want});
+
+    var s_save = try lanes.Stream.init(gpa, .{ .id = "mini-save", .prompt = prompt, .max_new = 4 });
+    defer s_save.deinit(gpa);
+    try dv.open(&s_save);
+    defer dv.release(&s_save);
+    try dv.absorb(&.{.{ .stream = &s_save, .features = featuresFor(taps, 0, restore_at, rb), .start = 0, .follow = &.{}, .prompt = true }});
+    var snap = snapshot.Snap{
+        .buf = try f.device.buffer(16, mtl.ResourceOptions.private),
+        .at = restore_at,
+        .bytes = 16,
+    };
+    defer snap.free();
+    try b_dr.keepLane(&s_save, &snap);
+    try t.expect(snap.draft != null);
+    try t.expectEqual(dspark.Drafter.keptBytesFor(f.model.config.mtp.?), snap.draft.?.length());
+
+    var s_res = try lanes.Stream.init(gpa, .{ .id = "mini-res", .prompt = prompt, .max_new = 4 });
+    defer s_res.deinit(gpa);
+    s_res.reuse.saved = &snap;
+    s_res.cached = restore_at;
+    try dv.open(&s_res);
+    defer dv.release(&s_res);
+    try dv.absorb(&.{.{ .stream = &s_res, .features = featuresFor(taps, restore_at, total - restore_at, rb), .start = restore_at, .follow = &.{}, .prompt = true }});
+    try dv.hold(&.{.{ .stream = &s_res, .pending = tokenAt(total + 13), .position = total + 1, .depth = 7 }});
     var got: [7]u32 = undefined;
     try dv.held(&.{&s_res}, &.{&got});
     try t.expectEqualSlices(u32, &want, &got);
