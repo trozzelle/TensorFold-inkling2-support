@@ -93,3 +93,8 @@ test "inkling2 budget: a share of RAM less the weights, a set limit capped at th
     try std.testing.expectEqual(@as(?f64, 236), try parseLimit(" 236 "));
     try std.testing.expectError(error.BadLoadLimit, parseLimit("lots"));
 }
+
+test "inkling2 budget: Mini fits >262k tokens in 70 GiB across its 48 virtual layers" {
+    const n = longest(&st.mini, st.mini.virtualLayers(), 70 << 30, st.mini.max_context, st.per_op_prefill_rows);
+    try std.testing.expect(n >= 262144);
+}
