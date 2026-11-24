@@ -86,6 +86,11 @@ fn backbone(c: *const Text, prec: []const plan.Precision, sink: anytype) !void {
     try put(sink, "model.llm.norm.weight", .{}, .bf16, &.{h});
     try put(sink, "model.llm.unembed.weight", .{}, .bf16, &.{ c.vocab, h });
     try put(sink, "model.llm.attn_res.output_query", .{}, .f32, &.{h});
+    if (c.loop) |lp| {
+        const qrows: u64 = 2 * @as(u64, lp.core_end - lp.core_start);
+        try put(sink, "model.llm.middle_cycle_cross_pass_queries", .{}, .f32, &.{ qrows, h });
+        try put(sink, "model.llm.middle_cycle_cross_pass_kv_queries", .{}, .f32, &.{ qrows, h });
+    }
     for (0..c.layers) |k| {
         const i: u32 = @intCast(k);
         try put(sink, "model.llm.attn_res.mlp_queries.{d}", .{i}, .f32, &.{h});
@@ -98,6 +103,14 @@ fn backbone(c: *const Text, prec: []const plan.Precision, sink: anytype) !void {
         try put(sink, "model.llm.layers.{d}.attn_sconv.weight", .{i}, .bf16, &.{ h, 1, config.conv_taps });
         try put(sink, "model.llm.layers.{d}.mlp_norm.weight", .{i}, .bf16, &.{h});
         try put(sink, "model.llm.layers.{d}.mlp_sconv.weight", .{i}, .bf16, &.{ h, 1, config.conv_taps });
+        if (c.loop) |lp| if (i >= lp.core_start and i < lp.core_end) {
+            const rank: u64 = lp.gate_rank;
+            inline for (.{ "attn", "k", "v", "mlp" }) |kind| {
+                try put(sink, "model.llm.layers.{d}.controllers." ++ kind ++ ".down_weight", .{i}, .bf16, &.{ rank, 2 * h });
+                try put(sink, "model.llm.layers.{d}.controllers." ++ kind ++ ".forget_weight", .{i}, .bf16, &.{ h, rank });
+                try put(sink, "model.llm.layers.{d}.controllers." ++ kind ++ ".gain_weight", .{i}, .bf16, &.{ h, rank });
+            }
+        };
         try experts(c, i, prec[i], sink);
     }
 }

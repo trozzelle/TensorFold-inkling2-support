@@ -1,7 +1,7 @@
-//! Inkling 2 Small's shape from config.json (inkling2), refusing every layout the engine does not run.
+//! Inkling 2's shape from config.json (inkling2 and inkling2_loop), refusing every layout the engine does not run.
 const std = @import("std");
 
-/// The most backbone layers the plan tables hold (Inkling 2 Small has 48).
+/// The most virtual layers the plan tables hold (Inkling 2 Small and Mini have 48).
 pub const max_layers = 128;
 
 /// Every sixth layer attends over the whole context; the reference derives its layer types the same way.
@@ -37,6 +37,14 @@ pub const Why = struct {
 /// One attention geometry: sliding layers read the `swa_*` keys, global layers the plain ones.
 pub const Heads = struct { q: u32, kv: u32, dim: u32 };
 
+/// Looped-core parameters (text_config.loop_config for inkling2_loop checkpoints).
+pub const LoopConfig = struct {
+    core_start: u32,
+    core_end: u32,
+    num_passes: u32,
+    gate_rank: u32,
+};
+
 pub const Text = struct {
     hidden: u32,
     layers: u32,
@@ -61,6 +69,7 @@ pub const Text = struct {
     up_cap: f32,
     logit_cap: f32,
     max_context: u32,
+    loop: ?LoopConfig = null,
 
     pub fn heads(c: *const Text, i: u32) Heads {
         return if (isGlobal(i)) c.global else c.local;
@@ -69,6 +78,12 @@ pub const Text = struct {
     /// Layer i's relative-bias extent in backward tokens.
     pub fn extent(c: *const Text, i: u32) u32 {
         return if (isGlobal(i)) c.rel_extent else c.window;
+    }
+
+    /// Number of virtual layers executed in one forward (physical layers plus repeated core passes).
+    pub fn virtualLayers(c: *const Text) u32 {
+        const lp = c.loop orelse return c.layers;
+        return c.layers + (lp.num_passes - 1) * (lp.core_end - lp.core_start);
     }
 };
 
@@ -204,7 +219,40 @@ fn layerTypes(o: std.json.ObjectMap, layers: u32, why: *Why) !void {
     }
 }
 
-fn parseText(o: std.json.ObjectMap, why: *Why) !Text {
+fn parseLoop(o: std.json.ObjectMap, t: *const Text, why: *Why) !LoopConfig {
+    const lo = try object(o, "loop_config", why);
+    try fixed(lo, "is_varloop", false, why);
+    const lp: LoopConfig = .{
+        .core_start = try int(lo, "core_start", why),
+        .core_end = try int(lo, "core_end", why),
+        .num_passes = try int(lo, "num_passes", why),
+        .gate_rank = try int(lo, "gate_rank", why),
+    };
+    if (lp.core_start >= lp.core_end or lp.core_end > t.layers) {
+        why.set("loop_config core_start/core_end ({d}..{d}) must lie inside 1..{d}", .{ lp.core_start, lp.core_end, t.layers });
+        return error.Layout;
+    }
+    if (lp.core_start % t.block != 0 or lp.core_end % t.block != 0) {
+        why.set("loop_config core_start ({d}) and core_end ({d}) must be multiples of n_layers_per_attn_res_block ({d})", .{ lp.core_start, lp.core_end, t.block });
+        return error.Layout;
+    }
+    if (lp.core_start % global_every != 0 or lp.core_end % global_every != 0) {
+        why.set("loop_config core_start ({d}) and core_end ({d}) must be multiples of {d}", .{ lp.core_start, lp.core_end, global_every });
+        return error.Layout;
+    }
+    if (lp.gate_rank == 0 or lp.gate_rank % 16 != 0 or lp.gate_rank > 128) {
+        why.set("loop_config gate_rank ({d}) must be a multiple of 16 up to 128", .{lp.gate_rank});
+        return error.Layout;
+    }
+    const vlayers: u64 = @as(u64, t.layers) + @as(u64, lp.num_passes - 1) * @as(u64, lp.core_end - lp.core_start);
+    if (vlayers > max_layers) {
+        why.set("{d} virtual layers: the plan tables hold {d}", .{ vlayers, max_layers });
+        return error.Layout;
+    }
+    return lp;
+}
+
+fn parseText(o: std.json.ObjectMap, looped: bool, why: *Why) !Text {
     var t: Text = undefined;
     t.hidden = try int(o, "hidden_size", why);
     t.layers = try int(o, "num_hidden_layers", why);
@@ -273,6 +321,7 @@ fn parseText(o: std.json.ObjectMap, why: *Why) !Text {
         return error.Unsupported;
     };
     try layerTypes(o, t.layers, why);
+    t.loop = if (looped) try parseLoop(o, &t, why) else null;
     return t;
 }
 
@@ -324,7 +373,7 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
         m.local[@intCast(e.integer)] = true;
     }
     for (taps.array.items) |e| {
-        if (e != .integer or e.integer < 0 or e.integer > t.layers) {
+        if (e != .integer or e.integer < 0 or e.integer > t.virtualLayers()) {
             why.set("mtp_config's target_layer_ids names a layer the backbone does not have", .{});
             return error.Layout;
         }
@@ -367,15 +416,20 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
     }
     const o = parsed.value.object;
     const arch = o.get("architectures");
-    const ok = arch != null and arch.? == .array and arch.?.array.items.len == 1 and arch.?.array.items[0] == .string and
-        std.mem.eql(u8, arch.?.array.items[0].string, "Inkling2ForConditionalGeneration");
-    if (!ok or !std.mem.eql(u8, text(o, "model_type") orelse "", "inkling2")) {
-        why.set("not an Inkling 2 checkpoint: architectures Inkling2ForConditionalGeneration, model_type inkling2", .{});
+    const mt = text(o, "model_type") orelse "";
+    const arch_name: []const u8 = if (arch != null and arch.? == .array and arch.?.array.items.len == 1 and arch.?.array.items[0] == .string)
+        arch.?.array.items[0].string
+    else
+        "";
+    const plain = std.mem.eql(u8, arch_name, "Inkling2ForConditionalGeneration") and std.mem.eql(u8, mt, "inkling2");
+    const looped = std.mem.eql(u8, arch_name, "Inkling2LoopForConditionalGeneration") and std.mem.eql(u8, mt, "inkling2_loop");
+    if (!plain and !looped) {
+        why.set("not an Inkling 2 checkpoint: architectures Inkling2ForConditionalGeneration/Inkling2LoopForConditionalGeneration, model_type inkling2/inkling2_loop", .{});
         return error.NotInkling2;
     }
     try fixed(o, "tie_word_embeddings", false, why);
     const quant = try quantization(o, why);
-    const t = try parseText(try object(o, "text_config", why), why);
+    const t = try parseText(try object(o, "text_config", why), looped, why);
     const eos = try int(o, "eos_token_id", why);
     if (eos >= t.vocab) {
         why.set("eos_token_id is not a token of the {d}-token vocabulary", .{t.vocab});

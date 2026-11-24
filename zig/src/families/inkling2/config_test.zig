@@ -5,6 +5,7 @@ const config = @import("config.zig");
 const t = std.testing;
 pub const real = @embedFile("fixtures/config.json");
 pub const tiny = @embedFile("fixtures/tiny_config.json");
+pub const mini = @embedFile("fixtures/mini_config.json");
 
 fn refused(json: []const u8, from: []const u8, to: []const u8, want: anyerror, says: []const u8) !void {
     if (std.mem.count(u8, json, from) != 1) return error.EditAnchor;
@@ -137,4 +138,29 @@ test "a scoring function, a layer count, a quantization_config and a root that t
     try t.expectEqualStrings("config.json is not an object", why.text());
     try t.expectError(error.BadConfig, config.parse(t.allocator, "{", &why));
     try t.expectEqualStrings("config.json is not JSON", why.text());
+}
+
+test "Inkling 2 Mini's config.json parses: 24 physical / 48 virtual layers, loop_config, 128 experts, GQA=3" {
+    var why: config.Why = .{};
+    const c = try config.parse(t.allocator, mini, &why);
+    try t.expectEqual(config.Quant.nvfp4, c.quant);
+    try t.expectEqual(@as(u32, 2304), c.text.hidden);
+    try t.expectEqual(@as(u32, 24), c.text.layers);
+    try t.expectEqual(@as(u32, 48), c.text.virtualLayers());
+    try t.expectEqual(config.Heads{ .q = 24, .kv = 8, .dim = 128 }, c.text.local);
+    try t.expectEqual(config.Heads{ .q = 24, .kv = 8, .dim = 128 }, c.text.global);
+    try t.expectEqual(@as(u32, 128), c.text.experts);
+    try t.expectEqual(@as(u32, 1152), c.text.expert_inter);
+    const lp = c.text.loop.?;
+    try t.expectEqual(config.LoopConfig{ .core_start = 6, .core_end = 18, .num_passes = 3, .gate_rank = 64 }, lp);
+    const m = c.mtp.?;
+    try t.expectEqual(@as(u32, 3), m.layers);
+    try t.expectEqualSlices(u32, &.{ 5, 23, 41, 48 }, m.taps[0..m.taps_n]);
+}
+
+test "loop_config validation refuses varloop, unaligned core bounds, and missing loop_config" {
+    try refused(mini, "\"is_varloop\": false", "\"is_varloop\": true", error.Unsupported, "is_varloop must be false");
+    try refused(mini, "\"core_start\": 6", "\"core_start\": 5", error.Layout, "multiples of n_layers_per_attn_res_block");
+    try refused(mini, "\"gate_rank\": 64", "\"gate_rank\": 10", error.Layout, "gate_rank");
+    try refused(mini, "\"loop_config\":", "\"loop_cfg\":", error.BadConfig, "loop_config");
 }
