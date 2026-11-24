@@ -12,10 +12,17 @@
 #include "../nax.h"
 using namespace tfp;
 
+#ifndef IK_PA_NQ
+#define IK_PA_NQ 48
+#endif
+#ifndef IK_PA_G
+#define IK_PA_G 6
+#endif
+
 constant constexpr int DH = 128;       // head dim
-constant constexpr int NQ = 48;        // query heads
-constant constexpr int G = 6;          // query heads a key head
-constant constexpr int KVH = 8;        // key heads
+constant constexpr int NQ = IK_PA_NQ;  // query heads
+constant constexpr int G = IK_PA_G;    // query heads a key head
+constant constexpr int KVH = NQ / G;   // key heads
 constant constexpr int LD = KVH * DH;  // elements in a cache row
 constant constexpr int QS = NQ * DH;   // elements in a row of q, gate and the output
 constant constexpr int WIN = 1024;     // a local layer's window
@@ -288,9 +295,9 @@ inline void ik_pa_run(constant IkPattnArgs& a, const device bfloat* Q, const dev
   }
 }
 
-// dispatch ceil(rows / 32) x 48 threadgroups of 64 threads. q [rows][48][128]; K and V the layer's keys and values
-// [capacity][8][128] (capacity a multiple of 64); sinks [rows][48]; table the rows' relative bias, ik_pattn_bias's
-// [rows][48][1024]; gate and out [rows][48][128]; all bf16, row r at position p0 + r.
+// dispatch ceil(rows / 32) x NQ threadgroups of 64 threads. q [rows][NQ][128]; K and V the layer's keys and values
+// [capacity][KVH][128] (capacity a multiple of 64); sinks [rows][NQ]; table the rows' relative bias, ik_pattn_bias's
+// [rows][NQ][1024]; gate and out [rows][NQ][128]; all bf16, row r at position p0 + r.
 [[max_total_threads_per_threadgroup(NS * 32)]]
 [[kernel]] void ik_pattn(constant IkPattnArgs& a [[buffer(0)]], const device bfloat* Q [[buffer(1)]],
                          const device bfloat* K [[buffer(2)]], const device bfloat* V [[buffer(3)]],
@@ -308,7 +315,7 @@ inline void ik_pa_run(constant IkPattnArgs& a, const device bfloat* Q, const dev
 // The table of the rows' relative bias, bf16(reln . proj) with the 16 products summed in index order from zero as ik_relbias
 // does: row t, head h, the distance d = 0 .. EXT - 1 behind the row at slot (p0 + t - d) & (EXT - 1). A thread takes four
 // consecutive distances (a multiple of four) of four consecutive heads, so each projection value it converts serves four
-// products. Dispatch threads (EXT / 4, 12, rows); reln [rows][48][16] and proj [16][EXT] bf16, table [rows][48][EXT] bf16.
+// products. Dispatch threads (EXT / 4, NQ / 4, rows); reln [rows][NQ][16] and proj [16][EXT] bf16, table [rows][NQ][EXT] bf16.
 [[kernel]] void ik_pattn_bias(constant IkPattnArgs& a [[buffer(0)]], const device bfloat* reln [[buffer(1)]],
                               const device bfloat* proj [[buffer(2)]], device bfloat* table [[buffer(3)]],
                               uint3 gid [[thread_position_in_grid]]) {
