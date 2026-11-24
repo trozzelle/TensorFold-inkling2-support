@@ -4,7 +4,7 @@ const std = @import("std");
 const mtl = @import("metal");
 const h = @import("harness.zig");
 
-/// tf-inkling-kernels [seed=N] [glue|conv|attn|moe|stack|fused|split|xd|dspark|gemm|pattn|xp ...]: the named case groups, every group by
+/// tf-inkling-kernels [seed=N] [glue|conv|attn|moe|stack|fused|split|xd|dspark|gemm|pattn|xp|controllers|fp_experts ...]: the named case groups, every group by
 /// default, on inputs drawn from seed N (0x1c11 by default); `time` instead times the fused norm kernels.
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     for (args[1..]) |a| if (std.mem.eql(u8, a, "time")) return @import("time_norms.zig").run(&g, r);
-    const groups = .{ .{ "glue", @import("cases_glue.zig") }, .{ "conv", @import("cases_conv.zig") }, .{ "attn", @import("cases_attn.zig") }, .{ "moe", @import("cases_moe.zig") }, .{ "stack", @import("cases_stack.zig") }, .{ "fused", @import("cases_fused.zig") }, .{ "split", @import("cases_split.zig") }, .{ "xd", @import("cases_xd.zig") }, .{ "dspark", @import("cases_dspark.zig") }, .{ "gemm", @import("cases_gemm.zig") }, .{ "pattn", @import("cases_pattn.zig") }, .{ "xp", @import("cases_xp.zig") }, .{ "controllers", @import("cases_controllers.zig") } };
+    const groups = .{ .{ "glue", @import("cases_glue.zig") }, .{ "conv", @import("cases_conv.zig") }, .{ "attn", @import("cases_attn.zig") }, .{ "moe", @import("cases_moe.zig") }, .{ "stack", @import("cases_stack.zig") }, .{ "fused", @import("cases_fused.zig") }, .{ "split", @import("cases_split.zig") }, .{ "xd", @import("cases_xd.zig") }, .{ "dspark", @import("cases_dspark.zig") }, .{ "gemm", @import("cases_gemm.zig") }, .{ "pattn", @import("cases_pattn.zig") }, .{ "xp", @import("cases_xp.zig") }, .{ "controllers", @import("cases_controllers.zig") }, .{ "fp_experts", @import("cases_fp_experts.zig") } };
     inline for (groups) |grp| {
         var on = true;
         for (args[1..]) |a| if (!std.mem.startsWith(u8, a, "seed=")) {
