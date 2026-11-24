@@ -368,7 +368,7 @@ const Enc = struct {
 
     /// The routed experts' grouped tiles through one EXL3 projection (in_ids: tokens for w13, slots for w2).
     fn experts(x: Enc, w: exl3.Experts, in: B, k: usize, in_rows: usize, out: B, slots: usize, rows: usize, in_ids: mtl.Buffer) !void {
-        try exl3.encodeIndexed(&x.m.exl3, x.e.*, w, .{ .buffer = in.buf, .offset = in.off }, .{ .buffer = out.buf, .offset = out.off }, .{ .buffer = x.s.exl3 }, .{
+        try exl3.encodeIndexed(&x.m.exl3.?, x.e.*, w, .{ .buffer = in.buf, .offset = in.off }, .{ .buffer = out.buf, .offset = out.off }, .{ .buffer = x.s.exl3 }, .{
             .count = rows,
             .x_stride = k,
             .y_stride = w.n,
@@ -390,13 +390,14 @@ const Enc = struct {
         std.debug.assert(rows <= st.batch_rows);
         const slots = rows * c.topk;
         const a = Args{ .rows = @intCast(slots), .cap = c.gate_cap, .thr = c.up_cap };
-        const w13 = bo(l.w13.descriptors.buffer, l.w13.descriptors.offset);
-        const w2 = bo(l.w2.descriptors.buffer, l.w2.descriptors.offset);
+        const ex = l.experts.exl3;
+        const w13 = bo(ex.w13.descriptors.buffer, ex.w13.descriptors.offset);
+        const w2 = bo(ex.w2.descriptors.buffer, ex.w2.descriptors.offset);
         // two 16-column output tiles a pair or down threadgroup, one simdgroup per 128 columns in mid and finish
-        x.glue(.xd_pair, a, &.{ b(s.xm), b(s.eids), w13, b(s.planes) }, .{ l.w13.n / 32, slots, 2 }, .{ 128, 1, 1 }, true);
-        x.glue(.xd_mid, a, &.{ b(s.planes), b(s.eids), w13, b(s.act) }, .{ l.w13.n / 128, slots, 1 }, .{ 32, 1, 1 }, true);
-        x.glue(.xd_down, a, &.{ b(s.act), b(s.eids), w2, b(s.sums) }, .{ l.w2.n / 32, slots, 1 }, .{ 128, 1, 1 }, true);
-        x.glue(.xd_finish, a, &.{ b(s.sums), b(s.eids), w2, b(s.ew), b(s.moe) }, .{ l.w2.n / 128, rows, 1 }, .{ 256, 1, 1 }, true);
+        x.glue(.xd_pair, a, &.{ b(s.xm), b(s.eids), w13, b(s.planes) }, .{ ex.w13.n / 32, slots, 2 }, .{ 128, 1, 1 }, true);
+        x.glue(.xd_mid, a, &.{ b(s.planes), b(s.eids), w13, b(s.act) }, .{ ex.w13.n / 128, slots, 1 }, .{ 32, 1, 1 }, true);
+        x.glue(.xd_down, a, &.{ b(s.act), b(s.eids), w2, b(s.sums) }, .{ ex.w2.n / 32, slots, 1 }, .{ 128, 1, 1 }, true);
+        x.glue(.xd_finish, a, &.{ b(s.sums), b(s.eids), w2, b(s.ew), b(s.moe) }, .{ ex.w2.n / 128, rows, 1 }, .{ 256, 1, 1 }, true);
     }
 
     /// The layer's routed experts for the chunk's (or shared decode batch's) rows through the tensor-unit chain
@@ -405,8 +406,9 @@ const Enc = struct {
         const c = &x.m.config.text;
         const s = x.s;
         const e = experts_prefill;
-        std.debug.assert((x.tensor or x.xp_batch) and l.xd_ok);
-        e.encode(x.e.*, &x.m.chunk.?.experts, .{ .w13 = l.w13, .w2 = l.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
+        const ex = l.experts.exl3;
+        std.debug.assert((x.tensor or x.xp_batch) and ex.xd_ok);
+        e.encode(x.e.*, &x.m.chunk.?.experts, .{ .w13 = ex.w13, .w2 = ex.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
     }
 };
 
@@ -711,7 +713,8 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     // wide shared decode batch) and the per-row path when it cannot: the chains read picks as routed and sort them themselves
     const slots = n * c.topk;
     const rows = st.tileRows(slots, c.experts);
-    const chain = w.xd_ok and (x.decode or x.tensor);
+    const ex = w.experts.exl3;
+    const chain = ex.xd_ok and (x.decode or x.tensor);
     if (!chain) x.glue(.tiles, .{ .rows = @intCast(slots), .width = c.experts, .queries = c.topk, .stride = @intCast(rows) }, &.{ b(s.eids), b(s.texp), b(s.tslot), b(s.ttok) }, .{ 1, 1, 1 }, one, true);
     try x.end();
     const I: usize = c.expert_inter;
@@ -719,9 +722,9 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     if (chain) {
         if (x.tensor or x.xp_batch) x.xp(w) else x.xd(w, n);
     } else {
-        try x.experts(w.w13, b(s.xm), H, n, b(s.gu), slots, rows, s.ttok);
+        try x.experts(ex.w13, b(s.xm), H, n, b(s.gu), slots, rows, s.ttok);
         x.glue(.swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.gu), b(s.act) }, .{ I, slots, 1 }, .{ 256, 1, 1 }, false);
-        try x.experts(w.w2, b(s.act), I, slots, b(s.ey), slots, rows, s.tslot);
+        try x.experts(ex.w2, b(s.act), I, slots, b(s.ey), slots, rows, s.tslot);
         x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
     }
     try x.end();

@@ -10,6 +10,8 @@ pub fn hold(h: anytype) !void {
     const m = h.model;
     for (m.checkpoint.shards.items) |sh| try list.append(h.gpa, sh.buffer);
     try list.appendSlice(h.gpa, m.weights.tables);
+    try list.appendSlice(h.gpa, m.weights.global_scales);
+    if (m.weights.message_queries) |mq| try list.append(h.gpa, mq);
     try mtl.resident.fields.append(h.gpa, &list, &h.metal.scratch);
     h.resident = try Resident.hold(h.gpa, h.io, m.device, m.queue, list.items, "inkling2");
     if (h.resident) |*r| {
