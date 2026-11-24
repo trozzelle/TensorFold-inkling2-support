@@ -275,3 +275,21 @@ test "inkling2 snapshot: a state holds 32 KiB a token and at most 203 MiB more" 
     try std.testing.expectEqual(@as(usize, 0), slidingFrom(&c, 1086));
     try std.testing.expectEqual(@as(usize, 64), slidingFrom(&c, 1087));
 }
+
+test "inkling2 snapshot: Mini's 48 virtual layers match pieces and 32 KiB a token plus rings" {
+    const c = st.mini;
+    const layers: usize = c.virtualLayers();
+    try std.testing.expectEqual(@as(usize, 48), layers);
+    const f = fakeCache(&c, 200_000, layers, st.per_op_prefill_rows);
+    for ([_]usize{ 5, 1024, 1792, 1793, 32768 }) |at| {
+        var store: [max_pieces]Piece = undefined;
+        var list: std.ArrayList(Piece) = .initBuffer(&store);
+        pieces(&c, &f.cache, at, &list);
+        var sum: u64 = 0;
+        for (list.items) |p| sum += p.len;
+        try std.testing.expectEqual(bytes(&c, layers, at), sum);
+    }
+    const want = 8 * 32768 * st.kvBytes(&c) + 40 * 1024 * st.kvBytes(&c) + layers * st.convBytes(&c);
+    try std.testing.expectEqual(@as(u64, want), bytes(&c, layers, 32768));
+    try std.testing.expect(bytes(&c, layers, 32768) - 8 * 32768 * 4096 <= 180 << 20);
+}
