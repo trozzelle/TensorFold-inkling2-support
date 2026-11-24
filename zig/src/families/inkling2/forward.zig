@@ -14,6 +14,7 @@ const dense_prefill = @import("dense_prefill.zig");
 const attention = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
 const experts_fp_prefill = @import("experts_fp_prefill.zig");
+const ctrl_prefill = @import("ctrl_prefill.zig");
 
 /// glue.metal's ik_args, field for field.
 pub const Args = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, kv: u32 = 0, dim: u32 = 0, pos: u32 = 0, blocks: u32 = 0, queries: u32 = 0, stride: u32 = 0, flags: u32 = 0, window: u32 = 0, extent: u32 = 0, ring: u32 = 0, eps: f32 = 0, scale: f32 = 0, cap: f32 = 0, alpha: f32 = 0, floor_n: f32 = 0, thr: f32 = 0 };
@@ -241,6 +242,23 @@ const Enc = struct {
         x.e.setValue(a, 0);
         for (bufs, 1..) |r, slot| x.e.setBuffer(r.buf, r.off, slot);
         if (groups) x.e.dispatchGroups(g3, t3) else x.e.dispatchThreads(g3, t3);
+    }
+
+    fn glueIndirect(x: Enc, g: Glue, a: Args, bufs: []const B, dargs_buf: mtl.Buffer, dargs_off: usize, group: [3]usize) void {
+        const t3 = mtl.Size.of(group[0], group[1], group[2]);
+        switch (x.ablateMode()) {
+            .skip => return,
+            .stub => {
+                x.e.setPipeline(x.m.pipe(.nop));
+                x.e.dispatchIndirect(dargs_buf, dargs_off, t3);
+                return;
+            },
+            .run => {},
+        }
+        x.e.setPipeline(x.m.pipe(g));
+        x.e.setValue(a, 0);
+        for (bufs, 1..) |r, slot| x.e.setBuffer(r.buf, r.off, slot);
+        x.e.dispatchIndirect(dargs_buf, dargs_off, t3);
     }
 
     /// The `n` hidden rows at `src` as tap `k` of the rows of `taps` taps at `to` ([n][taps][hidden] bf16), in a taps span.
@@ -646,15 +664,13 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
         const mq = m.weights.message_queries.?;
         const rank = c.loop.?.gate_rank;
         const mix = if (x.tensor) s.stage else s.ai;
-        try x.begin(.norm);
-        x.glue(.msg_depth, .{ .rows = nr, .width = c.hidden, .blocks = m.plan.bank_blocks, .queries = 4, .stride = stride, .scale = scale_h }, &.{ b(s.bank_blocks), b(s.bank_partial), bo(mq, @as(usize, p.core_idx) * 4 * H * 4), b(s.msg) }, .{ n, 1, 1 }, one, true);
-        x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
-        x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(w.attn_query.?), b(mix) }, .{ n, 1, 1 }, one, true);
         if (x.decode) {
+            std.debug.assert(3 * n * H * 4 <= s.ctrl_in.length());
             const gflag: u32 = if (glob) global else 0;
             const nw1 = t(if (glob) w.in_norm[1].? else w.in_norm[0].?);
             const nw2 = t(if (glob) w.in_norm[2].? else w.in_norm[0].?);
-            x.glue(.msggate_prep3, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .flags = gflag }, &.{ b(mix), b(s.msg), b(s.ctrl_in) }, .{ n, 3, 1 }, one, true);
+            try x.begin(.norm);
+            x.glue(if (glob) .loop_attn_prep3 else .loop_attn_prep, .{ .rows = nr, .width = c.hidden, .dim = m.plan.bank_blocks, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.h), b(s.bank_blocks), b(s.bank_partial), bo(mq, @as(usize, p.core_idx) * 4 * H * 4), b(s.blocks), t(w.attn_query.?), b(s.msg), nrd, b(mix), b(s.ctrl_in) }, .{ n, 1, 1 }, one, true);
             try x.end();
             const in_slot = n * 2 * H * 2;
             const z_slot = n * @as(usize, rank) * 2;
@@ -666,10 +682,19 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
             }, n);
             try x.end();
             try x.begin(.norm);
-            x.glue(.msggate_apply_norm3, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = Q * c.hidden, .flags = gflag, .eps = c.eps }, &.{ b(mix), b(s.msg), b(s.ctrl_z), t(ctrls[0].forget.t), t(ctrls[1].forget.t), t(ctrls[2].forget.t), t(ctrls[0].gain.t), t(ctrls[1].gain.t), t(ctrls[2].gain.t), t(w.in_norm[0].?), nw1, nw2, b(s.xq) }, .{ n, 3, 1 }, one, true);
+            x.glue(.msggate_fg_decode3, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = Q * c.hidden, .flags = gflag }, &.{ b(mix), b(s.msg), b(s.ctrl_z), t(ctrls[0].forget.t), t(ctrls[1].forget.t), t(ctrls[2].forget.t), t(ctrls[0].gain.t), t(ctrls[1].gain.t), t(ctrls[2].gain.t), b(s.ctrl_in) }, .{ (H + 31) / 32, (n + 15) / 16, 3 }, .{ 256, 1, 1 }, true);
+            x.glue(.norm3_f32, .{ .rows = nr, .width = c.hidden, .flags = gflag, .eps = c.eps }, &.{ b(s.ctrl_in), t(w.in_norm[0].?), nw1, nw2, b(s.xq) }, .{ n, 3, 1 }, one, true);
             try x.end();
         } else {
+            try x.begin(.norm);
+            x.glue(.msg_depth, .{ .rows = nr, .width = c.hidden, .blocks = m.plan.bank_blocks, .queries = 4, .stride = stride, .scale = scale_h }, &.{ b(s.bank_blocks), b(s.bank_partial), bo(mq, @as(usize, p.core_idx) * 4 * H * 4), b(s.msg) }, .{ n, 1, 1 }, one, true);
+            x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
+            x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(w.attn_query.?), b(mix) }, .{ n, 1, 1 }, one, true);
             try x.end();
+            const ctrl_pipes: ?*const ctrl_prefill.Pipes = if (x.tensor) if (m.chunk.?.ctrl) |*cp| cp else null else null;
+            const df_off = std.mem.alignForward(usize, @as(usize, Q) * n * H * 4, 256);
+            const dg_off = std.mem.alignForward(usize, df_off + n * H * 4, 256);
+            if (ctrl_pipes != null) std.debug.assert(dg_off + n * H * 4 <= s.stage.length());
             for (0..3) |j| {
                 const hj = if (glob) bo(mix, j * H * 4) else b(mix);
                 const mj = bo(s.msg, j * H * 4);
@@ -679,9 +704,16 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
                 try x.end();
                 try x.begin(.dense);
                 x.proj(ctrls[j].down, b(s.ctrl_in), b(s.ctrl_z), n);
+                if (ctrl_pipes) |cp| {
+                    ctrl_prefill.encodeFg(x.e.*, cp, view(ctrl_prefill.B, b(s.ctrl_z)), view(ctrl_prefill.B, t(ctrls[j].forget.t)), view(ctrl_prefill.B, t(ctrls[j].gain.t)), view(ctrl_prefill.B, bo(s.stage, df_off)), view(ctrl_prefill.B, bo(s.stage, dg_off)), n, H, rank);
+                }
                 try x.end();
                 try x.begin(.norm);
-                x.glue(.msggate_apply_norm, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = Q * c.hidden, .eps = c.eps }, &.{ hj, mj, b(s.ctrl_z), t(ctrls[j].forget.t), t(ctrls[j].gain.t), nwj, xin[j] }, .{ n, 1, 1 }, one, true);
+                if (ctrl_pipes != null) {
+                    x.glue(.msggate_blend_norm, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .eps = c.eps }, &.{ hj, mj, bo(s.stage, df_off), bo(s.stage, dg_off), nwj, xin[j] }, .{ n, 1, 1 }, one, true);
+                } else {
+                    x.glue(.msggate_apply_norm, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = Q * c.hidden, .eps = c.eps }, &.{ hj, mj, b(s.ctrl_z), t(ctrls[j].forget.t), t(ctrls[j].gain.t), nwj, xin[j] }, .{ n, 1, 1 }, one, true);
+                }
                 try x.end();
             }
         }
@@ -792,18 +824,42 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     if (has_msg) {
         const ctrls = w.controllers.?;
         const rank = c.loop.?.gate_rank;
-        try x.begin(.norm);
-        x.glue(.resid, .{ .rows = nr, .width = c.hidden, .flags = if (p.boundary) boundary else 0 }, &.{ b(s.h), b(s.ya), b(s.res) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
-        x.glue(.rms, .{ .rows = nr, .width = c.hidden, .flags = f32_in, .eps = 1e-6 }, &.{ b(s.res), b(s.ns) }, .{ n, 1, 1 }, one, true);
-        x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K + @intFromBool(p.boundary), .queries = 1, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), b(s.ns), t(w.mlp_query), b(s.mi) }, .{ n, 1, 1 }, one, true);
-        x.glue(.msggate_prep, .{ .rows = nr, .width = c.hidden, .stride = c.hidden }, &.{ b(s.mi), bo(s.msg, 3 * H * 4), b(s.ctrl_in) }, .{ n, 1, 1 }, one, true);
-        try x.end();
-        try x.begin(.dense);
-        x.proj(ctrls[3].down, b(s.ctrl_in), b(s.ctrl_z), n);
-        try x.end();
-        try x.begin(.norm);
-        x.glue(.msggate_apply_norm, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = c.hidden, .eps = c.eps }, &.{ b(s.mi), bo(s.msg, 3 * H * 4), b(s.ctrl_z), t(ctrls[3].forget.t), t(ctrls[3].gain.t), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
-        try x.end();
+        if (x.decode) {
+            std.debug.assert(n * H * 4 <= s.ctrl_in.length());
+            try x.begin(.norm);
+            x.glue(.loop_mlp_prep, .{ .rows = nr, .width = c.hidden, .blocks = K, .stride = stride, .flags = if (p.boundary) boundary else 0, .scale = scale_h }, &.{ b(s.h), b(s.ya), b(s.res), b(s.blocks), b(s.ns), t(w.mlp_query), bo(s.msg, 3 * H * 4), b(s.mi), b(s.ctrl_in) }, .{ n, 1, 1 }, one, true);
+            try x.end();
+            try x.begin(.dense);
+            x.proj(ctrls[3].down, b(s.ctrl_in), b(s.ctrl_z), n);
+            try x.end();
+            try x.begin(.norm);
+            x.glue(.msggate_fg_decode, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = c.hidden }, &.{ b(s.mi), bo(s.msg, 3 * H * 4), b(s.ctrl_z), t(ctrls[3].forget.t), t(ctrls[3].gain.t), b(s.ctrl_in) }, .{ (H + 31) / 32, (n + 15) / 16, 1 }, .{ 256, 1, 1 }, true);
+            x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .flags = f32_in, .eps = c.eps }, &.{ b(s.ctrl_in), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
+            try x.end();
+        } else {
+            try x.begin(.norm);
+            x.glue(.resid, .{ .rows = nr, .width = c.hidden, .flags = if (p.boundary) boundary else 0 }, &.{ b(s.h), b(s.ya), b(s.res) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            x.glue(.rms, .{ .rows = nr, .width = c.hidden, .flags = f32_in, .eps = 1e-6 }, &.{ b(s.res), b(s.ns) }, .{ n, 1, 1 }, one, true);
+            x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K + @intFromBool(p.boundary), .queries = 1, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), b(s.ns), t(w.mlp_query), b(s.mi) }, .{ n, 1, 1 }, one, true);
+            x.glue(.msggate_prep, .{ .rows = nr, .width = c.hidden, .stride = c.hidden }, &.{ b(s.mi), bo(s.msg, 3 * H * 4), b(s.ctrl_in) }, .{ n, 1, 1 }, one, true);
+            try x.end();
+            const ctrl_pipes: ?*const ctrl_prefill.Pipes = if (x.tensor) if (m.chunk.?.ctrl) |*cp| cp else null else null;
+            const dg_off = std.mem.alignForward(usize, n * H * 4, 256);
+            if (ctrl_pipes != null) std.debug.assert(dg_off + n * H * 4 <= s.stage.length());
+            try x.begin(.dense);
+            x.proj(ctrls[3].down, b(s.ctrl_in), b(s.ctrl_z), n);
+            if (ctrl_pipes) |cp| {
+                ctrl_prefill.encodeFg(x.e.*, cp, view(ctrl_prefill.B, b(s.ctrl_z)), view(ctrl_prefill.B, t(ctrls[3].forget.t)), view(ctrl_prefill.B, t(ctrls[3].gain.t)), view(ctrl_prefill.B, b(s.stage)), view(ctrl_prefill.B, bo(s.stage, dg_off)), n, H, rank);
+            }
+            try x.end();
+            try x.begin(.norm);
+            if (ctrl_pipes != null) {
+                x.glue(.msggate_blend_norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .eps = c.eps }, &.{ b(s.mi), bo(s.msg, 3 * H * 4), b(s.stage), bo(s.stage, dg_off), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
+            } else {
+                x.glue(.msggate_apply_norm, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = c.hidden, .eps = c.eps }, &.{ b(s.mi), bo(s.msg, 3 * H * 4), b(s.ctrl_z), t(ctrls[3].forget.t), t(ctrls[3].gain.t), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
+            }
+            try x.end();
+        }
     } else {
         try x.begin(.norm);
         if (x.decode) {
@@ -848,6 +904,17 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
             if (x.tensor or x.xp_batch) {
                 const e = experts_fp_prefill;
                 e.encodeNvfp4(x.e.*, &m.chunk.?.experts.fp, .{ .w13 = nv.w13, .w2 = nv.w2, .experts = c.experts }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xpFp(H, c.experts), n, .{ .gate = c.gate_cap, .up = c.up_cap });
+            } else if (x.decode and n >= 2 and slots <= 128 and c.experts <= 512) {
+                std.debug.assert(s.fp_grp.length() >= 4096);
+                const u_eid = bo(s.fp_grp, 0);
+                const u_off = bo(s.fp_grp, 512);
+                const u_cnt = bo(s.fp_grp, 1024);
+                const u_slots = bo(s.fp_grp, 1536);
+                const dargs = bo(s.fp_grp, 2048);
+                x.glue(.fp_group, .{ .rows = @intCast(slots), .width = c.experts, .dim = c.expert_inter, .stride = c.hidden }, &.{ b(s.eids), u_eid, u_off, u_cnt, u_slots, dargs }, .{ 1, 1, 1 }, .{ 256, 1, 1 }, true);
+                x.glueIndirect(.nvfp4_w13_swiglu_g, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), u_eid, u_off, u_cnt, u_slots, t(nv.w13.weight), t(nv.w13.scale), b(nv.w13.global_scale), b(s.act) }, s.fp_grp, 2048, .{ 128, 1, 1 });
+                x.glueIndirect(.nvfp4_w2_g, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), u_eid, u_off, u_cnt, u_slots, t(nv.w2.weight), t(nv.w2.scale), b(nv.w2.global_scale), b(s.ey) }, s.fp_grp, 2064, .{ 128, 1, 1 });
+                x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
             } else {
                 x.glue(.nvfp4_w13_swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), b(s.eids), t(nv.w13.weight), t(nv.w13.scale), b(nv.w13.global_scale), b(s.act) }, .{ (I + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
                 x.glue(.nvfp4_w2, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), b(s.eids), t(nv.w2.weight), t(nv.w2.scale), b(nv.w2.global_scale), b(s.ey) }, .{ (H + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
@@ -861,6 +928,17 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
             if (x.tensor or x.xp_batch) {
                 const e = experts_fp_prefill;
                 e.encodeMxfp8(x.e.*, &m.chunk.?.experts.fp, .{ .w13 = mx.w13, .w2 = mx.w2, .experts = c.experts }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xpFp(H, c.experts), n, .{ .gate = c.gate_cap, .up = c.up_cap });
+            } else if (x.decode and n >= 2 and slots <= 128 and c.experts <= 512) {
+                std.debug.assert(s.fp_grp.length() >= 4096);
+                const u_eid = bo(s.fp_grp, 0);
+                const u_off = bo(s.fp_grp, 512);
+                const u_cnt = bo(s.fp_grp, 1024);
+                const u_slots = bo(s.fp_grp, 1536);
+                const dargs = bo(s.fp_grp, 2048);
+                x.glue(.fp_group, .{ .rows = @intCast(slots), .width = c.experts, .dim = c.expert_inter, .stride = c.hidden }, &.{ b(s.eids), u_eid, u_off, u_cnt, u_slots, dargs }, .{ 1, 1, 1 }, .{ 256, 1, 1 }, true);
+                x.glueIndirect(.mxfp8_w13_swiglu_g, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), u_eid, u_off, u_cnt, u_slots, t(mx.w13.weight), t(mx.w13.scale), b(s.act) }, s.fp_grp, 2048, .{ 128, 1, 1 });
+                x.glueIndirect(.mxfp8_w2_g, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), u_eid, u_off, u_cnt, u_slots, t(mx.w2.weight), t(mx.w2.scale), b(s.ey) }, s.fp_grp, 2064, .{ 128, 1, 1 });
+                x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
             } else {
                 x.glue(.mxfp8_w13_swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), b(s.eids), t(mx.w13.weight), t(mx.w13.scale), b(s.act) }, .{ (I + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
                 x.glue(.mxfp8_w2, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), b(s.eids), t(mx.w2.weight), t(mx.w2.scale), b(s.ey) }, .{ (H + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
