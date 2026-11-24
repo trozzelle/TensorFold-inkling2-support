@@ -4,7 +4,7 @@
 //! every round holds the deepest chain, 7 drafts when INKLING_DRAFT_DEPTH is unset and at most the number it gives, and verifies the
 //! first draft and each next one while its own probability is at least that. With `off` every draft held is verified, and the depth
 //! is INKLING_DRAFT_DEPTH's: 1 to 7 holds every round at it, `auto` lets the cost rule choose, and unset is 4. The layers are
-//! INKLING_DRAFT_BITS's: 8 (quantized at load, unset too) or 16 (bf16). INKLING_PREFILL_ROWS sets the prompt chunk's rows, as served.
+//! INKLING_DRAFT_BITS's: 8 (quantized at load) or 16 (bf16), or model default when unset. INKLING_PREFILL_ROWS sets the prompt chunk's rows, as served.
 const std = @import("std");
 const tf = @import("tensorfold");
 const ik = tf.inkling2;

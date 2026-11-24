@@ -14,7 +14,6 @@ const lanes = tf.lanes;
 const trials = 9;
 /// Rows absorbed before timing: more than a window, so the attention reads every key it can.
 const context = 1100;
-const row_bytes = ik.state.feature_taps * 4608 * 2;
 
 fn now() f64 {
     var ts: std.c.timespec = undefined;
@@ -29,7 +28,7 @@ fn median(v: *[trials]f64) f64 {
 
 pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     // dspark <model>, then --bits 8|16 if given
-    var bits: ik.dspark_weights.Bits = .default;
+    var bits: ?ik.dspark_weights.Bits = null;
     if (args.len == 5 and std.mem.eql(u8, args[3], "--bits")) {
         bits = try ik.dspark_weights.Bits.parse(args[4]);
     } else if (args.len != 3) return error.ExpectedModelAndMaybeBits;
@@ -38,7 +37,8 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     const weights: *ik.dspark_weights.Weights = if (m.draft) |*w| w else return error.NoDraftHead;
     const drafter = try ik.dspark.Drafter.init(init.gpa, m.device, m, weights, .{ .depth = 7 });
     defer drafter.deinit();
-    std.debug.print("{{\"bits\": {d}, \"head_bytes\": {d}, \"head_gib\": {d:.3}, \"weights_bytes\": {d}, \"fold_bytes\": {d}, \"scratch_bytes\": {d}, \"lane_bytes\": {d}}}\n", .{ @backingInt(bits), drafter.residentBytes(1), @as(f64, @floatFromInt(drafter.residentBytes(1))) / (1 << 30), weights.bytes, weights.fold_w.?.t.bytes + weights.fold_b.?.bytes, drafter.scratchBytes(), drafter.laneBytes() });
+    const row_bytes = drafter.tapRowBytes();
+    std.debug.print("{{\"bits\": {d}, \"head_bytes\": {d}, \"head_gib\": {d:.3}, \"weights_bytes\": {d}, \"fold_bytes\": {d}, \"scratch_bytes\": {d}, \"lane_bytes\": {d}}}\n", .{ @backingInt(weights.bits), drafter.residentBytes(1), @as(f64, @floatFromInt(drafter.residentBytes(1))) / (1 << 30), weights.bytes, weights.fold_w.?.t.bytes + weights.fold_b.?.bytes, drafter.scratchBytes(), drafter.laneBytes() });
     const dv = drafter.drafter();
     const rows = context + 3 * (trials + 1) + 1;
     const taps = try m.device.buffer(rows * row_bytes, mtl.ResourceOptions.shared);
@@ -55,7 +55,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     try dv.open(&stream);
     defer dv.release(&stream);
     var next: usize = 0; // the first row not yet absorbed
-    try absorb(dv, &stream, taps, &next, context, false);
+    try absorb(dv, &stream, taps, row_bytes, &next, context, false);
     try drafter.sync();
     var wall: [trials]f64 = undefined;
     var gpu: [trials]f64 = undefined;
@@ -72,7 +72,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     var round: [trials]f64 = undefined;
     for (0..trials + 1) |i| {
         const t0 = now();
-        try absorb(dv, &stream, taps, &next, 1, false);
+        try absorb(dv, &stream, taps, row_bytes, &next, 1, false);
         const t1 = now();
         try drafter.sync();
         const t2 = now();
@@ -85,7 +85,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     for ([_]u32{ 4, 5 }) |depth| {
         for (0..trials + 1) |i| {
             const t0 = now();
-            try absorb(dv, &stream, taps, &next, 1, false);
+            try absorb(dv, &stream, taps, row_bytes, &next, 1, false);
             try dv.hold(&.{.{ .stream = &stream, .pending = ids[i % ids.len], .position = next + 1, .depth = depth }});
             if (i == 0) continue;
             round[i - 1] = now() - t0;
@@ -95,8 +95,8 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
 }
 
 /// `n` more rows of `taps` into the stream's lane.
-fn absorb(dv: lanes.drafter.Drafter, stream: *lanes.Stream, taps: mtl.Buffer, next: *usize, n: usize, prompt: bool) !void {
-    const f: lanes.backend.Features = .{ .buffer = @intFromPtr(taps.id), .offset = next.* * row_bytes, .rows = @intCast(n), .row_bytes = row_bytes, .space = .device, .dtype = .bf16 };
+fn absorb(dv: lanes.drafter.Drafter, stream: *lanes.Stream, taps: mtl.Buffer, row_bytes: usize, next: *usize, n: usize, prompt: bool) !void {
+    const f: lanes.backend.Features = .{ .buffer = @intFromPtr(taps.id), .offset = next.* * row_bytes, .rows = @intCast(n), .row_bytes = @intCast(row_bytes), .space = .device, .dtype = .bf16 };
     try dv.absorb(&.{.{ .stream = stream, .features = f, .start = next.*, .follow = &.{}, .prompt = prompt }});
     next.* += n;
 }

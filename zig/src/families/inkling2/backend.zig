@@ -235,7 +235,7 @@ pub const Metal = struct {
 
     /// A tapped row's bytes: every tap's hidden row, bf16.
     fn tapBytes(self: *const Metal) usize {
-        return @as(usize, st.feature_taps) * self.model.config.text.hidden * 2;
+        return fwd.tapCount(self.model) * self.model.config.text.hidden * 2;
     }
 
     /// Allocate a stream cache under the budget, evicting prompt snapshots if needed, and restore any prefix snapshot.
@@ -322,24 +322,24 @@ pub const Metal = struct {
         while (!try prefillStepFn(ptr, stream, 0)) {}
     }
 
-    /// Validates the drafter's tap layers (`fwd.tap_layers` + finals) and enables row tapping on forwards.
+    /// Validates the drafter's tap layers (`fwd.tapLayers(model)` + finals) and enables row tapping on forwards.
     fn prepareFn(ptr: *anyopaque, taps: []const u32) !void {
         const self = cast(ptr);
-        if (!tapsAre(taps, self.model.config.text.virtualLayers())) return error.UnsupportedInkling2Taps;
+        if (!tapsAre(taps, fwd.tapLayers(self.model), self.model.config.text.virtualLayers())) return error.UnsupportedInkling2Taps;
         self.tapped = true;
     }
 
     /// Rows [start, start + count) of the stream's latest tapped rows, on the device.
     fn featuresFn(ptr: *anyopaque, stream: *lanes.Stream, taps: []const u32, start: u64, count: u32) !be.Features {
         const self = cast(ptr);
-        if (!self.tapped or !tapsAre(taps, self.model.config.text.virtualLayers())) return error.UnpreparedInkling2Taps;
+        if (!self.tapped or !tapsAre(taps, fwd.tapLayers(self.model), self.model.config.text.virtualLayers())) return error.UnpreparedInkling2Taps;
         return featuresOf(try self.cacheOf(stream), self.tapBytes(), start, count, self.tap_gen);
     }
 
     /// The prompt pass handing `sink` each chunk's tapped rows as it makes them.
     fn prefillFeaturesFn(ptr: *anyopaque, stream: *lanes.Stream, taps: []const u32, sink: be.FeatureSink) !void {
         const self = cast(ptr);
-        if (!self.tapped or !tapsAre(taps, self.model.config.text.virtualLayers())) return error.UnpreparedInkling2Taps;
+        if (!self.tapped or !tapsAre(taps, fwd.tapLayers(self.model), self.model.config.text.virtualLayers())) return error.UnpreparedInkling2Taps;
         self.sink = sink;
         defer self.sink = null;
         return prefillFn(ptr, stream);
@@ -505,10 +505,10 @@ fn admitBudget(held: u64, need: u64, budget: u64, active: usize) !void {
     return if (active > 0) error.LaneMemory else error.Inkling2CachesFull;
 }
 
-/// True when `taps` matches `fwd.tap_layers` followed by `layers` (the finals).
-fn tapsAre(taps: []const u32, layers: u32) bool {
-    const n = fwd.tap_layers.len;
-    return taps.len == n + 1 and std.mem.eql(u32, taps[0..n], &fwd.tap_layers) and taps[n] == layers;
+/// True when `taps` matches `expected` intermediate layers followed by `layers` (the finals).
+fn tapsAre(taps: []const u32, expected: []const u32, layers: u32) bool {
+    const n = expected.len;
+    return taps.len == n + 1 and std.mem.eql(u32, taps[0..n], expected) and taps[n] == layers;
 }
 
 /// Rows [start, start + count) from `cache`, preferring `last_tap` for the final prompt row.
@@ -537,12 +537,17 @@ test "inkling2 backend: the lane backend's functions compile against its interfa
     std.testing.refAllDecls(Metal);
 }
 
-test "inkling2 backend: the taps are the inputs of seven layers and the finals, named by the layer count, in order" {
-    try std.testing.expect(tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 48 }, 48));
-    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41 }, 48));
-    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 47 }, 48));
-    try std.testing.expect(!tapsAre(&.{ 11, 5, 17, 23, 29, 35, 41, 48 }, 48));
-    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 48, 48 }, 48));
+test "inkling2 backend: the taps are the configured layer inputs and the finals, named by the virtual layer count, in order" {
+    try std.testing.expect(tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 48 }, &fwd.tap_layers, 48));
+    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41 }, &fwd.tap_layers, 48));
+    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 47 }, &fwd.tap_layers, 48));
+    try std.testing.expect(!tapsAre(&.{ 11, 5, 17, 23, 29, 35, 41, 48 }, &fwd.tap_layers, 48));
+    try std.testing.expect(!tapsAre(&.{ 5, 11, 17, 23, 29, 35, 41, 48, 48 }, &fwd.tap_layers, 48));
+    // Mini 4-tap schedule
+    const mini_taps = [_]u32{ 5, 23, 41 };
+    try std.testing.expect(tapsAre(&.{ 5, 23, 41, 48 }, &mini_taps, 48));
+    try std.testing.expect(!tapsAre(&.{ 5, 23, 41, 24 }, &mini_taps, 48));
+    try std.testing.expect(!tapsAre(&.{ 5, 23, 41, 48 }, &fwd.tap_layers, 48));
 }
 
 test "inkling2 backend: features are the window's rows from the buffer's offset, guard stale generations, and preserve last_tap" {

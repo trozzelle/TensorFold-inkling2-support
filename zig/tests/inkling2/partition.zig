@@ -244,8 +244,10 @@ fn allFinite(what: []const u8, words: []const u16, width: usize) !void {
 /// of fewer layers than the first tap layer writes the finals alone).
 fn tapsFinite(m: *const ik.Model, taps: []const u16, rows: usize) !void {
     const H: usize = m.config.text.hidden;
-    for (0..rows) |r| for (0..ik.state.feature_taps) |k| {
-        if (k == ik.state.feature_taps - 1 or ik.forward.tap_layers[k] < m.layers) try allFinite("a row's taps", taps[(r * ik.state.feature_taps + k) * H ..][0..H], H);
+    const tlayers = ik.forward.tapLayers(m);
+    const n_taps = ik.forward.tapCount(m);
+    for (0..rows) |r| for (0..n_taps) |k| {
+        if (k >= tlayers.len or tlayers[k] < m.layers) try allFinite("a row's taps", taps[(r * n_taps + k) * H ..][0..H], H);
     };
 }
 
@@ -258,7 +260,7 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
     const L: usize = m.layers;
     const full = m.layers == c.virtualLayers();
     const row = rowBytes(c);
-    const tap_row: usize = ik.state.feature_taps * H;
+    const tap_row: usize = ik.forward.tapCount(m) * H;
     var snap: ?ik.snapshot.Snap = null;
     defer if (snap) |*sp| sp.free();
     if (restore_at > 0) {
@@ -440,7 +442,7 @@ fn compare(m: *const ik.Model, a: *const Leg, b: *const Leg, from: usize, T: usi
     if (a.taps) |ta| {
         const tb = b.taps.?;
         var taps: Differ = .{ .what = "taps" };
-        const width = ik.state.feature_taps * H;
+        const width = ik.forward.tapCount(m) * H;
         for (from..T) |r| {
             taps.rows += 1;
             if (!std.mem.eql(u16, ta[r * width ..][0..width], tb[r * width ..][0..width])) {
@@ -485,7 +487,7 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
     const m = try ik.Model.load(gpa, init.io, model_dir, .{
         .layers = opt.layers,
         .drafts = opt.drafts,
-        .draft_bits = if (draft) |d| d.bits else .default,
+        .draft_bits = if (draft) |d| d.bits else null,
         .prefill_rows = try settings.prefillRows(),
     });
     defer m.deinit();
@@ -500,7 +502,7 @@ pub fn run(init: std.process.Init, model_dir: []const u8, ids: []const u32, args
     defer s.deinit();
     // what the forward writes besides the cache, for the diagnosis: every layer's picks (and the tap layers' inputs, unread)
     const tp: ik.forward.Taps = .{
-        .h = try m.device.buffer(ik.forward.tap_layers.len * rows * c.hidden * 2, mtl.ResourceOptions.shared),
+        .h = try m.device.buffer(@max(ik.forward.tapLayers(m).len * rows * c.hidden * 2, 16), mtl.ResourceOptions.shared),
         .eids = try m.device.buffer(@as(usize, m.layers) * rows * 32, mtl.ResourceOptions.shared),
     };
     defer tp.h.deinit();

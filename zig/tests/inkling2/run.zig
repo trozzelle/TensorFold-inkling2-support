@@ -504,8 +504,10 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     }
     var s = try ik.state.Scratch.init(m.device, c, longest, m.chunking());
     defer s.deinit();
+    const tlayers = ik.forward.tapLayers(m);
+    const n_taps = ik.forward.tapCount(m);
     const tp: ik.forward.Taps = .{
-        .h = try m.device.buffer(ik.forward.tap_layers.len * R * H * 2, mtl.ResourceOptions.shared),
+        .h = try m.device.buffer(@max(tlayers.len * R * H * 2, 16), mtl.ResourceOptions.shared),
         .eids = try m.device.buffer(L * R * 32, mtl.ResourceOptions.shared),
         .xm = try m.device.buffer(ik.forward.xm_layers.len * R * H * 2, mtl.ResourceOptions.shared),
     };
@@ -519,7 +521,7 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
         defer ids.deinit();
         const P = ids.value.len;
         const T = P + steps - 1;
-        const taps = try init.gpa.alloc(u16, T * 8 * H);
+        const taps = try init.gpa.alloc(u16, T * n_taps * H);
         defer init.gpa.free(taps);
         const eids = try init.gpa.alloc(u32, T * L * 8);
         defer init.gpa.free(eids);
@@ -536,7 +538,7 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
         while (at < P) {
             const n = @min(P - at, R);
             try ik.forward.run(m, &s, &cache, ids.value[at..][0..n], .{ .finals = true, .logits = if (at + n == P) .last else .none, .taps = tp, .prompt = true });
-            gather(&s, tp, n, row, H, L, taps, eids, xm);
+            gather(&s, tp, n, row, H, L, n_taps, tlayers.len, taps, eids, xm);
             cache.len += n;
             row += n;
             at += n;
@@ -546,7 +548,7 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
             try tokens.append(init.gpa, pick);
             if (k + 1 == steps) break;
             try ik.forward.run(m, &s, &cache, &.{pick}, .{ .finals = true, .taps = tp });
-            gather(&s, tp, 1, row, H, L, taps, eids, xm);
+            gather(&s, tp, 1, row, H, L, n_taps, tlayers.len, taps, eids, xm);
             cache.len += 1;
             row += 1;
         }
@@ -563,15 +565,15 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
 }
 
 /// The `n` rows just run, from the capture buffers and s.finals into the host arrays at `row`.
-fn gather(s: *ik.state.Scratch, tp: ik.forward.Taps, n: usize, row: usize, H: usize, L: usize, taps: []u16, eids: []u32, xm: []u16) void {
-    const th = tp.h.slice(u16, ik.forward.tap_layers.len * n * H);
+fn gather(s: *ik.state.Scratch, tp: ik.forward.Taps, n: usize, row: usize, H: usize, L: usize, n_taps: usize, n_mid: usize, taps: []u16, eids: []u32, xm: []u16) void {
+    const th = tp.h.slice(u16, n_mid * n * H);
     const fin = s.finals.slice(u16, n * H);
     const te = tp.eids.slice(u32, L * n * 8);
     const tx = tp.xm.?.slice(u16, ik.forward.xm_layers.len * n * H);
     for (0..n) |r| {
-        const dst = taps[(row + r) * 8 * H ..][0 .. 8 * H];
-        for (0..ik.forward.tap_layers.len) |k| @memcpy(dst[k * H ..][0..H], th[(k * n + r) * H ..][0..H]);
-        @memcpy(dst[7 * H ..][0..H], fin[r * H ..][0..H]);
+        const dst = taps[(row + r) * n_taps * H ..][0 .. n_taps * H];
+        for (0..n_mid) |k| @memcpy(dst[k * H ..][0..H], th[(k * n + r) * H ..][0..H]);
+        if (n_mid < n_taps) @memcpy(dst[n_mid * H ..][0..H], fin[r * H ..][0..H]);
         for (0..L) |l| @memcpy(eids[((row + r) * L + l) * 8 ..][0..8], te[(l * n + r) * 8 ..][0..8]);
         for (0..ik.forward.xm_layers.len) |k| @memcpy(xm[((row + r) * 2 + k) * H ..][0..H], tx[(k * n + r) * H ..][0..H]);
     }
@@ -584,7 +586,7 @@ fn writeSeq(init: std.process.Init, dir: []const u8, seq: usize, suffix: []const
 }
 
 /// ids[..at] in prompt chunks, then the rest in decode windows of at most `window` rows, every forward writing its rows' serving
-/// taps (what the drafter reads): bf16 [T][8][H] to the file, the layout of `taps` mode's taps.bin.
+/// taps (what the drafter reads): bf16 [T][taps][H] to the file, the layout of `taps` mode's taps.bin.
 fn ftapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len < 5 or args.len > 7) return error.ExpectedIdsOutAtWindow;
     const ids = try readIds(init, args[3]);
@@ -596,7 +598,7 @@ fn ftapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const m = try ik.Model.load(init.gpa, init.io, args[1], try options(null));
     defer m.deinit();
     const c = &m.config.text;
-    const row: usize = ik.state.feature_taps * @as(usize, c.hidden);
+    const row: usize = ik.forward.tapCount(m) * @as(usize, c.hidden);
     var s = try ik.state.Scratch.init(m.device, c, T + 1, m.chunking());
     defer s.deinit();
     var cache = try ik.state.Cache.init(m.device, c, T + 1, c.virtualLayers(), m.prefill_rows);
@@ -854,7 +856,7 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const draft: ?settings.Draft = if (opt.drafts) try settings.draft() else null;
     var load = try chunkOptions(opt.layers, opt.chunk);
     load.drafts = opt.drafts;
-    load.draft_bits = if (draft) |d| d.bits else .default;
+    load.draft_bits = if (draft) |d| d.bits else null;
     const m = try ik.Model.load(gpa, init.io, args[1], load);
     defer m.deinit();
     const c = &m.config.text;

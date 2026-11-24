@@ -59,7 +59,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     };
     // how a round drafts and how wide the draft layers' weights are: only a load with drafts reads them, once
     var drafting: fl.dspark.Drafting = .{ .depth = .default };
-    var bits: fl.dspark_weights.Bits = .default;
+    var bits: ?fl.dspark_weights.Bits = null;
     if (o.drafts) {
         drafting = fl.dspark.Drafting.parse(if (std.c.getenv("INKLING_DRAFT_DEPTH")) |v| std.mem.span(v) else null, if (std.c.getenv("INKLING_DRAFT_CONFIDENCE")) |v| std.mem.span(v) else null) catch |err| {
             problem.* = switch (err) {
@@ -68,8 +68,8 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
             };
             return null;
         };
-        bits = fl.dspark_weights.Bits.parse(if (std.c.getenv("INKLING_DRAFT_BITS")) |v| std.mem.span(v) else null) catch {
-            problem.* = "INKLING_DRAFT_BITS is not a draft weight width: give 8 (quantized at load) or 16 (bf16); unset it for 8";
+        bits = fl.dspark_weights.Bits.parseOpt(if (std.c.getenv("INKLING_DRAFT_BITS")) |v| std.mem.span(v) else null) catch {
+            problem.* = "INKLING_DRAFT_BITS is not a draft weight width: give 8 (quantized at load) or 16 (bf16); unset for model default";
             return null;
         };
     }
@@ -203,7 +203,7 @@ const Snaps = struct {
     }
     fn bytes(ptr: *anyopaque, at: u32) u64 {
         const h = host(ptr);
-        return M.snapBytes(h.metal, at) + if (h.draft != null) fl.dspark.Drafter.keptBytes() else 0;
+        return M.snapBytes(h.metal, at) + if (h.draft) |d| fl.dspark.Drafter.keptBytesFor(d.mtp) else 0;
     }
     fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
         const h = host(ptr);

@@ -46,7 +46,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     // <model> dspark <taps_dir> <seqs> <out_dir> then any of --depth d, --bits 8|16, --from-back K
     if (args.len < 6 or args.len % 2 != 0) return error.ExpectedTapsSeqsOutFlags;
     var depth: u32 = steps;
-    var bits: ik.dspark_weights.Bits = .default;
+    var bits: ?ik.dspark_weights.Bits = null;
     var from_back: ?usize = null;
     var flag: usize = 6;
     while (flag < args.len) : (flag += 2) {
@@ -71,7 +71,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !void {
     const drafter = try ik.dspark.Drafter.init(init.gpa, m.device, m, weights, .{ .depth = depth, .probabilities = true });
     defer drafter.deinit();
     try drafter.captureLogits();
-    std.debug.print("{{\"load_s\": {d:.1}, \"drafter_s\": {d:.1}, \"depth\": {d}, \"bits\": {d}, \"hold_ms\": {d:.3}, \"step_ms\": {d:.3}, \"resident_gib\": {d:.2}, \"head_gib\": {d:.3}}}\n", .{ loaded - t0, now() - loaded, depth, @backingInt(bits), drafter.hold_ms, drafter.step_ms, @as(f64, @floatFromInt(m.checkpoint.residentBytes() + drafter.scratchBytes())) / (1 << 30), @as(f64, @floatFromInt(drafter.residentBytes(1))) / (1 << 30) });
+    std.debug.print("{{\"load_s\": {d:.1}, \"drafter_s\": {d:.1}, \"depth\": {d}, \"bits\": {d}, \"hold_ms\": {d:.3}, \"step_ms\": {d:.3}, \"resident_gib\": {d:.2}, \"head_gib\": {d:.3}}}\n", .{ loaded - t0, now() - loaded, depth, @backingInt(weights.bits), drafter.hold_ms, drafter.step_ms, @as(f64, @floatFromInt(m.checkpoint.residentBytes() + drafter.scratchBytes())) / (1 << 30), @as(f64, @floatFromInt(drafter.residentBytes(1))) / (1 << 30) });
     for (seqs) |seq| try replay(init, m, drafter, args[3], args[5], seq, depth, from_back);
 }
 
