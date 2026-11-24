@@ -510,6 +510,309 @@ fn caseSplitWindowShared(g: *const h.Gpu, r: std.Random) !void {
     try c.done();
 }
 
+/// G=3 (24 q heads, 8 kv heads, 128 dims) verification: FP64 reference for sliding and global attention, 1-row vs
+/// 16-row window bit-exactness, `ik_attn_part_w_g3 == ik_attn_part_g3` across rows = 1, 4, 8, 16 (partials and merged
+/// outputs), and NaN containment for both queries and relative states.
+fn caseG3(g: *const h.Gpu, r: std.Random) !void {
+    const Hq3 = 24;
+    const OUT_ROW3 = Hq3 * D * 2;
+    const nan: u16 = 0x7fc0;
+    const alloc = std.heap.page_allocator;
+
+    const qn = try g.buf(ROWS * Hq3 * D * 2);
+    const keys = try g.buf(CAP * KV * D * 2);
+    const vals = try g.buf(CAP * KV * D * 2);
+    const reln = try g.buf(ROWS * Hq3 * REL * 2);
+    const proj = try g.buf(REL * E * 2);
+    const sink = try g.buf(ROWS * Hq3 * 2);
+    const gate = try g.buf(ROWS * Hq3 * D * 2);
+    const att = try g.buf(ROWS * OUT_ROW3);
+    const part = try g.buf(ROWS * Hq3 * MAX_BLOCKS * SLOT * 4);
+    defer for ([_]mtl.Buffer{ qn, keys, vals, reln, proj, sink, gate, att, part }) |b| b.deinit();
+
+    const qv = h.fill16(qn, ROWS * Hq3 * D, r, 2.5);
+    const kv = h.fill16(keys, CAP * KV * D, r, 2.5);
+    const vv = h.fill16(vals, CAP * KV * D, r, 1.0);
+    const relv = h.fill16(reln, ROWS * Hq3 * REL, r, 1.0);
+    const projv = h.fill16(proj, REL * E, r, 1.5);
+    const sv = h.fill16(sink, ROWS * Hq3, r, 2.0);
+    const gv = h.fill16(gate, ROWS * Hq3 * D, r, 3.0);
+
+    const pbv = try alloc.alloc(u16, ROWS * Hq3 * E);
+    defer alloc.free(pbv);
+    for (0..ROWS * Hq3) |rh| for (0..E) |d| {
+        var s: f32 = 0;
+        for (0..REL) |i| s += @as(f32, @floatCast(h.fb(relv[rh * REL + i]))) * @as(f32, @floatCast(h.fb(projv[i * E + d])));
+        pbv[rh * E + d] = h.bf(s);
+    };
+
+    const args3 = struct {
+        fn make(rows: u32, pos: u32, window: u32, f0: u32, n: u32) h.Args {
+            return .{
+                .rows = rows,
+                .heads = Hq3,
+                .kv = KV,
+                .dim = D,
+                .pos = pos,
+                .window = window,
+                .extent = E,
+                .ring = CAP,
+                .blocks = n,
+                .queries = f0,
+                .scale = @floatCast(1 / @sqrt(@as(f64, D))),
+            };
+        }
+    }.make;
+
+    const runG3 = struct {
+        fn call(gpu: *const h.Gpu, qn_b: mtl.Buffer, keys_b: mtl.Buffer, vals_b: mtl.Buffer, reln_b: mtl.Buffer, proj_b: mtl.Buffer, sink_b: mtl.Buffer, gate_b: mtl.Buffer, part_b: mtl.Buffer, att_b: mtl.Buffer, row: usize, rows: u32, pos: u32, window: u32, f0: u32, n: u32) !void {
+            @memset(part_b.slice(f32, rows * Hq3 * n * SLOT), std.math.nan(f32));
+            @memset(att_b.slice(u8, ROWS * OUT_ROW3)[row * OUT_ROW3 ..][0 .. rows * OUT_ROW3], 0xff);
+            const a = args3(rows, pos, window, f0, n);
+            try gpu.run("ik_attn_part_g3", a, &.{
+                .{ .buf = qn_b, .off = row * Hq3 * D * 2 },
+                .{ .buf = keys_b },
+                .{ .buf = vals_b },
+                .{ .buf = reln_b, .off = row * Hq3 * REL * 2 },
+                .{ .buf = proj_b },
+                .{ .buf = part_b },
+            }, .{ KV, rows, n }, .{ 32, PART_SIMDGROUPS, 1 }, true);
+            try gpu.run("ik_attn_merge", a, &.{
+                .{ .buf = part_b },
+                .{ .buf = sink_b, .off = row * Hq3 * 2 },
+                .{ .buf = gate_b, .off = row * Hq3 * D * 2 },
+                .{ .buf = att_b, .off = row * OUT_ROW3 },
+            }, .{ Hq3, rows, 1 }, .{ 32, 1, 1 }, true);
+        }
+    }.call;
+
+    // 1. FP64 reference (sliding and global)
+    const qf = try alloc.alloc(f64, qv.len);
+    const kf = try alloc.alloc(f64, kv.len);
+    const vf = try alloc.alloc(f64, vv.len);
+    defer for ([_][]f64{ qf, kf, vf }) |s| alloc.free(s);
+    for (qf, qv) |*o, v| o.* = h.fb(v);
+    for (kf, kv) |*o, v| o.* = h.fb(v);
+    for (vf, vv) |*o, v| o.* = h.fb(v);
+    const scale = 1 / @sqrt(@as(f64, D));
+    var logits: [CAP]f64 = undefined;
+
+    for ([_]u32{ 1024, 0 }) |window| {
+        var c: h.Check = .{ .name = if (window > 0) "split g3 local" else "split g3 global" };
+        var co: h.Check = .{ .name = if (window > 0) "split g3 part local" else "split g3 part global" };
+        for ([_]u32{ 0, 255, 1500, 2700 }) |pos| for ([_]u32{ 1, ROWS }) |rows| {
+            const bad = c.bad + co.bad;
+            const grid = blocksOf(pos, rows, window);
+            try runG3(g, qn, keys, vals, reln, proj, sink, gate, part, att, 0, rows, pos, window, grid.f0, grid.n);
+            const att16 = att.slice(u16, ROWS * Hq3 * D);
+            const part32 = part.slice(f32, rows * Hq3 * grid.n * SLOT);
+            for (0..rows) |t| for (0..Hq3) |hd| {
+                const p = pos + t;
+                const lo = if (window > 0 and p + 1 > window) p + 1 - window else 0;
+                const kvh = hd / (Hq3 / KV);
+                const qh = qf[(t * Hq3 + hd) * D ..][0..D];
+                const sink_v = h.fb(sv[t * Hq3 + hd]);
+                var m = sink_v;
+                for (lo..p + 1) |j| {
+                    const kr = kf[(j * KV + kvh) * D ..][0..D];
+                    var s: f64 = 0;
+                    for (qh, kr) |qd, kd| s += qd * kd;
+                    s *= scale;
+                    if (p - j < E) s += h.fb(pbv[(t * Hq3 + hd) * E + p - j]);
+                    logits[j - lo] = s;
+                    m = @max(m, s);
+                }
+                var z = @exp(sink_v - m);
+                var o: [D]f64 = @splat(0);
+                for (lo..p + 1) |j| {
+                    const w = @exp(logits[j - lo] - m);
+                    z += w;
+                    const vr = vf[(j * KV + kvh) * D ..][0..D];
+                    for (&o, vr) |*od, vd| od.* += w * vd;
+                }
+                // Fold partials from ik_attn_part_g3 as ik_attn_merge does to check the pre-gate bf16 output at <= 1 ULP.
+                var pm: f32 = @floatCast(sink_v);
+                var pl: f32 = 1.0;
+                var pacc: [D]f32 = @splat(0.0);
+                const head_part = part32[(t * Hq3 + hd) * grid.n * SLOT ..][0 .. grid.n * SLOT];
+                for (0..grid.n) |b| {
+                    const slot = head_part[b * SLOT ..][0..SLOT];
+                    const mb = slot[0];
+                    const lb = slot[1];
+                    if (lb == 0.0) continue;
+                    const mn = @max(pm, mb);
+                    const f = @exp(pm - mn);
+                    const fb_w = @exp(mb - mn);
+                    pl = @mulAdd(f32, pl, f, lb * fb_w);
+                    for (0..D) |d| pacc[d] = @mulAdd(f32, pacc[d], f, slot[2 + d] * fb_w);
+                    pm = mn;
+                }
+                for (0..D) |d| {
+                    co.b16a(h.bf(pacc[d] / pl), o[d] / z, 1, 1e-6);
+                    const gt = h.fb(gv[(t * Hq3 + hd) * D + d]);
+                    // two rounding points (o, then o times the gate), as caseSplitRef
+                    c.b16a(att16[(t * Hq3 + hd) * D + d], h.rb(o[d] / z) / (1 + @exp(-gt)), 2, 1e-6);
+                }
+            };
+            if (c.bad + co.bad != bad) std.debug.print("  failing: pos {d}, {d} rows\n", .{ pos, rows });
+        };
+        try co.done();
+        try c.done();
+    }
+
+    // 2. 1-row vs 16-row window bit-exactness and NaN containment for ik_attn_part_g3
+    const saved = try alloc.alloc(u8, ROWS * OUT_ROW3);
+    defer alloc.free(saved);
+    for ([_]u32{ 1024, 0 }) |window| {
+        var c: h.Check = .{ .name = if (window > 0) "split g3 window local" else "split g3 window global" };
+        for ([_]u32{ 0, 250, 1020, 1500, 2700 }) |pos| {
+            const bad = c.bad;
+            const grid = blocksOf(pos, ROWS, window);
+            try runG3(g, qn, keys, vals, reln, proj, sink, gate, part, att, 0, ROWS, pos, window, grid.f0, grid.n);
+            @memcpy(saved, att.slice(u8, ROWS * OUT_ROW3));
+            finite(&c, saved);
+            for (0..ROWS) |t| {
+                const one = blocksOf(pos + @as(u32, @intCast(t)), 1, window);
+                try runG3(g, qn, keys, vals, reln, proj, sink, gate, part, att, t, 1, pos + @as(u32, @intCast(t)), window, one.f0, one.n);
+                const row_out = att.slice(u8, ROWS * OUT_ROW3)[t * OUT_ROW3 ..][0..OUT_ROW3];
+                finite(&c, row_out);
+                c.same(row_out, saved[t * OUT_ROW3 ..][0..OUT_ROW3]);
+            }
+            // Extra empty blocks before/after must not alter row 0.
+            const one0 = blocksOf(pos, 1, window);
+            for ([_][2]u32{ .{ 2, 0 }, .{ 0, 2 }, .{ 2, 2 } }) |extra| {
+                if (one0.f0 < extra[0]) continue;
+                try runG3(g, qn, keys, vals, reln, proj, sink, gate, part, att, 0, 1, pos, window, one0.f0 - extra[0], one0.n + extra[0] + extra[1]);
+                c.same(att.slice(u8, OUT_ROW3), saved[0..OUT_ROW3]);
+            }
+            // NaN in row 1's query and relative state must stay confined to row 1.
+            const q_at = Hq3 * D;
+            const kept_q = qv[q_at];
+            qv[q_at] = nan;
+            try runG3(g, qn, keys, vals, reln, proj, sink, gate, part, att, 0, ROWS, pos, window, grid.f0, grid.n);
+            qv[q_at] = kept_q;
+            for (0..ROWS) |t| if (t != 1) c.same(att.slice(u8, ROWS * OUT_ROW3)[t * OUT_ROW3 ..][0..OUT_ROW3], saved[t * OUT_ROW3 ..][0..OUT_ROW3]);
+            const rel_at = Hq3 * REL + 2 * REL;
+            const kept_r = relv[rel_at];
+            relv[rel_at] = nan;
+            try runG3(g, qn, keys, vals, reln, proj, sink, gate, part, att, 0, ROWS, pos, window, grid.f0, grid.n);
+            relv[rel_at] = kept_r;
+            for (0..ROWS) |t| if (t != 1) c.same(att.slice(u8, ROWS * OUT_ROW3)[t * OUT_ROW3 ..][0..OUT_ROW3], saved[t * OUT_ROW3 ..][0..OUT_ROW3]);
+            if (c.bad != bad) std.debug.print("  failing: pos {d}\n", .{pos});
+        }
+        try c.done();
+    }
+
+    // 3. ik_attn_part_w_g3 == ik_attn_part_g3 bit-exactness across rows = 1, 4, 8, 16, tail NaN poisoning, and NaN containment
+    const ref_part = try alloc.alloc(u8, ROWS * Hq3 * MAX_BLOCKS * SLOT * 4);
+    const ref_att = try alloc.alloc(u8, ROWS * OUT_ROW3);
+    const saved_k = try alloc.alloc(u16, KEYS * KV * D);
+    const saved_v = try alloc.alloc(u16, KEYS * KV * D);
+    defer for ([_][]u8{ ref_part, ref_att }) |b| alloc.free(b);
+    defer for ([_][]u16{ saved_k, saved_v }) |b| alloc.free(b);
+
+    var cw: h.Check = .{ .name = "split g3 window shared global" };
+    for ([_]u32{ 250, 300, 1500, 2700 }) |pos| {
+        for ([_]u32{ 1, 4, 8, 16 }) |rows| {
+            const rows_u: usize = rows;
+            const bad = cw.bad;
+            const grid = blocksOf(pos, rows, 0);
+            const nblocks: u32 = if (pos == 300 and rows == 8) grid.n + 2 else grid.n;
+            const part_bytes: usize = rows_u * Hq3 * nblocks * SLOT * 4;
+            const att_bytes: usize = rows_u * OUT_ROW3;
+
+            const tail0: usize = pos + rows_u;
+            const tail_n: usize = @min(KEYS, CAP - tail0);
+            const ktail = kv[tail0 * KV * D ..][0 .. tail_n * KV * D];
+            const vtail = vv[tail0 * KV * D ..][0 .. tail_n * KV * D];
+            @memcpy(saved_k[0 .. tail_n * KV * D], ktail);
+            @memcpy(saved_v[0 .. tail_n * KV * D], vtail);
+            @memset(ktail, nan);
+            @memset(vtail, nan);
+            defer {
+                @memcpy(ktail, saved_k[0 .. tail_n * KV * D]);
+                @memcpy(vtail, saved_v[0 .. tail_n * KV * D]);
+            }
+
+            // Reference: ik_attn_part_g3 + ik_attn_merge
+            try runG3(g, qn, keys, vals, reln, proj, sink, gate, part, att, 0, rows, pos, 0, grid.f0, nblocks);
+            @memcpy(ref_part[0..part_bytes], part.slice(u8, part_bytes));
+            @memcpy(ref_att[0..att_bytes], att.slice(u8, att_bytes));
+            finite(&cw, ref_att[0..att_bytes]);
+
+            // Shared-KV global window kernel: grid (KV, 1, nblocks), group (32, 3, 1)
+            const aw = args3(rows, pos, 0, grid.f0, nblocks);
+            @memset(part.slice(f32, rows_u * Hq3 * nblocks * SLOT), std.math.nan(f32));
+            @memset(att.slice(u8, att_bytes), 0xff);
+            try g.run("ik_attn_part_w_g3", aw, &.{
+                .{ .buf = qn },
+                .{ .buf = keys },
+                .{ .buf = vals },
+                .{ .buf = reln },
+                .{ .buf = proj },
+                .{ .buf = part },
+            }, .{ KV, 1, nblocks }, .{ 32, 3, 1 }, true);
+            cw.same(part.slice(u8, part_bytes), ref_part[0..part_bytes]);
+            try g.run("ik_attn_merge", aw, &.{
+                .{ .buf = part },
+                .{ .buf = sink },
+                .{ .buf = gate },
+                .{ .buf = att },
+            }, .{ Hq3, rows, 1 }, .{ 32, 1, 1 }, true);
+            finite(&cw, att.slice(u8, att_bytes));
+            cw.same(att.slice(u8, att_bytes), ref_att[0..att_bytes]);
+
+            // NaN query and relative-state containment on full 16-row windows (covering multiple row tiles).
+            if (rows == ROWS and (pos == 300 or pos == 2700)) {
+                for ([_]usize{ 1, 9 }) |bad_row| {
+                    const q_at = bad_row * Hq3 * D;
+                    const kept_q = qv[q_at];
+                    qv[q_at] = nan;
+                    @memset(part.slice(f32, rows_u * Hq3 * nblocks * SLOT), std.math.nan(f32));
+                    try g.run("ik_attn_part_w_g3", aw, &.{
+                        .{ .buf = qn },
+                        .{ .buf = keys },
+                        .{ .buf = vals },
+                        .{ .buf = reln },
+                        .{ .buf = proj },
+                        .{ .buf = part },
+                    }, .{ KV, 1, nblocks }, .{ 32, 3, 1 }, true);
+                    try g.run("ik_attn_merge", aw, &.{
+                        .{ .buf = part },
+                        .{ .buf = sink },
+                        .{ .buf = gate },
+                        .{ .buf = att },
+                    }, .{ Hq3, rows, 1 }, .{ 32, 1, 1 }, true);
+                    qv[q_at] = kept_q;
+                    for (0..rows_u) |t| if (t != bad_row) cw.same(att.slice(u8, att_bytes)[t * OUT_ROW3 ..][0..OUT_ROW3], ref_att[t * OUT_ROW3 ..][0..OUT_ROW3]);
+                }
+                const rel_at = Hq3 * REL + 2 * REL;
+                const kept_r = relv[rel_at];
+                relv[rel_at] = nan;
+                @memset(part.slice(f32, rows_u * Hq3 * nblocks * SLOT), std.math.nan(f32));
+                try g.run("ik_attn_part_w_g3", aw, &.{
+                    .{ .buf = qn },
+                    .{ .buf = keys },
+                    .{ .buf = vals },
+                    .{ .buf = reln },
+                    .{ .buf = proj },
+                    .{ .buf = part },
+                }, .{ KV, 1, nblocks }, .{ 32, 3, 1 }, true);
+                try g.run("ik_attn_merge", aw, &.{
+                    .{ .buf = part },
+                    .{ .buf = sink },
+                    .{ .buf = gate },
+                    .{ .buf = att },
+                }, .{ Hq3, rows, 1 }, .{ 32, 1, 1 }, true);
+                relv[rel_at] = kept_r;
+                for (0..rows_u) |t| if (t != 1) cw.same(att.slice(u8, att_bytes)[t * OUT_ROW3 ..][0..OUT_ROW3], ref_att[t * OUT_ROW3 ..][0..OUT_ROW3]);
+            }
+            if (cw.bad != bad) std.debug.print("  failing: pos {d}, {d} rows\n", .{ pos, rows });
+        }
+    }
+    try cw.done();
+}
+
 pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseSplitRef(g, r);
     try caseSplitWindow(g, r);
@@ -517,4 +820,5 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseSplitBias(g, r);
     try caseSplitRing(g, r);
     try caseSplitWindowShared(g, r);
+    try caseG3(g, r);
 }
