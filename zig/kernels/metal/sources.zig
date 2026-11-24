@@ -241,6 +241,8 @@ pub const inkling2_dspark = @embedFile("inkling2/dspark.metal");
 /// Inkling 2's prompt-chunk expert chain on the tensor units: the decode chain's helpers (the bf16 matvec macros and
 /// glue.metal's arguments, xd.metal's rotation, codebook and descriptors) and xp.metal (nax.h inlined at load), its own library.
 pub const inkling2_xp = @embedFile("core/bf16_matvec.metal") ++ @embedFile("inkling2/glue.metal") ++ @embedFile("inkling2/xd.metal") ++ @embedFile("inkling2/xp.metal");
+/// Inkling 2's native NVFP4/MXFP8 routed-expert prefill chain on the tensor units (nax.h inlined at load).
+pub const inkling2_xp_fp = @embedFile("inkling2/xp_fp.metal");
 /// Inkling 2's dense prompt projections on gemm_nax's tensor-unit GEMM, bf16 or f32 rows out (nax.h inlined at load).
 pub const inkling2_gemm = gemm_nax ++ @embedFile("inkling2/gemm.metal");
 /// Inkling 2's prompt attention on the tensor units: a chunk's rows against the layer's cache, sink, relative bias and
