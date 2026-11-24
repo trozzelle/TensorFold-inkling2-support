@@ -34,8 +34,8 @@ Point TensorFold directly at the downloaded `thinkingmachines/Inkling-2-Mini` sn
 - The checkpoint loads in about 3.8 s on an M5 Max: `17.59 GiB` for the main model (`18.3 GiB` total with the bf16 DSpark draft head for 8 streams), `1.45 GiB` of prompt-chunk scratch at the default 4,096 rows, and `19.8 GiB` wired at rest.
 - On a 128 GB Mac (default 75% load limit), `74.1 GiB` remains for KV caches and prompt snapshots — `1,048,576` token slots across up to 8 streams, with `8.0 GiB` reserved for the prompt cache (`--prompt-cache-gib`, `0` disables it). On a 32–64 GB Mac, lower `--load-limit-gb` or `INKLING_PREFILL_ROWS=512` if tighter scratch/cache bounds are needed.
 - Virtual layer geometry mirrors Small's KV footprint per token: 40 sliding virtual layers (1,024-token window, ring sized to `alignForward(window + prefill_rows + 64, 256)`) and 8 global virtual layers (`8` KV heads × `128` dims in bf16 = `32 KiB/token`). Each admitted stream reserves the fixed sliding-ring and convolution floor plus `32 KiB/token` dynamically.
-- **Prompt chunk path (M5 tensor units):** on GPUs with tensor units, prompt chunks take `.chunk` (`INKLING_PREFILL_ROWS`, default `4,096`): dense projections and routers run as bf16→f32 GEMMs, attention runs parameterized `pattn` (`NQ=24, G=3`), and routed experts run `xp_fp` (single-list GPU sort into 32-row windows with exact in-register bf16 dequantization of both NVFP4 `e2m1 × e4m3` and MXFP8 `e4m3 × ue8m0` into `mma_16x32`, `SoftcappedSwiGLU`, and pick-ordered combine). GPUs without tensor units (or `INKLING_PROMPT_PATH=per_op`) fall back to the per-operation prompt path (`512`-row default).
-- **Decode path:** single-stream decode steps (`1..16` rows, including draft verification) use per-row NVFP4/MXFP8 expert kernels (`fp_experts`), GQA=3 split-K attention (`attn_split` with `ik_attn_part_w` shared K/V loads at long contexts), and fused 3-slot Pass 1–2 `MessageGate` controllers (`ik_msggate_prep3` → one stacked `mvs` call for all three `down_proj` projections → `ik_msggate_apply_norm3`), keeping 1-row steps, 16-row windows, and drafted verification bit-identical. Wide multi-stream shared decode batches (`segments.len > 1` and `rows >= 12`, up to 64 rows) switch routed experts to `xp_fp`.
+- **Prompt chunk path (M5 tensor units):** on GPUs with tensor units, prompt chunks take `.chunk` (`INKLING_PREFILL_ROWS`, default `4,096`): dense projections, routers, and Pass 1–2 `MessageGate` `forget`/`gain` projections (`ctrl_nax`) run as tensor-unit GEMMs, attention runs parameterized `pattn` (`NQ=24, G=3`), and routed experts run `xp_fp` (single-list GPU sort into 32-row windows with exact in-register bf16 dequantization of both NVFP4 `e2m1 × e4m3` and MXFP8 `e4m3 × ue8m0` into `mma_16x32`, `SoftcappedSwiGLU`, and pick-ordered combine). GPUs without tensor units (or `INKLING_PROMPT_PATH=per_op`) fall back to the per-operation prompt path (`512`-row default).
+- **Decode path:** single-stream decode steps (`1..16` rows, including draft verification) use per-row NVFP4/MXFP8 expert kernels at 1 row and bit-identical GPU-grouped (`<= 4`-slot tile) kernels (`ik_fp_group` + `*_g`) at `2..16` rows, GQA=3 split-K attention (`attn_split` with `ik_attn_part_w_g3` shared K/V loads at long contexts), and fused Pass 1–2 decode controllers (`ik_loop_attn_prep`/`prep3` & `ik_loop_mlp_prep` → stacked `mvs` `down_proj` → coalesced multi-threadgroup `ik_msggate_fg_decode`/`fg_decode3` + `ik_norm3_f32`), keeping 1-row steps, 16-row windows, and drafted verification bit-identical. Wide multi-stream shared decode batches (`segments.len > 1` and `rows >= 12`, up to 64 rows) switch routed experts to `xp_fp`, and concurrent DSpark holds batch their draft projections, unembedding, and `fold_w` Markov scoring across active streams (`ikd_fold_pick_batch`, with lazy `27.9 MiB` batch scratch allocated only when `c > 1`).
 - **Host-side switches:** `INKLING_WARM_WAIT=0`, `INKLING_FIRST_CHUNK=N`, `INKLING_ROUND_TIMING=1`, `INKLING_PREFILL_ROWS`, `INKLING_PROMPT_PATH`, `--decode-share`, and `launchd` settings (`ProcessType: Interactive`) behave identically to [`inkling2-exl3-metal.md`](inkling2-exl3-metal.md).
 
 ## Drafts
@@ -53,36 +53,36 @@ Measured on an Apple M5 Max (40-core Metal 4 GPU, 128 GB unified memory, ~614 GB
 
 | Workload | Plain (`--no-drafts`) | Drafted (bf16 default) | Notes |
 |---|---:|---:|---|
-| Prefill, `512` tokens (warm) | `1,649 tok/s` (`311 ms`) | `1,627 tok/s` (`315 ms`) | `absorb: 3.5 ms` |
-| Prefill, `8,192` tokens (warm) | `2,147 tok/s` (`3.82 s`) | `2,051 tok/s` (`3.99 s`) | `absorb: 7.1 ms`; bit-identical hidden digest |
-| Prefill, `32,704` tokens | `1,777 tok/s` (`18.40 s`) | — | 8 chunks |
-| Prefill, `131,008` tokens | `1,238 tok/s` (`105.8 s`) | — | 32 chunks (sustained laptop thermal envelope) |
-| Decode, `512` + `128` tokens | `47.2 tok/s` (`20.9 ms` GPU) | `78.4 tok/s` (`1.66×`) | `128/128` bit-identical; `70.8%` acc, `2.46` tok/round (`80.0 tok/s` at `BITS=8`) |
-| Decode, `32,704` + `64` tokens | `42.4 tok/s` (`23.3 ms` GPU) | `57.7 tok/s` (`1.36×`) | `64/64` bit-identical; `71.1%` acc, `2.00` tok/round |
-| Decode, `131,008` + `64` tokens | `32.9 tok/s` (`30.0 ms` GPU) | `49.0 tok/s` (`1.49×`) | `64/64` bit-identical; `82.5%` acc, `2.13` tok/round |
+| Prefill, `512` tokens (warm) | `2,175 tok/s` (`235 ms`) | — | `norm: 40.4 ms`, `experts: 117.6 ms` |
+| Prefill, `8,192` tokens (warm) | `2,754 tok/s` (`2.97 s`) | `2,762 tok/s` (`2.97 s`) | `absorb: 8.8 ms`; bit-identical hidden digest |
+| Prefill, `32,704` tokens | `2,282 tok/s` (`14.33 s`) | — | 8 chunks |
+| Prefill, `131,008` tokens | `1,601 tok/s` (`81.8 s`) | — | 32 chunks (sustained laptop thermal envelope) |
+| Decode, `512` + `128` tokens | `61.5 tok/s` (`16.0 ms` GPU) | `76.0 tok/s` (`1.23×`) | `128/128` bit-identical (`2.06` tok/round on this passage) |
+| Decode, `32,704` + `64` tokens | `51.4 tok/s` (`19.2 ms` GPU) | `64.2 tok/s` (`1.25×`) | `64/64` bit-identical; `71.1%` acc, `2.00` tok/round |
+| Decode, `131,008` + `64` tokens | `37.1 tok/s` (`26.6 ms` GPU) | `49.0 tok/s` (`1.32×`) | `64/64` bit-identical; `63.8%` acc, `1.94` tok/round |
 
 ### Served concurrency and prompt cache (`tensorfold-native serve --parallel 8`)
 
-Loaded in `3.8 s` (`18.3 GiB` weights incl. `0.80 GiB` bf16 DSpark, `1.45 GiB` scratch, `74.1 GiB` caches, `19.8 GiB` wired, `18.5 GiB` peak RSS). Distinct ~245-token prompts with `max_tokens: 128` (`temperature: 0`) for the concurrency sweep; `32,046`-token prompt with `max_tokens: 64` for the 32k cache check:
+Loaded in `3.8–4.7 s` (`18.3 GiB` weights incl. `0.80 GiB` bf16 DSpark, `1.45 GiB` scratch, `74.1 GiB` caches, `19.8 GiB` wired, `18.5 GiB` peak RSS). Distinct ~245-token prompts with `max_tokens: 128` (`temperature: 0`) for the concurrency sweep; `32,046`-token prompt with `max_tokens: 64` for the 32k cache check:
 
 | Workload | Concurrency | Prompt tokens | TTFT | Decode (`tok/s`) | Aggregate decode (`tok/s`) | Notes |
 |---|---:|---:|---:|---:|---:|---|
-| Short decode (`c=1`) | 1 | 221 | `0.38 s` | `78.2` | `78.2` (`1.00×`) | `2.67` tok/round |
-| Short decode (`c=2`) | 2 | 221–248 | `0.42 s` | `52.5` | `104.9` (`1.34×`) | `2.84` tok/round |
-| Short decode (`c=4`) | 4 | 221–269 | `0.69 s` | `29.4` | `117.5` (`1.50×`) | `2.35` tok/round |
-| Short decode (`c=8`) | 8 | 221–269 | `1.37 s` | `20.0` | `159.6` (`2.04×`) | `2.21` tok/round |
-| 32k cold (`c=1`) | 1 | 32,046 | `16.39 s` | `79.6` | `79.6` | `3.20` tok/round |
-| 32k cached, exact hit (`c=1`) | 1 | 32,046 (`32,045` hit) | `0.16 s` | `79.5` | `79.5` | `99.5×` lower TTFT; identical output SHA |
-| 32k cached, new suffix (`c=1`) | 1 | 32,043 (`28,705` hit) | `2.00 s` | `66.4` | `66.4` | `8.2×` lower TTFT |
+| Short decode (`c=1`) | 1 | 221 | `0.33 s` | `87.5` | `87.5` (`1.00×`) | — |
+| Short decode (`c=2`) | 2 | 221–248 | `0.35 s` | `57.7` | `115.3` (`1.32×`) | — |
+| Short decode (`c=4`) | 4 | 221–269 | `0.57 s` | `33.2` | `132.7` (`1.52×`) | `113.1 tok/s` agg wall |
+| Short decode (`c=8`) | 8 | 221–269 | `1.16 s` | `21.8` | `174.1` (`1.99×`) | `121.2 tok/s` agg wall |
+| 32k cold (`c=1`) | 1 | 32,046 | `12.66 s` | `95.9` | `95.9` | `3.56` tok/round (`71.4%` acc) |
+| 32k cached, exact hit (`c=1`) | 1 | 32,046 (`32,045` hit) | `0.16 s` | `96.4` | `96.4` | `80.8×` lower TTFT; identical output SHA |
+| 32k cached, new suffix (`c=1`) | 1 | 32,043 (`28,705` hit) | `1.61 s` | `84.1` | `84.1` | `7.9×` lower TTFT |
 
-Shared forward calibration at startup (48 virtual layers, tapped): single-stream `1..8` rows `20.4..40.6 ms`; multi-stream shared `16` rows `49.2 ms`, `24` rows `58.9 ms`, `32` rows `69.8 ms`, `48` rows `92.6 ms`, `64` rows `111.1 ms`.
+Shared forward calibration at startup (48 virtual layers, tapped): single-stream `1..8` rows `16.6..32.7 ms`; multi-stream shared `16` rows `45.8 ms`, `24` rows `55.4 ms`, `32` rows `64.5 ms`, `48` rows `84.3 ms`, `64` rows `102.8 ms`.
 
 ## Fidelity
 
 Checked against the `mlx-lm` reference implementation of `inkling2_loop` over 512 tokens across all 48 virtual layers:
 
-- **Per-layer hidden states:** worst ratio to the bf16 reference noise floor is `1.32×` on the tensor-unit chunk path (`1.19×` on the decode window path, `1.19×` on per-op prompt; gate `1.5×`).
-- **Held-out KL & top-1:** KL `0.00120` (95% CI upper `0.00141`, gate `<= 0.002`) and `98.63%` top-1 agreement (`>= 98%`) in chunk mode; KL `0.00118` (95% CI upper `0.00151`) and `98.63%` top-1 in decode window mode.
+- **Per-layer hidden states:** worst ratio to the bf16 reference noise floor is `1.31×` on the tensor-unit chunk path (`1.34×` on the decode window path; gate `1.5×`).
+- **Held-out KL & top-1:** KL `0.00114` (95% CI upper `0.00135`, gate `<= 0.002`) and `98.63%` top-1 agreement (`>= 98%`) in chunk mode; KL `0.00095` (95% CI upper `0.00106`) and `98.83%` top-1 in decode window mode.
 - **Invariance:** `exact 256` reports `0` differing elements across all 48 virtual layers; `partition 17 200 --restore 17 --restore 217 --drafts` reports `0` differences across KV caches, convolution rings, expert picks, taps, finals, logits, and all 7 first-hold draft proposals; `shared 1` reports `order_diff: 0`, `solo_diff: 0` (2-stream), and `nonfinite: 0`.
 
 ## Limits
