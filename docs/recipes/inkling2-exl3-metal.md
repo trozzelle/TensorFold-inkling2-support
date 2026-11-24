@@ -5,6 +5,8 @@ TensorFold serves `thinkingmachines/Inkling-2-Small` on one Mac with 256 GB of m
   2 to 4 bits;
 - everything else in the source checkpoint's bf16.
 
+A ready-to-serve 2.59 bpw Metal pack is published on Hugging Face at [`heliophage/Inkling-2-Small-EXL3-2.59bpw-TensorFold`](https://huggingface.co/heliophage/Inkling-2-Small-EXL3-2.59bpw-TensorFold).
+
 Text only, one to eight concurrent streams (`--parallel 1` through `8`, default `1`); drafts come from the checkpoint's DSpark draft head, with an in-memory prompt cache for multi-turn reuse and chunked prefill interleaving (`--decode-share`). No image tower yet.
 
 ## Model directory
