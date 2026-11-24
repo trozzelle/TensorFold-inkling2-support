@@ -1,5 +1,6 @@
-//! Inkling 2 looped-core controller kernel checks: ik_copy_f32, ik_msg_depth, ik_msggate_prep, and
-//! ik_msggate_apply_norm against FP64 references, row independence, and NaN containment at H=2304, rank=64.
+//! Inkling 2 looped-core controller kernel checks: ik_copy_f32, ik_msg_depth, ik_msggate_prep,
+//! ik_msggate_apply_norm, ik_msggate_prep3, and ik_msggate_apply_norm3 against FP64 and 1-slot references,
+//! row independence, and NaN containment at H=2304, rank=64.
 const std = @import("std");
 const mtl = @import("metal");
 const h = @import("harness.zig");
@@ -7,12 +8,15 @@ const h = @import("harness.zig");
 const H = 2304;
 const RANK = 64;
 const ROWS = 5;
+const flag_global: u32 = 2;
 
 pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseCopyF32(g, r);
     try caseMsgDepth(g, r);
     try caseMsgGate(g, r, H, 0, 0, 1e-6); // local layer stride = H, msg slot 0
     try caseMsgGate(g, r, 3 * H, 2, 2, 1e-5); // global layer stride = 3*H, query 2 / msg slot 2 (v), distinct norm eps
+    try caseMsgGate3(g, r, false, 1e-6); // local 3-slot: flags = 0, stride = H
+    try caseMsgGate3(g, r, true, 1e-5); // global 3-slot: flags = IK_GLOBAL, stride = 3*H, distinct norm eps
 }
 
 fn caseCopyF32(g: *const h.Gpu, r: std.Random) !void {
@@ -199,5 +203,114 @@ fn caseMsgGate(g: *const h.Gpu, r: std.Random, h_stride: u32, h_slot: usize, msg
         cn.same(out.slice(u8, ROWS * H * 2)[row * H * 2 ..][0 .. H * 2], all_out[row * H * 2 ..][0 .. H * 2]);
     };
     hs[1 * h_stride + h_slot * H] = kept;
+    try cn.done();
+}
+
+fn caseMsgGate3(g: *const h.Gpu, r: std.Random, glob: bool, norm_eps: f32) !void {
+    const h_stride: u32 = if (glob) 3 * H else H;
+    const flags: u32 = if (glob) flag_global else 0;
+    const hbuf = try g.buf(ROWS * h_stride * 4);
+    const mbuf = try g.buf(ROWS * 4 * H * 4);
+    const ref_in = try g.buf(3 * ROWS * 2 * H * 2);
+    const got_in = try g.buf(3 * ROWS * 2 * H * 2);
+    const one_in = try g.buf(3 * 2 * H * 2);
+    const zbuf = try g.buf(3 * ROWS * RANK * 2);
+    const one_z = try g.buf(3 * RANK * 2);
+    const fw0 = try g.buf(H * RANK * 2);
+    const fw1 = try g.buf(H * RANK * 2);
+    const fw2 = try g.buf(H * RANK * 2);
+    const gw0 = try g.buf(H * RANK * 2);
+    const gw1 = try g.buf(H * RANK * 2);
+    const gw2 = try g.buf(H * RANK * 2);
+    const nw0 = try g.buf(H * 2);
+    const nw1 = try g.buf(H * 2);
+    const nw2 = try g.buf(H * 2);
+    const ref_out = try g.buf(3 * ROWS * H * 2);
+    const got_out = try g.buf(3 * ROWS * H * 2);
+    const one_out = try g.buf(3 * H * 2);
+    defer for ([_]mtl.Buffer{ hbuf, mbuf, ref_in, got_in, one_in, zbuf, one_z, fw0, fw1, fw2, gw0, gw1, gw2, nw0, nw1, nw2, ref_out, got_out, one_out }) |b| b.deinit();
+
+    const hs = h.fill32(hbuf, ROWS * h_stride, r, 2.0);
+    _ = h.fill32(mbuf, ROWS * 4 * H, r, 2.0);
+    const zs = h.fill16(zbuf, 3 * ROWS * RANK, r, 0.3);
+    const fws = [3]mtl.Buffer{ fw0, fw1, fw2 };
+    const gws = [3]mtl.Buffer{ gw0, gw1, gw2 };
+    const nws = [3]mtl.Buffer{ nw0, nw1, nw2 };
+    for (0..3) |s| {
+        _ = h.fill16(fws[s], H * RANK, r, 0.25);
+        _ = h.fill16(gws[s], H * RANK, r, 0.25);
+        _ = h.fill16(nws[s], H, r, 1.5);
+    }
+
+    // Reference: 3 calls of ik_msggate_prep and 3 calls of ik_msggate_apply_norm.
+    const prep1_a: h.Args = .{ .rows = ROWS, .width = H, .stride = h_stride };
+    const apply1_a: h.Args = .{ .rows = ROWS, .width = H, .dim = RANK, .stride = h_stride, .eps = norm_eps };
+    for (0..3) |slot| {
+        const h_off = if (glob) slot * H * 4 else 0;
+        const m_off = slot * H * 4;
+        const in_off = slot * ROWS * 2 * H * 2;
+        const z_off = slot * ROWS * RANK * 2;
+        const out_off = slot * ROWS * H * 2;
+        const nw_buf = if (glob) nws[slot] else nws[0];
+        try g.run("ik_msggate_prep", prep1_a, &.{ .{ .buf = hbuf, .off = h_off }, .{ .buf = mbuf, .off = m_off }, .{ .buf = ref_in, .off = in_off } }, .{ ROWS, 1, 1 }, .{ 1024, 1, 1 }, true);
+        try g.run("ik_msggate_apply_norm", apply1_a, &.{ .{ .buf = hbuf, .off = h_off }, .{ .buf = mbuf, .off = m_off }, .{ .buf = zbuf, .off = z_off }, .{ .buf = fws[slot] }, .{ .buf = gws[slot] }, .{ .buf = nw_buf }, .{ .buf = ref_out, .off = out_off } }, .{ ROWS, 1, 1 }, .{ 1024, 1, 1 }, true);
+    }
+
+    // 3-slot kernels: must be bit-for-bit identical to the 3 single-slot calls.
+    const prep3_a: h.Args = .{ .rows = ROWS, .width = H, .stride = h_stride, .flags = flags };
+    const apply3_a: h.Args = .{ .rows = ROWS, .width = H, .dim = RANK, .stride = h_stride, .flags = flags, .eps = norm_eps };
+    try g.run("ik_msggate_prep3", prep3_a, &.{ .{ .buf = hbuf }, .{ .buf = mbuf }, .{ .buf = got_in } }, .{ ROWS, 3, 1 }, .{ 1024, 1, 1 }, true);
+    try g.run("ik_msggate_apply_norm3", apply3_a, &.{ .{ .buf = hbuf }, .{ .buf = mbuf }, .{ .buf = zbuf }, .{ .buf = fw0 }, .{ .buf = fw1 }, .{ .buf = fw2 }, .{ .buf = gw0 }, .{ .buf = gw1 }, .{ .buf = gw2 }, .{ .buf = nw0 }, .{ .buf = nw1 }, .{ .buf = nw2 }, .{ .buf = got_out } }, .{ ROWS, 3, 1 }, .{ 1024, 1, 1 }, true);
+
+    var cp: h.Check = .{ .name = if (glob) "msggate_prep3_global" else "msggate_prep3_local" };
+    cp.same(got_in.slice(u8, 3 * ROWS * 2 * H * 2), ref_in.slice(u8, 3 * ROWS * 2 * H * 2));
+    try cp.done();
+
+    var ca: h.Check = .{ .name = if (glob) "msggate_apply_norm3_global" else "msggate_apply_norm3_local" };
+    ca.same(got_out.slice(u8, 3 * ROWS * H * 2), ref_out.slice(u8, 3 * ROWS * H * 2));
+    try ca.done();
+
+    // Row independence: each row alone matches the batch's bits for all 3 slots.
+    const all_in = try std.heap.page_allocator.dupe(u8, got_in.slice(u8, 3 * ROWS * 2 * H * 2));
+    defer std.heap.page_allocator.free(all_in);
+    const all_out = try std.heap.page_allocator.dupe(u8, got_out.slice(u8, 3 * ROWS * H * 2));
+    defer std.heap.page_allocator.free(all_out);
+
+    var ci: h.Check = .{ .name = if (glob) "msggate3_independent_global" else "msggate3_independent_local" };
+    var one_prep = prep3_a;
+    one_prep.rows = 1;
+    var one_apply = apply3_a;
+    one_apply.rows = 1;
+    const ozs = one_z.slice(u16, 3 * RANK);
+    for (0..ROWS) |row| {
+        const rh_off = row * h_stride * 4;
+        const rm_off = row * 4 * H * 4;
+        for (0..3) |slot| @memcpy(ozs[slot * RANK ..][0..RANK], zs[(slot * ROWS + row) * RANK ..][0..RANK]);
+        try g.run("ik_msggate_prep3", one_prep, &.{ .{ .buf = hbuf, .off = rh_off }, .{ .buf = mbuf, .off = rm_off }, .{ .buf = one_in } }, .{ 1, 3, 1 }, .{ 1024, 1, 1 }, true);
+        try g.run("ik_msggate_apply_norm3", one_apply, &.{ .{ .buf = hbuf, .off = rh_off }, .{ .buf = mbuf, .off = rm_off }, .{ .buf = one_z }, .{ .buf = fw0 }, .{ .buf = fw1 }, .{ .buf = fw2 }, .{ .buf = gw0 }, .{ .buf = gw1 }, .{ .buf = gw2 }, .{ .buf = nw0 }, .{ .buf = nw1 }, .{ .buf = nw2 }, .{ .buf = one_out } }, .{ 1, 3, 1 }, .{ 1024, 1, 1 }, true);
+        for (0..3) |slot| {
+            ci.same(one_in.slice(u8, 3 * 2 * H * 2)[slot * 2 * H * 2 ..][0 .. 2 * H * 2], all_in[(slot * ROWS + row) * 2 * H * 2 ..][0 .. 2 * H * 2]);
+            ci.same(one_out.slice(u8, 3 * H * 2)[slot * H * 2 ..][0 .. H * 2], all_out[(slot * ROWS + row) * H * 2 ..][0 .. H * 2]);
+        }
+    }
+    try ci.done();
+
+    // NaN containment on row 1 across all active h slots for both prep3 and apply_norm3.
+    const h_slots: usize = if (glob) 3 else 1;
+    var kept: [3]f32 = undefined;
+    for (0..h_slots) |s| {
+        kept[s] = hs[1 * h_stride + s * H];
+        hs[1 * h_stride + s * H] = std.math.nan(f32);
+    }
+    try g.run("ik_msggate_prep3", prep3_a, &.{ .{ .buf = hbuf }, .{ .buf = mbuf }, .{ .buf = got_in } }, .{ ROWS, 3, 1 }, .{ 1024, 1, 1 }, true);
+    try g.run("ik_msggate_apply_norm3", apply3_a, &.{ .{ .buf = hbuf }, .{ .buf = mbuf }, .{ .buf = zbuf }, .{ .buf = fw0 }, .{ .buf = fw1 }, .{ .buf = fw2 }, .{ .buf = gw0 }, .{ .buf = gw1 }, .{ .buf = gw2 }, .{ .buf = nw0 }, .{ .buf = nw1 }, .{ .buf = nw2 }, .{ .buf = got_out } }, .{ ROWS, 3, 1 }, .{ 1024, 1, 1 }, true);
+    var cn: h.Check = .{ .name = if (glob) "msggate3_nan_contain_global" else "msggate3_nan_contain_local" };
+    for (0..3) |slot| {
+        for (0..ROWS) |row| if (row != 1) {
+            cn.same(got_in.slice(u8, 3 * ROWS * 2 * H * 2)[(slot * ROWS + row) * 2 * H * 2 ..][0 .. 2 * H * 2], all_in[(slot * ROWS + row) * 2 * H * 2 ..][0 .. 2 * H * 2]);
+            cn.same(got_out.slice(u8, 3 * ROWS * H * 2)[(slot * ROWS + row) * H * 2 ..][0 .. H * 2], all_out[(slot * ROWS + row) * H * 2 ..][0 .. H * 2]);
+        };
+    }
+    for (0..h_slots) |s| hs[1 * h_stride + s * H] = kept[s];
     try cn.done();
 }
