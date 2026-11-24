@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     for (args[1..]) |a| if (std.mem.eql(u8, a, "time")) return @import("time_norms.zig").run(&g, r);
-    const groups = .{ .{ "glue", @import("cases_glue.zig") }, .{ "conv", @import("cases_conv.zig") }, .{ "attn", @import("cases_attn.zig") }, .{ "moe", @import("cases_moe.zig") }, .{ "stack", @import("cases_stack.zig") }, .{ "fused", @import("cases_fused.zig") }, .{ "split", @import("cases_split.zig") }, .{ "xd", @import("cases_xd.zig") }, .{ "dspark", @import("cases_dspark.zig") }, .{ "gemm", @import("cases_gemm.zig") }, .{ "pattn", @import("cases_pattn.zig") }, .{ "xp", @import("cases_xp.zig") } };
+    const groups = .{ .{ "glue", @import("cases_glue.zig") }, .{ "conv", @import("cases_conv.zig") }, .{ "attn", @import("cases_attn.zig") }, .{ "moe", @import("cases_moe.zig") }, .{ "stack", @import("cases_stack.zig") }, .{ "fused", @import("cases_fused.zig") }, .{ "split", @import("cases_split.zig") }, .{ "xd", @import("cases_xd.zig") }, .{ "dspark", @import("cases_dspark.zig") }, .{ "gemm", @import("cases_gemm.zig") }, .{ "pattn", @import("cases_pattn.zig") }, .{ "xp", @import("cases_xp.zig") }, .{ "controllers", @import("cases_controllers.zig") } };
     inline for (groups) |grp| {
         var on = true;
         for (args[1..]) |a| if (!std.mem.startsWith(u8, a, "seed=")) {
