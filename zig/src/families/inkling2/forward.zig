@@ -111,9 +111,10 @@ fn checked(f: mtl.CommandBuffer) !void {
     }
 }
 
-/// Most spans one layer opens (a looped global layer with controllers and dynamic convolutions is the most), so a recorder's capacity is
-/// `spans_per_layer * layers * repeat` plus the final's.
-pub const spans_per_layer = 48;
+/// Most spans one layer opens (a looped global layer with controllers and dynamic convolutions opens at most 28), so a
+/// recorder's capacity is `spans_per_layer * layers * repeat` plus the final's, keeping 48-layer runs within Metal's
+/// 4096-sample counter buffer limit.
+pub const spans_per_layer = 32;
 /// Rows recorded for the drafter and kernel studies: the inputs of the drafter's tapped layers, every layer's expert
 /// picks, and the MoE inputs of `xm_layers` (layouts: h [7][n][H] bf16, eids [layers][n][8] u32, xm [2][n][H] bf16).
 pub const Taps = struct { h: mtl.Buffer, eids: mtl.Buffer, xm: ?mtl.Buffer = null };
@@ -161,12 +162,8 @@ const part_w_g3_group = [3]usize{ 32, 3, 1 };
 pub const Segment = struct { cache: *st.Cache, rows: usize };
 
 /// Multi-stream shared decode rounds at or above this total row count switch routed experts to the sorted tensor-unit
-/// chain (`xp`) when available, saving ~42-66% of expert GPU time while keeping solo rounds on `xd`.
+/// chain (`xp` / `xp_fp`) when available, keeping solo decode windows on the per-row kernels for exactness.
 pub const batch_xp_from: usize = 12;
-
-/// Decode rounds at or above this total row count switch native NVFP4/MXFP8 routed experts to the sorted tensor-unit
-/// chain (`xp_fp`) when available.
-pub const batch_xp_from_fp: usize = 4;
 
 /// out = in W^T on `e` for `rows` rows of the bf16 [d.n, d.k] matrix `d` (torch's Linear layout), in slabs of at most 16:
 /// the row-count kernel of the slab, whose bits do not depend on the slab. `in` rows are d.k wide, `out` rows d.n.
@@ -848,7 +845,7 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
         .nvfp4 => |nv| {
             try x.end();
             try x.begin(.experts);
-            if ((x.tensor or (x.decode and n >= batch_xp_from_fp)) and m.chunk != null and s.path != .per_op) {
+            if (x.tensor or x.xp_batch) {
                 const e = experts_fp_prefill;
                 e.encodeNvfp4(x.e.*, &m.chunk.?.experts.fp, .{ .w13 = nv.w13, .w2 = nv.w2, .experts = c.experts }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xpFp(H, c.experts), n, .{ .gate = c.gate_cap, .up = c.up_cap });
             } else {
@@ -861,7 +858,7 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
         .mxfp8 => |mx| {
             try x.end();
             try x.begin(.experts);
-            if ((x.tensor or (x.decode and n >= batch_xp_from_fp)) and m.chunk != null and s.path != .per_op) {
+            if (x.tensor or x.xp_batch) {
                 const e = experts_fp_prefill;
                 e.encodeMxfp8(x.e.*, &m.chunk.?.experts.fp, .{ .w13 = mx.w13, .w2 = mx.w2, .experts = c.experts }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xpFp(H, c.experts), n, .{ .gate = c.gate_cap, .up = c.up_cap });
             } else {
