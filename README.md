@@ -1,9 +1,9 @@
-> **Fork note — Inkling 2 Small (EXL3 2.59 bpw) on Apple Silicon**
+> **Fork note — Inkling 2 (Small EXL3 & Mini NVFP4/MXFP8) on Apple Silicon**
 >
-> This fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) adds Metal inference support for **Inkling 2 Small** with EXL3 routed experts, DSpark speculative decoding, prompt-prefix caching, and multi-stream serving (`--parallel 1..8`) on a 256 GB Mac.
+> This fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) adds Metal inference support for **Inkling 2 Small** (EXL3 routed experts) and **Inkling 2 Mini** (`inkling2_loop`, native ModelOpt NVFP4/MXFP8 routed experts), with DSpark speculative decoding, prompt-prefix caching, and multi-stream serving (`--parallel 1..8`).
 >
-> - **Ready-to-serve model pack on Hugging Face:** [`heliophage/Inkling-2-Small-EXL3-2.59bpw-TensorFold`](https://huggingface.co/heliophage/Inkling-2-Small-EXL3-2.59bpw-TensorFold)
-> - **Build, serve, and architecture recipe:** [`docs/recipes/inkling2-exl3-metal.md`](docs/recipes/inkling2-exl3-metal.md)
+> - **Inkling 2 Small (EXL3 2.59 bpw) model pack:** [`heliophage/Inkling-2-Small-EXL3-2.59bpw-TensorFold`](https://huggingface.co/heliophage/Inkling-2-Small-EXL3-2.59bpw-TensorFold) — [`docs/recipes/inkling2-exl3-metal.md`](docs/recipes/inkling2-exl3-metal.md)
+> - **Inkling 2 Mini (native NVFP4/MXFP8):** serves `thinkingmachines/Inkling-2-Mini` directly — [`docs/recipes/inkling2-mini-metal.md`](docs/recipes/inkling2-mini-metal.md)
 
 <p align="center">
   <a href="https://ko-fi.com/ashxhart">Help Support TensorFold</a> ·
