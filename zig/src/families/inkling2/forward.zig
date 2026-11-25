@@ -165,9 +165,9 @@ pub const Segment = struct { cache: *st.Cache, rows: usize };
 /// Multi-stream shared decode rounds at or above this total row count switch routed experts to the sorted tensor-unit
 /// chain (`xp` / `xp_fp`) when available, keeping solo decode windows on the per-row kernels for exactness.
 pub const batch_xp_from: usize = 12;
-/// Multi-stream shared decode rounds at or above this total row count switch dense projections, router, and unembedding
+/// Multi-stream shared decode rounds at or above this total row count switch dense projections and unembedding
 /// to tensor-unit GEMM so wide concurrent batches read dense weights once instead of per 16-row matvec slab.
-pub const batch_dense_from: usize = 32;
+pub const batch_dense_from: usize = 64;
 
 /// out = in W^T on `e` for `rows` rows of the bf16 [d.n, d.k] matrix `d` (torch's Linear layout), in slabs of at most 16:
 /// the row-count kernel of the slab, whose bits do not depend on the slab. `in` rows are d.k wide, `out` rows d.n.
