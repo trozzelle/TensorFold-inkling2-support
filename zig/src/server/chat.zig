@@ -70,6 +70,7 @@ pub const Reply = struct {
     tool_calls_streamed: bool,
     native_tool_format: bool = false,
     native_calls: ?[]Value = null,
+    native_cut_calls: bool = false,
     finish_reason: []const u8,
     prompt_tokens: usize,
     cached_tokens: usize,
@@ -277,9 +278,10 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     defer srv.noteRequest(prepared.prompt_len, cached_tokens.within(box.cached, prepared.prompt_len), gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds, if (box.stats.prefill_seconds != null) box.stats.queued_seconds else null);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     if (srv.recipients and input.prompt == null) gen.recipient = try recipient_reply.Reading.of(a, srv.text, request.prompt, input.tools, prepared.reasoning);
+    gen.call_end = @import("chat_inkling2.zig").callEnd(srv, gen.required, request.structure);
     const result: Failure!Reply = blk: {
         if (sink) |s| if (s.begin) |begin| begin(s.ctx, prepared.prompt_len) catch break :blk error.Cancelled;
-        if (sink != null and input.tools.len > 0 and srv.text.vtable.format != .kimi) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+        if (sink != null and input.tools.len > 0 and srv.text.vtable.format != .kimi and !@import("chat_inkling2.zig").enabled(srv)) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
         gen.loop(gone) catch |e| break :blk e;
         break :blk gen.finish(cx, prepared.prompt_len, received, prepared.thinking, prepared.reasoning, effort, prepared.sampled, prepared.drafts);
     };
