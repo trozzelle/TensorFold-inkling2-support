@@ -72,7 +72,8 @@ comptime {
     for (members, kernel_names) |member, name| std.debug.assert(std.mem.eql(u8, "ikd_" ++ member, name));
 }
 
-const max_batch = st.max_streams;
+/// Maximum streams handled in one batched hold pass (matches IKD_MAX_BATCH in dspark.metal).
+const max_batch = 8;
 
 // The kernels' argument structs, field for field.
 const MixArgs = extern struct { rows: u32, width: u32, tap_stride: u32, mix_stride: u32, eps: f32 };
