@@ -15,14 +15,14 @@ pub fn prefillRows() !?u32 {
 }
 
 /// How the draft head runs: how a round drafts (INKLING_DRAFT_DEPTH and INKLING_DRAFT_CONFIDENCE) and the width of its layers'
-/// weights (INKLING_DRAFT_BITS).
-pub const Draft = struct { drafting: ik.dspark.Drafting, bits: ik.dspark_weights.Bits };
+/// weights (INKLING_DRAFT_BITS; null picks the model's default).
+pub const Draft = struct { drafting: ik.dspark.Drafting, bits: ?ik.dspark_weights.Bits };
 
 pub fn draft() !Draft {
     const drafting = ik.dspark.Drafting.parse(env("INKLING_DRAFT_DEPTH"), env("INKLING_DRAFT_CONFIDENCE")) catch |err| return switch (err) {
         error.BadDraftDepth => error.DraftDepthIsOneToSevenOrAuto,
         error.BadDraftConfidence => error.DraftConfidenceIsAboveZeroAndBelowOneOrOff,
     };
-    const bits = ik.dspark_weights.Bits.parse(env("INKLING_DRAFT_BITS")) catch return error.DraftBitsIsEightOrSixteen;
+    const bits = ik.dspark_weights.Bits.parseOpt(env("INKLING_DRAFT_BITS")) catch return error.DraftBitsIsEightOrSixteen;
     return .{ .drafting = drafting, .bits = bits };
 }

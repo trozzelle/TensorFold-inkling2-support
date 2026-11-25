@@ -1,9 +1,9 @@
-//! Inkling 2's DSpark draft head as a lane drafter over the target's taps. Each committed row's eight taps are mixed, normed and
-//! projected into five draft layers' context keys and values, kept in a ring of the newest 1,023 positions a layer. A hold runs
-//! one block of eight rows (the pending token's embedding, then seven mask rows) through those layers, takes the target's
-//! unembedding of rows 1 to 7 as base logits, and names the proposals with the Markov GRU: each step folds the previous token,
-//! a state and two features into a latent whose product with the folded unembedding (dspark_weights.fold) joins the base
-//! logits before the softcap, the padded vocabulary's mask and the argmax.
+//! Inkling 2's DSpark draft head as a lane drafter over the target's taps. Each committed row's taps are mixed, normed,
+//! and projected into the draft layers' context keys and values, kept in a ring of the newest 1,023 positions a layer.
+//! A hold runs one block of eight rows (the pending token's embedding, then seven mask rows) through those layers, takes
+//! the target's unembedding of rows 1 to 7 as base logits, and names proposals with the Markov GRU: each step folds
+//! the previous token, a state and two features into a latent whose product with the folded unembedding
+//! (dspark_weights.fold) joins the base logits before the softcap, the padded vocabulary's mask and the argmax.
 //!
 //! The arithmetic is the reference's (omlx/patches/inkling2/dspark.py on mlx 0.32): kernels/metal/inkling2/dspark.metal holds the
 //! rounding points; the layers' projections are the target's bf16 matvec kernels or, with the weights quantized at load (the
@@ -28,19 +28,13 @@ const dr = lanes.drafter;
 const Stream = lanes.Stream;
 const B = fwd.B;
 
-// The shapes the kernels are written for.
-const hidden = 4608;
-const heads = 48;
+// Fixed geometry shared by the kernels; layer count, width, q heads and tap count come from config.Mtp.
 const kv_heads = 8;
 const head_dim = 128;
 const kv_width = kv_heads * head_dim;
 const rank = 256;
-const taps = 8;
-/// Tap mixes of a row: one for each of the five draft layers, and the Markov head's.
-const mixes = 6;
-const draft_layers = 5;
-/// Bytes of a row's taps: [8][hidden] bf16.
-const tap_row_bytes = taps * hidden * 2;
+const max_draft_layers = 8;
+const default_draft_layers = 5;
 /// Rows of a hold's block: the pending token's and seven mask rows.
 pub const block = 8;
 /// Drafts a hold makes at most: one for each of the block's rows after the first.
@@ -81,7 +75,7 @@ const MixArgs = extern struct { rows: u32, width: u32, tap_stride: u32, mix_stri
 const PrepArgs = extern struct { rows: u32, heads: u32, kv: u32, pos: u32, ring: u32, eps: f32, base_log2: f32 };
 const AttnArgs = extern struct { heads: u32, kv: u32, end: u32, window: u32, ring: u32, blocks: u32, scale: f32 };
 const EwArgs = extern struct { rows: u32, width: u32 };
-const ProjArgs = extern struct { n: u32, at: u32 };
+const ProjArgs = extern struct { n: u32, at: u32, hidden: u32 };
 const FoldArgs = extern struct { vocab: u32, valid: u32, flags: u32, cap: f32 };
 const PickArgs = extern struct { groups: u32, step: u32, flags: u32 };
 /// ikd_fold_pick's flags: also write every id's logit, and (with ikd_pick's) the step's probability of the pick.
@@ -97,19 +91,24 @@ fn attnBlocks(end: u32, win: u32) u32 {
     return (end - 1) / key_block - lo / key_block + 2;
 }
 
+/// Metal source for dspark.metal specialized with `IKD_TAPS = taps_n`.
+pub fn sourceFor(gpa: std.mem.Allocator, taps_n: u32) ![]u8 {
+    return std.fmt.allocPrint(gpa, "#define IKD_TAPS {d}\n{s}", .{ taps_n, ks.inkling2_dspark });
+}
+
 /// The drafter's scratch: absorb's mixed rows and context keys and values, the block's activations, base logits and the
 /// Markov step's working buffers. Every field is a buffer, so a residency hook joins them all.
 const Scratch = struct {
-    mixed: mtl.Buffer, // [6][rows][hidden]: the tap mixes of an absorb's rows
+    mixed: mtl.Buffer, // [layers + 1][rows][hidden]: the tap mixes of an absorb's rows
     kc: mtl.Buffer, // [rows][kv_width]: a layer's context keys and values
     vc: mtl.Buffer,
     h0: mtl.Buffer, // [8][hidden]: the block's input rows; rows 1 to 7 are mask_embed from the start
     h: mtl.Buffer, // [8][hidden]: the block's residual stream
     x: mtl.Buffer, // [8][hidden]: normed rows
     y: mtl.Buffer, // [8][hidden]: a branch's output
-    q: mtl.Buffer, // [8][heads * head_dim]
-    qn: mtl.Buffer, // [8][heads * head_dim]: the rotated queries
-    att: mtl.Buffer, // [8][heads * head_dim]: the attention's output
+    q: mtl.Buffer, // [8][q_heads * head_dim]
+    qn: mtl.Buffer, // [8][q_heads * head_dim]: the rotated queries
+    att: mtl.Buffer, // [8][q_heads * head_dim]: the attention's output
     k: mtl.Buffer, // [8][kv_width]: the block's keys and values, as projected and as normed and rotated
     v: mtl.Buffer,
     kb: mtl.Buffer,
@@ -117,7 +116,7 @@ const Scratch = struct {
     gate: mtl.Buffer, // [8][inter]
     up: mtl.Buffer,
     act: mtl.Buffer,
-    part: mtl.Buffer, // f32 [8][heads][max_blocks][130]: the attention's partials
+    part: mtl.Buffer, // f32 [8][q_heads][max_blocks][130]: the attention's partials
     hn: mtl.Buffer, // [8][hidden]: the final norm of rows 1 to 7
     base: mtl.Buffer, // [7][vocab]: the unembedding of those rows
     proj: mtl.Buffer, // [3 * rank]: the Markov projection
@@ -131,21 +130,26 @@ const Scratch = struct {
     /// The buffers made up front, in `bytes`' order.
     const made = [_][]const u8{ "mixed", "kc", "vc", "h0", "h", "x", "y", "q", "qn", "att", "k", "v", "kb", "vb", "gate", "up", "act", "part", "hn", "base", "proj", "latent", "best", "best_id", "mass" };
 
-    /// Bytes of each buffer for a vocabulary of `vocab` ids and an MLP of width `inter`.
-    fn bytes(vocab: usize, inter: usize) [made.len]usize {
+    /// Bytes of each buffer for the draft head's shape `m`.
+    fn bytes(m: cfg.Mtp) [made.len]usize {
         const rows = block;
+        const h: usize = m.hidden;
+        const q_heads: usize = m.q_heads;
+        const mixes: usize = @as(usize, m.layers) + 1;
+        const inter: usize = m.inter;
+        const vocab: usize = m.vocab;
         const groups = (vocab + pick_group - 1) / pick_group;
         return .{
-            mixes * absorb_rows * hidden * 2,
+            mixes * absorb_rows * h * 2,
             absorb_rows * kv_width * 2,
             absorb_rows * kv_width * 2,
-            rows * hidden * 2,
-            rows * hidden * 2,
-            rows * hidden * 2,
-            rows * hidden * 2,
-            rows * heads * head_dim * 2,
-            rows * heads * head_dim * 2,
-            rows * heads * head_dim * 2,
+            rows * h * 2,
+            rows * h * 2,
+            rows * h * 2,
+            rows * h * 2,
+            rows * q_heads * head_dim * 2,
+            rows * q_heads * head_dim * 2,
+            rows * q_heads * head_dim * 2,
             rows * kv_width * 2,
             rows * kv_width * 2,
             rows * kv_width * 2,
@@ -153,8 +157,8 @@ const Scratch = struct {
             rows * inter * 2,
             rows * inter * 2,
             rows * inter * 2,
-            rows * heads * max_blocks * part_slot * 4,
-            rows * hidden * 2,
+            rows * q_heads * max_blocks * part_slot * 4,
+            rows * h * 2,
             max_depth * vocab * 2,
             3 * rank * 2,
             rank * 2,
@@ -166,8 +170,9 @@ const Scratch = struct {
 
     /// Every buffer made, and the block's input rows ready: row 0 is the pending token's embedding, each hold's to write, and
     /// rows 1 to 7 are the mask embedding.
-    fn init(device: mtl.Device, vocab: usize, w: *const dw.Weights) !Scratch {
-        const sz = bytes(vocab, w.layers[0].gate.n());
+    fn init(device: mtl.Device, m: cfg.Mtp, w: *const dw.Weights) !Scratch {
+        const sz = bytes(m);
+        const h: usize = m.hidden;
         var s: Scratch = undefined;
         s.capture = null;
         var done: [made.len]bool = @splat(false);
@@ -176,8 +181,8 @@ const Scratch = struct {
             @field(s, f) = try device.buffer(@max(sz[i], 16), mtl.ResourceOptions.shared);
             done[i] = true;
         }
-        const rows = s.h0.slice(u16, block * hidden);
-        for (1..block) |r| @memcpy(rows[r * hidden ..][0..hidden], w.mask_embed.host(u16));
+        const rows = s.h0.slice(u16, block * h);
+        for (1..block) |r| @memcpy(rows[r * h ..][0..h], w.mask_embed.host(u16));
         return s;
     }
 
@@ -191,11 +196,11 @@ comptime {
     std.debug.assert(@typeInfo(Scratch).@"struct".field_names.len == Scratch.made.len + 1);
 }
 
-/// One stream's draft state: each layer's context ring, the Markov feature of its newest absorbed row, the GRU's state, the
-/// hold's token row (the pending token, then its proposals) and the probability of each proposal under its step's logits.
+/// One stream's draft state: each layer's context ring (slots 0..mtp.layers), the Markov feature of its newest absorbed
+/// row, the GRU's state, the hold's token row (the pending token, then its proposals) and each proposal's probability.
 const Lane = struct {
-    k: [draft_layers]mtl.Buffer,
-    v: [draft_layers]mtl.Buffer,
+    k: [max_draft_layers]mtl.Buffer,
+    v: [max_draft_layers]mtl.Buffer,
     f_rnn: mtl.Buffer,
     state: mtl.Buffer,
     seq: mtl.Buffer,
@@ -367,7 +372,9 @@ pub const Drafter = struct {
         errdefer gpa.destroy(d);
         d.* = .{ .gpa = gpa, .device = device, .model = model, .w = weights, .mtp = mtp, .options = options, .pipes = undefined, .s = undefined };
         {
-            const lib = try mtl.Library.fromSource(device, ks.inkling2_dspark, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
+            const src = try sourceFor(gpa, mtp.taps_n);
+            defer gpa.free(src);
+            const lib = try mtl.Library.fromSource(device, src, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
             defer lib.deinit();
             var made: usize = 0;
             errdefer for (d.pipes[0..made]) |p| p.deinit();
@@ -381,7 +388,7 @@ pub const Drafter = struct {
         errdefer if (d.qmv) |*q| q.deinit();
         try d.checkQuantized();
         try dw.fold(weights, &model.checkpoint, device, model.queue, model, d.pipe(.fold_t));
-        d.s = try Scratch.init(device, model.config.text.vocab, weights);
+        d.s = try Scratch.init(device, mtp, weights);
         errdefer d.s.deinit();
         try d.warm();
         return d;
@@ -403,13 +410,17 @@ pub const Drafter = struct {
         return d.pipes[@backingInt(k)];
     }
 
-    /// Whether the kernels' shapes are this head's and the taps are the ones the target writes.
-    fn supported(m: *const cfg.Mtp, text: *const cfg.Text) bool {
-        const ok = m.layers == draft_layers and m.q_heads == heads and m.kv_heads == kv_heads and m.head_dim == head_dim and m.rank == rank and
-            m.block == block and m.taps_n == taps and m.window == window + 1 and m.hidden == hidden and text.hidden == hidden and
-            m.vocab == text.vocab and m.inter % 256 == 0;
+    /// Whether the kernels support this head's shape and its final tap matches the backbone's virtual layer count.
+    pub fn supported(m: *const cfg.Mtp, text: *const cfg.Text) bool {
+        if (m.kv_heads != kv_heads or m.q_heads % kv_heads != 0) return false;
+        const gqa = m.q_heads / kv_heads;
+        if (gqa != 3 and gqa != 6) return false;
+        const ok = m.layers >= 1 and m.layers <= max_draft_layers and m.head_dim == head_dim and m.rank == rank and
+            m.block == block and m.taps_n >= 1 and m.taps_n <= 16 and m.window == window + 1 and
+            m.hidden > 0 and m.hidden == text.hidden and m.hidden % 256 == 0 and m.vocab == text.vocab and
+            m.inter > 0 and m.inter % 256 == 0;
         if (!ok) return false;
-        return std.mem.eql(u32, m.taps[0 .. taps - 1], &fwd.tap_layers) and m.taps[taps - 1] == text.layers;
+        return m.taps[m.taps_n - 1] == text.virtualLayers();
     }
 
     /// Whether any projection of the draft layers is quantized.
@@ -428,25 +439,39 @@ pub const Drafter = struct {
         };
     }
 
+    fn applyLaneResident(d: *const Drafter, l: *const Lane, f: mtl.ResidencySet.Follow, join: bool) void {
+        const call = if (join) f.join else f.leave;
+        for (l.k[0..d.mtp.layers]) |buf| call(f.ctx, buf);
+        for (l.v[0..d.mtp.layers]) |buf| call(f.ctx, buf);
+        call(f.ctx, l.f_rnn);
+        call(f.ctx, l.state);
+        call(f.ctx, l.seq);
+        call(f.ctx, l.prob);
+    }
+
     /// Joins (or, with null, leaves) a residency set: the scratch and every lane's buffers, as lanes open and close.
     pub fn setResident(d: *Drafter, hook: ?mtl.ResidencySet.Follow) void {
         if (d.follow) |f| {
             mtl.resident.fields.apply(&d.s, f, false);
             var it = d.lanes.valueIterator();
-            while (it.next()) |l| mtl.resident.fields.apply(l.*, f, false);
+            while (it.next()) |l| d.applyLaneResident(l.*, f, false);
         }
         d.follow = hook;
         if (hook) |f| {
             mtl.resident.fields.apply(&d.s, f, true);
             var it = d.lanes.valueIterator();
-            while (it.next()) |l| mtl.resident.fields.apply(l.*, f, true);
+            while (it.next()) |l| d.applyLaneResident(l.*, f, true);
         }
     }
 
-    /// Device bytes one stream's draft state takes: ten rings, the Markov feature, the state, the token row and the probabilities.
+    /// Device bytes one stream's draft state takes: layer rings, Markov feature, state, token row and probabilities.
     pub fn laneBytes(d: *const Drafter) usize {
-        _ = d;
-        return 2 * draft_layers * ringBytes() + hidden * 2 + rank * 2 + block * 4 + block * 4;
+        return 2 * @as(usize, d.mtp.layers) * ringBytes() + @as(usize, d.mtp.hidden) * 2 + rank * 2 + block * 4 + block * 4;
+    }
+
+    /// Bytes of one row's taps: bf16 [taps_n][hidden].
+    pub fn tapRowBytes(d: *const Drafter) usize {
+        return @as(usize, d.mtp.taps_n) * @as(usize, d.mtp.hidden) * 2;
     }
 
     /// Device bytes the head holds that no checkpoint shard counts: the scratch and `streams` streams' draft state.
@@ -485,7 +510,7 @@ pub const Drafter = struct {
 
     fn tapsFn(ptr: *anyopaque) []const u32 {
         const d = cast(ptr);
-        return d.mtp.taps[0..taps];
+        return d.mtp.taps[0..d.mtp.taps_n];
     }
 
     fn factsFn(ptr: *anyopaque) dr.Facts {
@@ -497,9 +522,14 @@ pub const Drafter = struct {
         return @as(usize, ring + ring_pad) * kv_width * 2;
     }
 
-    /// Device bytes a kept draft context takes beside a prompt state: every draft layer's key and value ring.
+    /// Device bytes a kept draft context takes beside a prompt state for head `m`: each draft layer's K and V rings.
+    pub fn keptBytesFor(m: cfg.Mtp) u64 {
+        return 2 * @as(u64, m.layers) * ringBytes();
+    }
+
+    /// Device bytes a kept draft context takes beside a prompt state (5-layer default).
     pub fn keptBytes() u64 {
-        return 2 * draft_layers * ringBytes();
+        return 2 * default_draft_layers * ringBytes();
     }
 
     /// Copies `s`'s context rings into `snap` at `snap.at`, deferring if `prefill_step` has not absorbed yet.
@@ -514,7 +544,7 @@ pub const Drafter = struct {
             return;
         }
         if (l.end != snap.at or l.end <= l.from) return;
-        const buf = try d.device.buffer(@intCast(keptBytes()), mtl.ResourceOptions.private);
+        const buf = try d.device.buffer(@intCast(keptBytesFor(d.mtp)), mtl.ResourceOptions.private);
         errdefer buf.deinit();
         try d.copyLane(l, buf, true);
         snap.setDraft(buf, l.from);
@@ -547,7 +577,7 @@ pub const Drafter = struct {
         const cb = d.model.queue.commandBuffer();
         const e = cb.blit();
         var at: usize = 0;
-        for (0..draft_layers) |i| for ([_]mtl.Buffer{ l.k[i], l.v[i] }) |live| {
+        for (0..d.mtp.layers) |i| for ([_]mtl.Buffer{ l.k[i], l.v[i] }) |live| {
             if (out) e.copy(live, 0, buf, at, n) else e.copy(buf, at, live, 0, n);
             at += n;
         };
@@ -558,30 +588,40 @@ pub const Drafter = struct {
     }
 
     fn newLane(d: *Drafter) !*Lane {
+        const n_layers: usize = d.mtp.layers;
+        const h: usize = d.mtp.hidden;
         const l = try d.gpa.create(Lane);
         errdefer d.gpa.destroy(l);
-        var bufs: [2 * draft_layers + 4]mtl.Buffer = undefined;
+        var bufs: [2 * max_draft_layers + 4]mtl.Buffer = undefined;
+        const total = 2 * n_layers + 4;
         var made: usize = 0;
         errdefer for (bufs[0..made]) |x| x.deinit();
-        const small = [4]usize{ hidden * 2, rank * 2, block * 4, block * 4 };
-        for (&bufs, 0..) |*x, i| {
-            x.* = if (i < 2 * draft_layers) try d.device.buffer(ringBytes(), mtl.ResourceOptions.private) else try d.device.buffer(small[i - 2 * draft_layers], mtl.ResourceOptions.shared);
+        const small = [4]usize{ h * 2, rank * 2, block * 4, block * 4 };
+        for (bufs[0..total], 0..) |*x, i| {
+            x.* = if (i < 2 * n_layers) try d.device.buffer(ringBytes(), mtl.ResourceOptions.private) else try d.device.buffer(small[i - 2 * n_layers], mtl.ResourceOptions.shared);
             made += 1;
         }
-        l.* = .{ .k = undefined, .v = undefined, .f_rnn = bufs[2 * draft_layers], .state = bufs[2 * draft_layers + 1], .seq = bufs[2 * draft_layers + 2], .prob = bufs[2 * draft_layers + 3] };
-        for (0..draft_layers) |i| {
+        l.* = .{
+            .k = undefined,
+            .v = undefined,
+            .f_rnn = bufs[2 * n_layers],
+            .state = bufs[2 * n_layers + 1],
+            .seq = bufs[2 * n_layers + 2],
+            .prob = bufs[2 * n_layers + 3],
+        };
+        for (0..n_layers) |i| {
             l.k[i] = bufs[2 * i];
             l.v[i] = bufs[2 * i + 1];
         }
         for ([_]mtl.Buffer{ l.f_rnn, l.state, l.seq, l.prob }) |x| @memset(x.slice(u8, x.length()), 0);
-        if (d.follow) |f| mtl.resident.fields.apply(l, f, true);
+        if (d.follow) |f| d.applyLaneResident(l, f, true);
         return l;
     }
 
     fn dropLane(d: *Drafter, l: *Lane) void {
-        if (d.follow) |f| mtl.resident.fields.apply(l, f, false);
-        for (l.k) |x| x.deinit();
-        for (l.v) |x| x.deinit();
+        if (d.follow) |f| d.applyLaneResident(l, f, false);
+        for (l.k[0..d.mtp.layers]) |x| x.deinit();
+        for (l.v[0..d.mtp.layers]) |x| x.deinit();
         l.f_rnn.deinit();
         l.state.deinit();
         l.seq.deinit();
@@ -665,7 +705,8 @@ pub const Drafter = struct {
 
     /// nn.RMSNorm of `rows` bf16 rows of the hidden width: `in` to `out`.
     fn norm(d: *const Drafter, e: mtl.ComputeEncoder, w: dw.Tensor, in: B, out: B, rows: usize) void {
-        d.glue(e, .norm, .{ .rows = @intCast(rows), .width = hidden, .stride = hidden, .eps = d.mtp.eps }, &.{ in, t(w), out }, .{ rows, 1, 1 }, .{ 1024, 1, 1 }, true);
+        const h = d.mtp.hidden;
+        d.glue(e, .norm, .{ .rows = @intCast(rows), .width = h, .stride = h, .eps = d.mtp.eps }, &.{ in, t(w), out }, .{ rows, 1, 1 }, .{ 1024, 1, 1 }, true);
     }
 
     /// `rows` rows of `in` through the projection `p` into `out`: the target's bf16 matvec kernels, or core's tiles for a
@@ -682,59 +723,70 @@ pub const Drafter = struct {
         return @floatCast(std.math.log2(@as(f64, d.mtp.rope_theta)));
     }
 
-    /// The context rows [p0, p0 + n) from `src` (rows of eight taps) into every layer's ring; `newest`: the last of them is the
+    /// Context rows [p0, p0 + n) from `src` (rows of taps) into each layer's ring; `newest`: the last of them is the
     /// stream's newest committed row, whose Markov feature the hold reads.
     fn encodeAbsorb(d: *Drafter, e: mtl.ComputeEncoder, l: *const Lane, src: B, p0: u64, n: usize, newest: bool) !void {
         const s = &d.s;
         const ls = d.w.layers;
+        const h: usize = d.mtp.hidden;
+        const h32: u32 = d.mtp.hidden;
+        const q_heads: u32 = d.mtp.q_heads;
+        const taps_n: u32 = d.mtp.taps_n;
+        const mixes: usize = @as(usize, d.mtp.layers) + 1;
         const rows: u32 = @intCast(n);
-        d.launch(e, .mix, MixArgs{ .rows = rows, .width = hidden, .tap_stride = taps * hidden, .mix_stride = rows * hidden, .eps = d.mtp.eps }, &.{ src, b(d.w.alpha_buffer), t(ls[0].dflare), t(ls[1].dflare), t(ls[2].dflare), t(ls[3].dflare), t(ls[4].dflare), t(d.w.markov.dflare), b(s.mixed) }, .{ n, mixes, 1 }, .{ 288, 1, 1 });
+        const mix_threads = std.mem.alignForward(usize, (h + 15) / 16, 32);
+        d.launch(e, .mix, MixArgs{ .rows = rows, .width = h32, .tap_stride = taps_n * h32, .mix_stride = rows * h32, .eps = d.mtp.eps }, &.{ src, b(d.w.alpha_buffer), b(d.w.dflare_norms), b(s.mixed) }, .{ n, mixes, 1 }, .{ mix_threads, 1, 1 });
         for (ls, 0..) |*layer, i| {
-            const mixed = bo(s.mixed, i * n * hidden * 2);
+            const mixed = bo(s.mixed, i * n * h * 2);
             try d.mv(e, layer.k_ctx, mixed, b(s.kc), n);
             try d.mv(e, layer.v_ctx, mixed, b(s.vc), n);
-            const a = PrepArgs{ .rows = rows, .heads = heads, .kv = kv_heads, .pos = @intCast(p0), .ring = ring, .eps = d.mtp.eps, .base_log2 = d.rope() };
+            const a = PrepArgs{ .rows = rows, .heads = q_heads, .kv = kv_heads, .pos = @intCast(p0), .ring = ring, .eps = d.mtp.eps, .base_log2 = d.rope() };
             d.launch(e, .ctx_prep, a, &.{ b(s.kc), b(s.vc), t(layer.k_norm_ctx), b(l.k[i]), b(l.v[i]) }, .{ n, 1, 1 }, .{ 256, 1, 1 });
         }
-        if (newest) d.glue(e, .copy, .{ .rows = 1, .width = hidden }, &.{ bo(s.mixed, (5 * n + n - 1) * hidden * 2), b(l.f_rnn) }, .{ hidden, 1, 1 }, .{ 256, 1, 1 }, false);
+        if (newest) d.glue(e, .copy, .{ .rows = 1, .width = h32 }, &.{ bo(s.mixed, (ls.len * n + n - 1) * h * 2), b(l.f_rnn) }, .{ h, 1, 1 }, .{ 256, 1, 1 }, false);
     }
 
-    /// The block for `it`: the pending token at the lane's end and seven mask rows through the five layers, the unembedding of
-    /// rows 1 to 7, and `it.depth` Markov steps; the proposals land in the lane's token row after the pending token.
+    /// Block for `it`: pending token at lane's end and seven mask rows through draft layers, unembedding of rows 1..7,
+    /// and `it.depth` Markov steps; proposals land in the lane's token row after the pending token.
     fn encodeHold(d: *Drafter, e: mtl.ComputeEncoder, l: *const Lane, it: dr.Hold) !void {
         const m = d.model;
         const s = &d.s;
         const text = &m.config.text;
+        const h: usize = d.mtp.hidden;
+        const h32: u32 = d.mtp.hidden;
+        const q_heads: usize = d.mtp.q_heads;
+        const q_heads32: u32 = d.mtp.q_heads;
+        const gqa: usize = q_heads / kv_heads;
         const eps = d.mtp.eps;
         const end: u32 = @intCast(l.end);
         const win: u32 = @intCast(@min(@as(u64, window), l.end - l.from));
         const blocks = attnBlocks(end, win);
         const inter: usize = d.mtp.inter;
-        d.glue(e, .embed, .{ .rows = 1, .width = hidden, .eps = text.eps }, &.{ b(l.seq), t(m.weights.embed.t), t(m.weights.embed_norm), b(s.h0) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, true);
+        d.glue(e, .embed, .{ .rows = 1, .width = h32, .eps = text.eps }, &.{ b(l.seq), t(m.weights.embed.t), t(m.weights.embed_norm), b(s.h0) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, true);
         var prev = b(s.h0);
         for (d.w.layers, 0..) |*layer, i| {
             d.norm(e, layer.input, prev, b(s.x), block);
             try d.mv(e, layer.q, b(s.x), b(s.q), block);
             try d.mv(e, layer.k, b(s.x), b(s.k), block);
             try d.mv(e, layer.v, b(s.x), b(s.v), block);
-            const pa = PrepArgs{ .rows = block, .heads = heads, .kv = kv_heads, .pos = end, .ring = ring, .eps = eps, .base_log2 = d.rope() };
-            d.launch(e, .block_prep, pa, &.{ b(s.q), b(s.k), b(s.v), t(layer.q_norm), t(layer.k_norm), b(s.qn), b(s.kb), b(s.vb) }, .{ (heads + kv_heads + 7) / 8, block, 1 }, .{ 256, 1, 1 });
-            const aa = AttnArgs{ .heads = heads, .kv = kv_heads, .end = end, .window = win, .ring = ring, .blocks = blocks, .scale = @floatCast(1.0 / @sqrt(@as(f64, head_dim))) };
-            d.launch(e, .attn_part, aa, &.{ b(s.qn), b(l.k[i]), b(l.v[i]), b(s.kb), b(s.vb), b(s.part) }, .{ kv_heads, 1, blocks }, .{ 192, 1, 1 });
-            d.launch(e, .attn_merge, aa, &.{ b(s.part), b(s.att) }, .{ heads, block, 1 }, .{ 32, 1, 1 });
+            const pa = PrepArgs{ .rows = block, .heads = q_heads32, .kv = kv_heads, .pos = end, .ring = ring, .eps = eps, .base_log2 = d.rope() };
+            d.launch(e, .block_prep, pa, &.{ b(s.q), b(s.k), b(s.v), t(layer.q_norm), t(layer.k_norm), b(s.qn), b(s.kb), b(s.vb) }, .{ (q_heads + kv_heads + 7) / 8, block, 1 }, .{ 256, 1, 1 });
+            const aa = AttnArgs{ .heads = q_heads32, .kv = kv_heads, .end = end, .window = win, .ring = ring, .blocks = blocks, .scale = @floatCast(1.0 / @sqrt(@as(f64, head_dim))) };
+            d.launch(e, .attn_part, aa, &.{ b(s.qn), b(l.k[i]), b(l.v[i]), b(s.kb), b(s.vb), b(s.part) }, .{ kv_heads, 1, blocks }, .{ gqa * 32, 1, 1 });
+            d.launch(e, .attn_merge, aa, &.{ b(s.part), b(s.att) }, .{ q_heads, block, 1 }, .{ 32, 1, 1 });
             try d.mv(e, layer.o, b(s.att), b(s.y), block);
-            const row_add = EwArgs{ .rows = block, .width = hidden };
-            d.launch(e, .add, row_add, &.{ prev, b(s.y), b(s.h) }, .{ hidden / 256, block, 1 }, .{ 256, 1, 1 });
+            const row_add = EwArgs{ .rows = block, .width = h32 };
+            d.launch(e, .add, row_add, &.{ prev, b(s.y), b(s.h) }, .{ h / 256, block, 1 }, .{ 256, 1, 1 });
             d.norm(e, layer.post, b(s.h), b(s.x), block);
             try d.mv(e, layer.gate, b(s.x), b(s.gate), block);
             try d.mv(e, layer.up, b(s.x), b(s.up), block);
             d.launch(e, .swiglu, EwArgs{ .rows = block, .width = @intCast(inter) }, &.{ b(s.gate), b(s.up), b(s.act) }, .{ (inter + 255) / 256, block, 1 }, .{ 256, 1, 1 });
             try d.mv(e, layer.down, b(s.act), b(s.y), block);
-            d.launch(e, .add, row_add, &.{ b(s.h), b(s.y), b(s.h) }, .{ hidden / 256, block, 1 }, .{ 256, 1, 1 });
+            d.launch(e, .add, row_add, &.{ b(s.h), b(s.y), b(s.h) }, .{ h / 256, block, 1 }, .{ 256, 1, 1 });
             prev = b(s.h);
         }
         // rows 1 to 7 only: the first row's last output is not read
-        d.norm(e, d.w.norm, bo(s.h, hidden * 2), b(s.hn), max_depth);
+        d.norm(e, d.w.norm, bo(s.h, h * 2), b(s.hn), max_depth);
         fwd.matvec(e, m, m.weights.unembed, b(s.hn), b(s.base), max_depth);
         const vocab: usize = text.vocab;
         const groups = (vocab + pick_group - 1) / pick_group;
@@ -744,7 +796,7 @@ pub const Drafter = struct {
         const flags: u32 = if (s.capture != null) write_logits | mass else mass;
         for (0..it.depth) |k| {
             const step: u32 = @intCast(k);
-            d.launch(e, .rnn_proj, ProjArgs{ .n = 3 * rank, .at = step }, &.{ b(l.state), t(d.w.markov.w1.t), b(l.seq), bo(s.hn, k * hidden * 2), b(l.f_rnn), t(d.w.markov.rnn.t), t(d.w.markov.rnn_b), b(s.proj) }, .{ 3 * rank / 8, 1, 1 }, .{ 256, 1, 1 });
+            d.launch(e, .rnn_proj, ProjArgs{ .n = 3 * rank, .at = step, .hidden = h32 }, &.{ b(l.state), t(d.w.markov.w1.t), b(l.seq), bo(s.hn, k * h * 2), b(l.f_rnn), t(d.w.markov.rnn.t), t(d.w.markov.rnn_b), b(s.proj) }, .{ 3 * rank / 8, 1, 1 }, .{ 256, 1, 1 });
             d.launch(e, .gru, {}, &.{ b(s.proj), b(l.state), b(l.state), b(s.latent) }, .{ 1, 1, 1 }, .{ rank, 1, 1 });
             const out = if (s.capture) |c| bo(c, k * vocab * 2) else b(s.latent);
             d.launch(e, .fold_pick, FoldArgs{ .vocab = @intCast(vocab), .valid = text.unpadded_vocab, .flags = flags, .cap = text.logit_cap }, &.{ bo(s.base, k * vocab * 2), b(s.latent), t(fold_w), t(fold_b), b(s.best), b(s.best_id), out, b(s.mass) }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
@@ -770,10 +822,11 @@ pub const Drafter = struct {
     /// writes its taps only after it.
     fn absorbFn(ptr: *anyopaque, items: []const dr.Absorb) anyerror!void {
         const d = cast(ptr);
+        const row_bytes = d.tapRowBytes();
         for (items) |it| {
             _ = d.lanes.get(it.stream) orelse return error.DraftStreamUnknown;
             const f = it.features;
-            if (f.space != .device or f.dtype != .bf16 or f.row_bytes != tap_row_bytes or f.rows == 0 or std.meta.activeTag(f.ready) != .none or it.rows != null) return error.DraftFeaturesUnsupported;
+            if (f.space != .device or f.dtype != .bf16 or f.row_bytes != row_bytes or f.rows == 0 or std.meta.activeTag(f.ready) != .none or it.rows != null) return error.DraftFeaturesUnsupported;
         }
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
@@ -813,7 +866,7 @@ pub const Drafter = struct {
                     enc = cb.?.compute(.serial);
                 }
                 const n: usize = @intCast(@min(@as(u64, absorb_rows), end - at));
-                d.encodeAbsorb(enc, l, bo(src, @intCast(f.offset + (at - it.start) * tap_row_bytes)), at, n, at + n == end) catch |err| {
+                d.encodeAbsorb(enc, l, bo(src, @intCast(f.offset + (at - it.start) * @as(u64, row_bytes))), at, n, at + n == end) catch |err| {
                     enc.end(); // an open encoder may not be dropped
                     return err;
                 };
@@ -916,19 +969,20 @@ pub const Drafter = struct {
         const l = try d.newLane();
         defer d.dropLane(l);
         const rows = window + 77;
-        const feat = try d.device.buffer(rows * tap_row_bytes, mtl.ResourceOptions.shared);
+        const row_bytes = d.tapRowBytes();
+        const feat = try d.device.buffer(rows * row_bytes, mtl.ResourceOptions.shared);
         defer feat.deinit();
         var prng = std.Random.DefaultPrng.init(0x5eed);
-        const row = feat.slice(u16, tap_row_bytes / 2);
+        const row = feat.slice(u16, row_bytes / 2);
         for (row) |*x| x.* = mix.bf16Of(prng.random().float(f32) * 2 - 1);
-        const all = feat.slice(u16, rows * tap_row_bytes / 2);
+        const all = feat.slice(u16, rows * row_bytes / 2);
         for (1..rows) |r| @memcpy(all[r * row.len ..][0..row.len], row);
         const ids = [_]u32{ 1000, 2000, 3000, 4000 };
         var stream: Stream = try Stream.init(d.gpa, .{ .id = "warm", .prompt = &ids, .max_new = 1 });
         defer stream.deinit(d.gpa);
         try d.lanes.put(d.gpa, &stream, l);
         defer _ = d.lanes.remove(&stream);
-        const feature = lanes.backend.Features{ .buffer = @intFromPtr(feat.id), .rows = rows, .row_bytes = tap_row_bytes, .space = .device, .dtype = .bf16 };
+        const feature = lanes.backend.Features{ .buffer = @intFromPtr(feat.id), .rows = rows, .row_bytes = @intCast(row_bytes), .space = .device, .dtype = .bf16 };
         try absorbFn(d, &.{.{ .stream = &stream, .features = feature, .start = 0, .follow = &.{}, .prompt = false }});
         var ms: [4]f64 = undefined;
         for (&ms) |*x| {

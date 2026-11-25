@@ -624,6 +624,295 @@ fn caseRing(g: *const h.Gpu, pipes: *const Pipes, r: std.Random) !void {
     }
 }
 
+/// 24 query heads over 8 key heads (G = 3): FP64 reference parity (local and global), exact bias bits, piece invariance,
+/// chunk-cut invariance, and NaN containment past each call's rows.
+fn caseG3(g: *const h.Gpu, r: std.Random) !void {
+    const hq: usize = 24;
+    const kv: usize = 8;
+    const qrow = hq * D;
+    const alloc = std.heap.page_allocator;
+    var pipes = try ap.Pipes.initFor(g.device, alloc, hq, kv);
+    defer pipes.deinit();
+    if (g.device.tensorUnits()) {
+        var older = try ap.Pipes.initUnitsFor(g.device, alloc, false, hq, kv);
+        older.deinit();
+    }
+
+    const SeqG3 = struct {
+        n: usize,
+        cap: usize,
+        pad: usize,
+        q: mtl.Buffer,
+        sink: mtl.Buffer,
+        reln: mtl.Buffer,
+        gate: mtl.Buffer,
+        out: mtl.Buffer,
+        keys: mtl.Buffer,
+        vals: mtl.Buffer,
+        proj: mtl.Buffer,
+        qv: []u16,
+        sv: []u16,
+        rv: []u16,
+        gv: []u16,
+        kv_buf: []u16,
+        vv: []u16,
+        pv: []u16,
+        saved: [6][]u16,
+
+        const widths = [6]usize{ qrow, hq, hq * REL, qrow, kv * D, kv * D };
+
+        fn init(gpu: *const h.Gpu, rng: std.Random, n: usize, pad: usize) !@This() {
+            const rows = n + pad;
+            const cap = (n + 63) / 64 * 64 + 64;
+            var s: @This() = undefined;
+            s.n = n;
+            s.cap = cap;
+            s.pad = pad;
+            s.q = try gpu.buf(rows * qrow * 2);
+            s.sink = try gpu.buf(rows * hq * 2);
+            s.reln = try gpu.buf(rows * hq * REL * 2);
+            s.gate = try gpu.buf(rows * qrow * 2);
+            s.out = try gpu.buf(rows * qrow * 2);
+            s.keys = try gpu.buf(cap * kv * D * 2);
+            s.vals = try gpu.buf(cap * kv * D * 2);
+            s.proj = try gpu.buf(REL * E * 2);
+            s.qv = h.fill16(s.q, rows * qrow, rng, 3);
+            s.sv = h.fill16(s.sink, rows * hq, rng, 2);
+            s.rv = h.fill16(s.reln, rows * hq * REL, rng, 2);
+            s.gv = h.fill16(s.gate, rows * qrow, rng, 3);
+            s.kv_buf = h.fill16(s.keys, cap * kv * D, rng, 3);
+            s.vv = h.fill16(s.vals, cap * kv * D, rng, 1.7);
+            s.pv = h.fill16(s.proj, REL * E, rng, 1);
+            @memset(s.qv[n * qrow ..], POISON);
+            @memset(s.sv[n * hq ..], POISON);
+            @memset(s.rv[n * hq * REL ..], POISON);
+            @memset(s.gv[n * qrow ..], POISON);
+            @memset(s.kv_buf[n * kv * D ..], POISON);
+            @memset(s.vv[n * kv * D ..], POISON);
+            const sizes = [6]usize{ pad * qrow, pad * hq, pad * hq * REL, pad * qrow, REACH * kv * D, REACH * kv * D };
+            for (&s.saved, sizes) |*sv, len| sv.* = try alloc.alloc(u16, len);
+            return s;
+        }
+
+        fn deinit(s: *@This()) void {
+            for ([_]mtl.Buffer{ s.q, s.sink, s.reln, s.gate, s.out, s.keys, s.vals, s.proj }) |b| b.deinit();
+            for (s.saved) |sv| alloc.free(sv);
+        }
+
+        fn views(s: *const @This()) [6][]u16 {
+            return .{ s.qv, s.sv, s.rv, s.gv, s.kv_buf, s.vv };
+        }
+
+        fn poison(s: *@This(), end: usize) void {
+            for (s.views(), s.saved, widths, 0..) |v, saved, w, i| {
+                const total = if (i < 4) s.n + s.pad else s.cap;
+                const len = @min(saved.len / w, total - end);
+                @memcpy(saved[0 .. len * w], v[end * w ..][0 .. len * w]);
+                @memset(v[end * w ..][0 .. len * w], POISON);
+            }
+        }
+
+        fn restore(s: *@This(), end: usize) void {
+            for (s.views(), s.saved, widths, 0..) |v, saved, w, i| {
+                const total = if (i < 4) s.n + s.pad else s.cap;
+                const len = @min(saved.len / w, total - end);
+                @memcpy(v[end * w ..][0 .. len * w], saved[0 .. len * w]);
+            }
+        }
+
+        fn biasBits(s: *const @This(), p: usize, hd: usize, d: usize) u16 {
+            var acc: f32 = 0;
+            for (0..REL) |i| acc += @as(f32, @floatCast(h.fb(s.rv[(p * hq + hd) * REL + i]))) * @as(f32, @floatCast(h.fb(s.pv[i * E + d])));
+            return h.bf(acc);
+        }
+
+        fn io(s: *const @This(), p0: usize) Io {
+            return .{
+                .q = .{ .buf = s.q, .off = p0 * qrow * 2 },
+                .k = .{ .buf = s.keys },
+                .v = .{ .buf = s.vals },
+                .sink = .{ .buf = s.sink, .off = p0 * hq * 2 },
+                .gate = .{ .buf = s.gate, .off = p0 * qrow * 2 },
+                .out = .{ .buf = s.out, .off = p0 * qrow * 2 },
+            };
+        }
+
+        fn relnAt(s: *const @This(), p0: usize) ap.B {
+            return .{ .buf = s.reln, .off = p0 * hq * REL * 2 };
+        }
+
+        fn rowsOf(s: *const @This(), p0: usize, n: usize) []u8 {
+            return s.out.slice(u8, (s.n + s.pad) * qrow * 2)[p0 * qrow * 2 ..][0 .. n * qrow * 2];
+        }
+
+        fn callG3(s: *@This(), gpu: *const h.Gpu, p: *const ap.Pipes, p0: usize, n: usize, global: bool, table: mtl.Buffer, piece: usize) !void {
+            const end = p0 + n;
+            s.poison(end);
+            defer s.restore(end);
+            const after = @min(s.pad, s.n + s.pad - end);
+            @memset(s.rowsOf(p0, n + after), 0xff);
+            const a: Args = .{ .rows = @intCast(n), .p0 = @intCast(p0), .global = @intFromBool(global), .ring = @intCast(s.cap) };
+            const cb = gpu.queue.commandBuffer();
+            const e = cb.compute(.serial);
+            ap.encodeChunk(e, p, a, s.io(p0), s.relnAt(p0), .{ .buf = s.proj }, .{ .buf = table }, piece);
+            e.end();
+            try finish(cb, "ik_pattn g3");
+            for (s.rowsOf(p0 + n, after)) |b| if (b != 0xff) return error.WroteBeyondRows;
+            const out_u16 = s.out.slice(u16, (s.n + s.pad) * qrow)[p0 * qrow ..][0 .. n * qrow];
+            for (out_u16) |x| if (std.math.isNan(h.fb(x))) return error.NanInOutput;
+        }
+    };
+
+    // 1. FP64 scalar reference parity (sliding and global) with NaN poisoning past every call
+    const heads_g3 = [_]usize{ 0, 2, 3, 5, 6, 11, 12, 23 };
+    const all_heads_g3 = comptime rowList(0, hq);
+    const first_rows = comptime rowList(0, 72);
+    const edge_rows = comptime rowList(0, 100);
+    const deep_rows = [_]usize{ 0, 1, 5, 31, 32, 40, 63, 64, 69 };
+    const Run = struct { p0: usize, rows: usize, heads: []const usize, row_list: []const usize };
+    const runs = [_]Run{
+        .{ .p0 = 0, .rows = 72, .heads = &heads_g3, .row_list = &first_rows },
+        .{ .p0 = 1000, .rows = 100, .heads = &all_heads_g3, .row_list = &edge_rows },
+        .{ .p0 = 3000, .rows = 70, .heads = &heads_g3, .row_list = &deep_rows },
+    };
+    const ref_table = try g.buf(ap.tableBytesFor(100, hq));
+    defer ref_table.deinit();
+    const scratch = try alloc.alloc(f64, 3071);
+    defer alloc.free(scratch);
+    const scale = 1 / @sqrt(@as(f64, D));
+    for ([_]bool{ false, true }) |global| {
+        var c: h.Check = .{ .name = if (global) "pattn g3 (24/8) global" else "pattn g3 (24/8) local" };
+        for (runs) |rc| {
+            var s = try SeqG3.init(g, r, rc.p0 + rc.rows, 64);
+            defer s.deinit();
+            for (0..s.n) |t| {
+                s.sv[t * hq + 2] = h.bf(25);
+                s.sv[t * hq + 3] = h.bf(25);
+                s.sv[t * hq + 5] = h.bf(-25);
+                s.sv[t * hq + 6] = h.bf(-25);
+            }
+            try s.callG3(g, &pipes, rc.p0, rc.rows, global, ref_table, PIECE);
+            const out = s.out.slice(u16, (s.n + s.pad) * qrow);
+            const bad = c.bad;
+            for (rc.row_list) |t| for (rc.heads) |hd| {
+                const p = rc.p0 + t;
+                const first = if (!global and p + 1 > E) p + 1 - E else 0;
+                const kvh = hd / (hq / kv);
+                const sink = h.fb(s.sv[p * hq + hd]);
+                var m = sink;
+                for (first..p + 1) |j| {
+                    var x: f64 = 0;
+                    for (0..D) |d| x += h.fb(s.qv[(p * hq + hd) * D + d]) * h.fb(s.kv_buf[(j * kv + kvh) * D + d]);
+                    x *= scale;
+                    if (p - j < E) x += h.fb(s.biasBits(p, hd, p - j));
+                    scratch[j] = x;
+                    m = @max(m, x);
+                }
+                var z = @exp(sink - m);
+                for (first..p + 1) |j| z += @exp(scratch[j] - m);
+                var o: [D]f64 = @splat(0);
+                var mag: [D]f64 = @splat(0);
+                for (first..p + 1) |j| {
+                    const w = @exp(scratch[j] - m) / z;
+                    for (&o, &mag, 0..) |*od, *md, d| {
+                        const v = h.fb(s.vv[(j * kv + kvh) * D + d]);
+                        od.* += w * v;
+                        md.* += w * @abs(v);
+                    }
+                }
+                for (0..D) |d| {
+                    const gt = h.fb(s.gv[(p * hq + hd) * D + d]);
+                    const gate = 1 / (1 + @exp(-gt));
+                    c.b16a(out[(p * hq + hd) * D + d], h.rb(o[d]) * gate, 2, 1e-6 + mag[d] * gate / 1024);
+                }
+            };
+            if (c.bad != bad) std.debug.print("  failing g3: p0 {d}, {d} rows\n", .{ rc.p0, rc.rows });
+        }
+        try c.done();
+    }
+
+    // 2. Bias table bits for 24 heads against host index-order sums
+    {
+        const rows: usize = 96;
+        const p0: usize = 1024 - 32;
+        var s = try SeqG3.init(g, r, p0 + rows, 64);
+        defer s.deinit();
+        const table = try g.buf(ap.tableBytesFor(rows, hq));
+        defer table.deinit();
+        const tv = table.slice(u16, rows * hq * E);
+        @memset(tv, 0xffff);
+        const a: Args = .{ .rows = rows, .p0 = p0, .global = 0, .ring = @intCast(s.cap) };
+        const cb = g.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        ap.encodeBiasFor(e, pipes.bias, hq, a, s.relnAt(p0), .{ .buf = s.proj }, .{ .buf = table });
+        e.end();
+        try finish(cb, "ik_pattn_bias g3");
+        var c: h.Check = .{ .name = "pattn g3 (24/8) bias bits" };
+        var differ: usize = 0;
+        for (0..rows) |t| for (0..hq) |hd| for (0..E) |d| {
+            const got = tv[(t * hq + hd) * E + ((p0 + t - d) & (E - 1))];
+            if (got != s.biasBits(p0 + t, hd, d)) differ += 1;
+        };
+        c.n += 1;
+        c.bad += @intFromBool(differ != 0);
+        try c.done();
+    }
+
+    // 3. Chunk-cut and piece invariance (sliding and global) with NaN poisoning past every sub-call
+    const cut_rows: usize = 1200;
+    const saved = try alloc.alloc(u8, cut_rows * qrow * 2);
+    defer alloc.free(saved);
+    const cut_table = try g.buf(ap.tableBytesFor(512, hq));
+    defer cut_table.deinit();
+    var cs = try SeqG3.init(g, r, cut_rows, 64);
+    defer cs.deinit();
+    for (0..cs.n) |t| {
+        cs.sv[t * hq + 2] = h.bf(25);
+        cs.sv[t * hq + 3] = h.bf(25);
+    }
+    const row_bytes = qrow * 2;
+    for ([_]bool{ false, true }) |global| {
+        var c: h.Check = .{ .name = if (global) "pattn g3 (24/8) partition global" else "pattn g3 (24/8) partition local" };
+        try cs.callG3(g, &pipes, 0, cut_rows, global, cut_table, 512);
+        @memcpy(saved, cs.rowsOf(0, cut_rows));
+        for ([_]usize{ 96, 32 }) |piece| {
+            try cs.callG3(g, &pipes, 0, cut_rows, global, cut_table, piece);
+            c.same(cs.rowsOf(0, cut_rows), saved);
+        }
+        const Sub = struct { p0: usize, n: usize };
+        const subs = [_]Sub{
+            .{ .p0 = 1, .n = cut_rows - 1 },
+            .{ .p0 = 7, .n = cut_rows - 7 },
+            .{ .p0 = 31, .n = cut_rows - 31 },
+            .{ .p0 = 32, .n = cut_rows - 32 },
+            .{ .p0 = 37, .n = cut_rows - 37 },
+            .{ .p0 = 63, .n = cut_rows - 63 },
+            .{ .p0 = 0, .n = 37 },
+            .{ .p0 = 0, .n = 1023 },
+            .{ .p0 = 1023, .n = cut_rows - 1023 },
+            .{ .p0 = 0, .n = 1024 },
+            .{ .p0 = 1024, .n = cut_rows - 1024 },
+            .{ .p0 = 0, .n = 1025 },
+            .{ .p0 = 1025, .n = cut_rows - 1025 },
+            .{ .p0 = cut_rows - 1, .n = 1 },
+            .{ .p0 = cut_rows - 13, .n = 13 },
+            .{ .p0 = cut_rows - 31, .n = 31 },
+            .{ .p0 = 0, .n = 33 },
+        };
+        for (subs) |sub| {
+            try cs.callG3(g, &pipes, sub.p0, sub.n, global, cut_table, 512);
+            c.same(cs.rowsOf(sub.p0, sub.n), saved[sub.p0 * row_bytes ..][0 .. sub.n * row_bytes]);
+        }
+        var at: usize = 0;
+        for ([_]usize{ 5, 7, 3, 11, 13, 2, 19, 31, 1, 33 }) |n| {
+            try cs.callG3(g, &pipes, at, n, global, cut_table, 512);
+            c.same(cs.rowsOf(at, n), saved[at * row_bytes ..][0 .. n * row_bytes]);
+            at += n;
+        }
+        try c.done();
+    }
+}
+
 pub fn run(g: *const h.Gpu, r: std.Random) !void {
     var pipes = try Pipes.init(g.device, std.heap.page_allocator);
     defer pipes.deinit();
@@ -637,4 +926,5 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try casePieces(g, &pipes, r);
     try casePartition(g, &pipes, r);
     try caseRing(g, &pipes, r);
+    try caseG3(g, r);
 }

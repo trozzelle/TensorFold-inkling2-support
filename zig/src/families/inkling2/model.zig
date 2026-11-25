@@ -13,9 +13,10 @@ const dspark_weights = @import("dspark_weights.zig");
 const dense_prefill = @import("dense_prefill.zig");
 const attention_prefill = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
+const experts_fp_prefill = @import("experts_fp_prefill.zig");
 
-pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_part_w", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap", "ik_nop", "ik_copy_f32", "ik_msg_depth", "ik_msggate_prep", "ik_msggate_apply_norm", "ik_attn_part_g3", "ik_attn_part_w_g3", "ik_nvfp4_w13_swiglu", "ik_nvfp4_w2", "ik_mxfp8_w13_swiglu", "ik_mxfp8_w2" };
-pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_part_w, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap, nop, copy_f32, msg_depth, msggate_prep, msggate_apply_norm, attn_part_g3, attn_part_w_g3, nvfp4_w13_swiglu, nvfp4_w2, mxfp8_w13_swiglu, mxfp8_w2 };
+pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_part_w", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap", "ik_nop", "ik_copy_f32", "ik_msg_depth", "ik_msggate_prep", "ik_msggate_apply_norm", "ik_msggate_prep3", "ik_msggate_apply_norm3", "ik_attn_part_g3", "ik_attn_part_w_g3", "ik_nvfp4_w13_swiglu", "ik_nvfp4_w2", "ik_mxfp8_w13_swiglu", "ik_mxfp8_w2" };
+pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_part_w, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap, nop, copy_f32, msg_depth, msggate_prep, msggate_apply_norm, msggate_prep3, msggate_apply_norm3, attn_part_g3, attn_part_w_g3, nvfp4_w13_swiglu, nvfp4_w2, mxfp8_w13_swiglu, mxfp8_w2 };
 
 comptime {
     // `pipe` indexes the pipelines by the enum's order: each member is its kernel's name without the ik_ prefix
@@ -27,31 +28,44 @@ comptime {
 /// `layers`: load only the first layers (the per-layer checks on a Mac that cannot hold the model); 0 loads none, and no
 /// experts: the embedding, the final norm and the unembedding alone, enough to run the draft head over recorded taps.
 /// `drafts`: also load the DSpark draft head from the folder's mtp.safetensors, when the config has one and the file is there.
-/// `draft_bits`: the width of the draft layers' projections (INKLING_DRAFT_BITS): quantized to 8 bits at load, or the file's bf16.
+/// `draft_bits`: draft layer projection width (INKLING_DRAFT_BITS); null picks `dspark_weights.Bits.defaultFor(mtp)`.
 /// `prefill_rows`: rows of a prompt chunk at most (INKLING_PREFILL_ROWS), a multiple of 64 from 64 to 8192: a scratch is made for
 /// that many rows and a prompt is fed in pieces of them; null takes `state.defaultPrefillRows` for the load's path.
-pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: dspark_weights.Bits = .default, prefill_rows: ?u32 = null };
+pub const Options = struct { layers: ?u32 = null, drafts: bool = false, draft_bits: ?dspark_weights.Bits = null, prefill_rows: ?u32 = null };
 
 /// The kernels of the chunk path, which runs a prompt chunk's rows on the tensor units: the dense projections' GEMM, the attention
 /// and the experts' chain. A load has them on a GPU with tensor units, for the shapes they are written for (`chunkGeometry`).
 pub const Chunk = struct {
     dense: dense_prefill.Pipes,
     attention: attention_prefill.Pipes,
-    experts: experts_prefill.Pipes,
+    experts: union(enum) {
+        exl3: experts_prefill.Pipes,
+        fp: experts_fp_prefill.Pipes,
+    },
 
-    /// Compiles them for `device`, which has tensor units (`error.NeedsTensorUnits` otherwise).
+    /// Compiles default 48/8 EXL3 chunk kernels for `device`, which has tensor units (`error.NeedsTensorUnits` otherwise).
     pub fn init(device: mtl.Device, gpa: std.mem.Allocator) !Chunk {
-        if (!experts_prefill.available(device)) return error.NeedsTensorUnits;
+        return initFor(device, gpa, attention_prefill.heads, attention_prefill.kv_heads, .exl3);
+    }
+
+    /// Compiles chunk kernels for `device`, parameterized by attention head geometry and expert storage format.
+    pub fn initFor(device: mtl.Device, gpa: std.mem.Allocator, q_heads: u32, kv_heads: u32, quant: cfg.Quant) !Chunk {
+        if (quant == .exl3 and !experts_prefill.available(device)) return error.NeedsTensorUnits;
+        if (quant != .exl3 and !experts_fp_prefill.available(device)) return error.NeedsTensorUnits;
         var dense = try dense_prefill.Pipes.init(device, gpa);
         errdefer dense.deinit();
-        var attention = try attention_prefill.Pipes.init(device, gpa);
+        var attention = try attention_prefill.Pipes.initFor(device, gpa, q_heads, kv_heads);
         errdefer attention.deinit();
-        const experts = try experts_prefill.Pipes.init(device, gpa);
-        return .{ .dense = dense, .attention = attention, .experts = experts };
+        if (quant == .exl3) {
+            return .{ .dense = dense, .attention = attention, .experts = .{ .exl3 = try experts_prefill.Pipes.init(device, gpa) } };
+        }
+        return .{ .dense = dense, .attention = attention, .experts = .{ .fp = try experts_fp_prefill.Pipes.init(device, gpa) } };
     }
 
     pub fn deinit(c: *Chunk) void {
-        c.experts.deinit();
+        switch (c.experts) {
+            inline else => |*e| e.deinit(),
+        }
         c.attention.deinit();
         c.dense.deinit();
     }
@@ -123,16 +137,14 @@ pub const Model = struct {
             "INKLING_PROMPT_PATH asks for them"
         else if (!m.device.tensorUnits())
             "this GPU has no tensor units"
-        else if (m.config.quant != .exl3)
-            "native NVFP4/MXFP8 checkpoints run prompts on the per-operation kernels"
-        else if (!chunkGeometry(t))
+        else if (!chunkGeometry(t, m.config.quant))
             "this config's shapes are not the tensor-unit kernels'"
         else
             null;
         if (reason) |r| {
             m.chunk = null;
             std.log.info("inkling2: prompt chunks run on the per-operation kernels: {s}", .{r});
-        } else m.chunk = try Chunk.init(m.device, gpa);
+        } else m.chunk = try Chunk.initFor(m.device, gpa, t.local.q, t.local.kv, m.config.quant);
         errdefer if (m.chunk) |*chunk| chunk.deinit();
         m.prefill_rows = opts.prefill_rows orelse st.defaultPrefillRows(if (m.chunk == null) .per_op else .chunk);
         m.checkpoint = ck.Checkpoint.init(gpa);
@@ -176,8 +188,8 @@ pub const Model = struct {
         m.draft = null;
         if (opts.drafts) {
             if (m.config.mtp) |mtp| {
-                if (mtp.hidden != 4608 or mtp.layers != 5 or mtp.taps_n != 8) return error.UnsupportedInkling2DraftHead;
-                m.draft = try dspark_weights.load(gpa, io, m.device, &m.checkpoint, dir, mtp, opts.draft_bits);
+                const bits = opts.draft_bits orelse dspark_weights.Bits.defaultFor(mtp);
+                m.draft = try dspark_weights.load(gpa, io, m.device, &m.checkpoint, dir, mtp, bits);
             } else std.log.info("inkling2: the config has no mtp_config; the draft head stays off", .{});
         }
         return m;
@@ -193,14 +205,19 @@ pub const Model = struct {
         if (m.chunk == null) return .per_op;
         for (m.weights.layers) |l| switch (l.experts) {
             .exl3 => |ex| if (!ex.xd_ok) return .chunk_rows,
-            else => return .per_op,
+            .nvfp4, .mxfp8 => {},
         };
         return .chunk;
     }
 
     /// What a scratch for this load's prompt chunks is made for.
     pub fn chunking(m: *const Model) st.Chunking {
-        return .{ .rows = m.prefill_rows, .path = m.promptPath(), .quant = m.config.quant };
+        return .{
+            .rows = m.prefill_rows,
+            .path = m.promptPath(),
+            .quant = m.config.quant,
+            .taps = if (m.config.mtp) |mtp| mtp.taps_n else st.feature_taps,
+        };
     }
 
     pub fn deinit(m: *Model) void {
@@ -227,11 +244,14 @@ fn geometry(t: *const cfg.Text) !void {
     if (!ok) return error.UnsupportedInkling2Geometry;
 }
 
-/// Whether the chunk kernels are written for this config: the attention's 48 query heads over 8 key heads of 128 dims, a relative
-/// state of 16 dims, a window and an extent of 1,024 on both layer kinds, and dense inputs a multiple of the GEMM's 256-deep step.
-fn chunkGeometry(t: *const cfg.Text) bool {
+/// Whether the tensor-unit chunk kernels support this config's attention, dense, and routed-expert geometry.
+fn chunkGeometry(t: *const cfg.Text, quant: cfg.Quant) bool {
     const a = attention_prefill;
-    return t.local.q == a.heads and t.local.kv == a.kv_heads and t.local.dim == a.dim and t.global.q == a.heads and
-        t.global.kv == a.kv_heads and t.global.dim == a.dim and t.d_rel == a.rel_dims and t.window == a.extent and
-        t.rel_extent == a.extent and t.hidden % 256 == 0 and (t.local.q * t.local.dim) % 256 == 0;
+    const heads_ok = (t.local.q == 48 or t.local.q == 24) and t.local.kv == a.kv_heads and t.local.dim == a.dim and
+        t.global.q == t.local.q and t.global.kv == t.local.kv and t.global.dim == t.local.dim;
+    const base_ok = heads_ok and t.d_rel == a.rel_dims and t.window == a.extent and t.rel_extent == a.extent and
+        t.hidden % 256 == 0 and (t.local.q * t.local.dim) % 256 == 0 and t.expert_inter % 128 == 0 and t.experts > 0;
+    if (!base_ok) return false;
+    if (quant == .exl3) return t.hidden == experts_prefill.hidden and t.expert_inter == experts_prefill.inner;
+    return 2 * t.expert_inter <= t.hidden;
 }

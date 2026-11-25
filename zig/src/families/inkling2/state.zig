@@ -7,6 +7,7 @@ const cfg = @import("config.zig");
 const exl3 = @import("../../core/exl3_projection.zig");
 const attention_prefill = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
+const experts_fp_prefill = @import("experts_fp_prefill.zig");
 
 /// Rows of a verify window at most (the pending token and its copy drafts).
 pub const window_rows = 16;
@@ -56,8 +57,8 @@ pub const PromptPath = enum {
     per_op,
 };
 
-/// What a scratch is made for: the rows of a prompt chunk at most, the path they take, and the expert storage format.
-pub const Chunking = struct { rows: usize, path: PromptPath = .chunk, quant: cfg.Quant = .exl3 };
+/// What a scratch is made for: prompt chunk rows, execution path, expert storage format, and drafter tap count.
+pub const Chunking = struct { rows: usize, path: PromptPath = .chunk, quant: cfg.Quant = .exl3, taps: usize = feature_taps };
 
 /// What INKLING_PROMPT_PATH asks of a load, to compare the paths and to test the fallbacks on a GPU and a pack that need none:
 /// `per_op` runs prompt chunks on the per-operation kernels whatever the GPU; `rows` (every layer) or `rows:3,7` (those layers)
@@ -332,20 +333,27 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, ch: C
     if (comptime named(name, "fin")) return R * H * 4;
     if (comptime named(name, "finals")) return (R + 7) * H * 2;
     if (comptime named(name, "logits")) return batch_rows * @as(usize, c.vocab) * 2;
-    if (comptime named(name, "segs")) return @as(usize, c.virtualLayers()) * max_mvs_slabs * seg_slot;
+    if (comptime named(name, "segs")) {
+        const seg_layers: usize = if (looped) 2 * @as(usize, c.virtualLayers()) else c.virtualLayers();
+        return seg_layers * max_mvs_slabs * seg_slot;
+    }
     if (comptime named(name, "part")) return partBytes(c, capacity);
     if (comptime named(name, "planes")) return if (is_exl3) win_slots * 2 * H * 4 else 0; // the decode chain's w13 output per slot as two f32 K halves
     if (comptime named(name, "sums")) return if (is_exl3) win_slots * H * 4 else 0; // its w2 output per slot before the output rotation, f32
-    if (comptime named(name, "ftaps")) return batch_rows * feature_taps * H * 2; // a shared decode round's rows of the drafter's taps
-    if (comptime named(name, "ptaps")) return R * feature_taps * H * 2; // a prompt chunk's
-    if (comptime named(name, "stage")) return if (per_op) 0 else @max(experts_prefill.xpBytes(R), @max(attention_prefill.tableBytes(R), R * max_queries * H * 4));
+    if (comptime named(name, "ftaps")) return batch_rows * ch.taps * H * 2; // a shared decode round's rows of the drafter's taps
+    if (comptime named(name, "ptaps")) return R * ch.taps * H * 2; // a prompt chunk's
+    if (comptime named(name, "stage")) {
+        if (per_op) return 0;
+        const xp_bytes = if (is_exl3) experts_prefill.xpBytes(R) else experts_fp_prefill.xpBytes(R, H, c.experts);
+        return @max(xp_bytes, @max(attention_prefill.tableBytesFor(R, c.local.q), R * max_queries * H * 4));
+    }
     if (comptime named(name, "h_pre")) return if (looped) R * H * 2 else 0;
     if (comptime named(name, "blocks_pre")) return if (c.loop) |lp| (lp.core_start / c.block) * R * H * 4 else 0;
     if (comptime named(name, "bank_blocks")) return if (c.loop) |lp| ((lp.core_end - lp.core_start) / c.block - 1) * R * H * 4 else 0;
     if (comptime named(name, "bank_partial")) return if (looped) R * H * 4 else 0;
     if (comptime named(name, "msg")) return if (looped) R * 4 * H * 4 else 0;
-    if (comptime named(name, "ctrl_in")) return if (looped) R * 2 * H * 2 else 0;
-    if (comptime named(name, "ctrl_z")) return if (c.loop) |lp| R * @as(usize, lp.gate_rank) * 2 else 0;
+    if (comptime named(name, "ctrl_in")) return if (looped) @max(R, max_queries * batch_rows) * 2 * H * 2 else 0;
+    if (comptime named(name, "ctrl_z")) return if (c.loop) |lp| @max(R, max_queries * batch_rows) * @as(usize, lp.gate_rank) * 2 else 0;
     @compileError("a scratch buffer without a size: " ++ name);
 }
 
@@ -440,6 +448,8 @@ pub const Scratch = struct {
     prefill_rows: usize,
     /// The path the buffers were made for: a forward's chunks take the path the model does.
     path: PromptPath,
+    /// Drafter taps per row that `ftaps` and `ptaps` are sized for.
+    taps: usize,
     /// The GPU seconds a decode step of each row count is expected to take (0: none yet), for the next one's wait: a
     /// shorter step replaces it at once, a longer one moves it a quarter of the way.
     expected: [batch_rows + 1]f64,
@@ -451,6 +461,7 @@ pub const Scratch = struct {
         s.capacity = capacity;
         s.prefill_rows = ch.rows;
         s.path = ch.path;
+        s.taps = ch.taps;
         s.expected = @splat(0);
         var made: [fields.len]bool = @splat(false);
         errdefer inline for (fields, 0..) |f, i| if (made[i]) @field(s, f).deinit();
@@ -468,6 +479,11 @@ pub const Scratch = struct {
     /// The experts' chain's tables and planes over the front of `stage`, for a chunk of up to `prefill_rows` rows.
     pub fn xp(s: *const Scratch) experts_prefill.Xp {
         return experts_prefill.Xp.init(s.stage, 0, s.prefill_rows);
+    }
+
+    /// Native NVFP4/MXFP8 routed-expert chain staging views over the front of `stage`.
+    pub fn xpFp(s: *const Scratch, hidden: usize, experts: usize) experts_fp_prefill.Xp {
+        return experts_fp_prefill.Xp.init(s.stage, 0, s.prefill_rows, hidden, experts);
     }
 };
 
@@ -723,10 +739,10 @@ test "inkling2 state: a cache's layers hold whole blocks of 64 positions, the va
 
 test "inkling2 state: Mini sizes segs for 48 virtual layers, skips EXL3 scratch, and allocates loop buffers" {
     @setEvalBranchQuota(100000);
-    const ch: Chunking = .{ .rows = per_op_prefill_rows, .path = .per_op, .quant = .nvfp4 };
+    const ch: Chunking = .{ .rows = per_op_prefill_rows, .path = .per_op, .quant = .nvfp4, .taps = 4 };
     const sz = try sizes(&mini, 0, ch);
     inline for (fields, 0..) |f, i| {
-        if (comptime named(f, "segs")) try std.testing.expectEqual(@as(usize, 48) * max_mvs_slabs * seg_slot, sz[i]);
+        if (comptime named(f, "segs")) try std.testing.expectEqual(@as(usize, 2 * 48) * max_mvs_slabs * seg_slot, sz[i]);
         if (comptime named(f, "blocks")) try std.testing.expectEqual(@as(usize, 4) * per_op_prefill_rows * 2304 * 4, sz[i]);
         if (comptime (named(f, "texp") or named(f, "tslot") or named(f, "ttok") or named(f, "gu") or named(f, "exl3") or named(f, "planes") or named(f, "sums")))
             try std.testing.expectEqual(@as(usize, 0), sz[i]);
@@ -738,11 +754,16 @@ test "inkling2 state: Mini sizes segs for 48 virtual layers, skips EXL3 scratch,
         if (comptime named(f, "msg")) try std.testing.expectEqual(per_op_prefill_rows * 4 * 2304 * 4, sz[i]);
         if (comptime named(f, "ctrl_in")) try std.testing.expectEqual(per_op_prefill_rows * 2 * 2304 * 2, sz[i]);
         if (comptime named(f, "ctrl_z")) try std.testing.expectEqual(per_op_prefill_rows * 64 * 2, sz[i]);
+        if (comptime named(f, "ftaps")) try std.testing.expectEqual(batch_rows * 4 * 2304 * 2, sz[i]);
+        if (comptime named(f, "ptaps")) try std.testing.expectEqual(per_op_prefill_rows * 4 * 2304 * 2, sz[i]);
     }
-    // Looped decode keeps ai sized for batch_rows even on the chunk path
-    const sz_chunk = try sizes(&mini, 0, .{ .rows = 512, .path = .chunk, .quant = .nvfp4 });
+    // Looped decode keeps ai, ctrl_in, and ctrl_z sized for 3-slot fused decode even at rows=64, and chunk stage uses xp_fp
+    const sz_chunk = try sizes(&mini, 0, .{ .rows = 64, .path = .chunk, .quant = .nvfp4, .taps = 4 });
     inline for (fields, 0..) |f, i| {
         if (comptime named(f, "ai")) try std.testing.expectEqual(batch_rows * max_queries * 2304 * 4, sz_chunk[i]);
+        if (comptime named(f, "ctrl_in")) try std.testing.expectEqual(max_queries * batch_rows * 2 * 2304 * 2, sz_chunk[i]);
+        if (comptime named(f, "ctrl_z")) try std.testing.expectEqual(max_queries * batch_rows * 64 * 2, sz_chunk[i]);
+        if (comptime named(f, "stage")) try std.testing.expectEqual(@max(experts_fp_prefill.xpBytes(64, 2304, 128), attention_prefill.tableBytesFor(64, 24)), sz_chunk[i]);
     }
     // Small still gets 0 bytes for loop buffers
     const sm = try sizes(&small, 0, .{ .rows = default_prefill_rows });

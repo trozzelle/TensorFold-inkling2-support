@@ -13,6 +13,7 @@ const Glue = @import("model.zig").Glue;
 const dense_prefill = @import("dense_prefill.zig");
 const attention = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
+const experts_fp_prefill = @import("experts_fp_prefill.zig");
 
 /// glue.metal's ik_args, field for field.
 pub const Args = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, kv: u32 = 0, dim: u32 = 0, pos: u32 = 0, blocks: u32 = 0, queries: u32 = 0, stride: u32 = 0, flags: u32 = 0, window: u32 = 0, extent: u32 = 0, ring: u32 = 0, eps: f32 = 0, scale: f32 = 0, cap: f32 = 0, alpha: f32 = 0, floor_n: f32 = 0, thr: f32 = 0 };
@@ -110,17 +111,34 @@ fn checked(f: mtl.CommandBuffer) !void {
     }
 }
 
-/// Most spans one layer opens (a looped global layer with controllers and dynamic convolutions is the most), so a recorder's capacity is
-/// `spans_per_layer * layers * repeat` plus the final's.
-pub const spans_per_layer = 48;
+/// Most spans one layer opens (a looped global layer with controllers and dynamic convolutions opens at most 28), so a
+/// recorder's capacity is `spans_per_layer * layers * repeat` plus the final's, keeping 48-layer runs within Metal's
+/// 4096-sample counter buffer limit.
+pub const spans_per_layer = 32;
 /// Rows recorded for the drafter and kernel studies: the inputs of the drafter's tapped layers, every layer's expert
 /// picks, and the MoE inputs of `xm_layers` (layouts: h [7][n][H] bf16, eids [layers][n][8] u32, xm [2][n][H] bf16).
 pub const Taps = struct { h: mtl.Buffer, eids: mtl.Buffer, xm: ?mtl.Buffer = null };
-/// The target layers whose input the DSpark head reads; its eighth tap is the finals.
+/// Default target layers whose input the Small DSpark head reads; its eighth tap is the finals.
 pub const tap_layers = [_]u32{ 5, 11, 17, 23, 29, 35, 41 };
 
 comptime {
     std.debug.assert(tap_layers.len + 1 == st.feature_taps);
+}
+
+/// Virtual layer indices whose input hidden state is tapped for the draft head (all taps before finals).
+pub fn tapLayers(m: *const Model) []const u32 {
+    if (m.config.mtp) |*mtp| {
+        const vtotal = m.config.text.virtualLayers();
+        if (mtp.taps_n > 0 and mtp.taps[mtp.taps_n - 1] == vtotal) return mtp.taps[0 .. mtp.taps_n - 1];
+        return mtp.taps[0..mtp.taps_n];
+    }
+    return &tap_layers;
+}
+
+/// Total taps per row written to `feature_taps` (intermediate layer taps plus finals).
+pub fn tapCount(m: *const Model) usize {
+    if (m.config.mtp) |mtp| return mtp.taps_n;
+    return st.feature_taps;
 }
 
 /// Layers whose MoE inputs the expert benches replay: one all-K3 layer and one mixed K2/K3 layer.
@@ -144,7 +162,7 @@ const part_w_g3_group = [3]usize{ 32, 3, 1 };
 pub const Segment = struct { cache: *st.Cache, rows: usize };
 
 /// Multi-stream shared decode rounds at or above this total row count switch routed experts to the sorted tensor-unit
-/// chain (`xp`) when available, saving ~42-66% of expert GPU time while keeping solo rounds on `xd`.
+/// chain (`xp` / `xp_fp`) when available, keeping solo decode windows on the per-row kernels for exactness.
 pub const batch_xp_from: usize = 12;
 
 /// out = in W^T on `e` for `rows` rows of the bf16 [d.n, d.k] matrix `d` (torch's Linear layout), in slabs of at most 16:
@@ -225,11 +243,12 @@ const Enc = struct {
         if (groups) x.e.dispatchGroups(g3, t3) else x.e.dispatchThreads(g3, t3);
     }
 
-    /// The `n` hidden rows at `src` as tap `k` of the rows of eight taps at `to` ([n][8][hidden] bf16), in a taps span.
+    /// The `n` hidden rows at `src` as tap `k` of the rows of `taps` taps at `to` ([n][taps][hidden] bf16), in a taps span.
     fn tap(x: Enc, to: B, src: B, k: usize) !void {
         const H: usize = x.m.config.text.hidden;
+        const n_taps = tapCount(x.m);
         try x.begin(.taps);
-        x.glue(.tap, .{ .rows = @intCast(x.n), .width = @intCast(H), .stride = @intCast(st.feature_taps * H) }, &.{ src, bo(to.buf, to.off + k * H * 2) }, .{ H, x.n, 1 }, .{ 256, 1, 1 }, false);
+        x.glue(.tap, .{ .rows = @intCast(x.n), .width = @intCast(H), .stride = @intCast(n_taps * H) }, &.{ src, bo(to.buf, to.off + k * H * 2) }, .{ H, x.n, 1 }, .{ 256, 1, 1 }, false);
         try x.end();
     }
 
@@ -410,7 +429,7 @@ const Enc = struct {
         const e = experts_prefill;
         const ex = l.experts.exl3;
         std.debug.assert((x.tensor or x.xp_batch) and ex.xd_ok);
-        e.encode(x.e.*, &x.m.chunk.?.experts, .{ .w13 = ex.w13, .w2 = ex.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
+        e.encode(x.e.*, &x.m.chunk.?.experts.exl3, .{ .w13 = ex.w13, .w2 = ex.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
     }
 };
 
@@ -441,6 +460,7 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
     }
     if (total_rows != n) return error.Inkling2RowsExceeded;
     if ((out.finals or out.feature_taps != null or out.logits != .none) and m.layers != m.plan.n) return error.Inkling2PartialModel;
+    if (out.feature_taps != null and s.taps < tapCount(m)) return error.Inkling2ScratchShort;
     // a chunk takes the path the model does, and the scratch's buffers are made for it
     if (!decode and s.path != m.promptPath()) return error.Inkling2ScratchForAnotherPromptPath;
     for (ids) |id| if (id >= c.vocab) return error.InvalidInkling2Token;
@@ -466,13 +486,14 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
     const H: usize = c.hidden;
     const nr: u32 = @intCast(n);
     x.glue(.embed, .{ .rows = nr, .width = c.hidden, .eps = c.eps }, &.{ b(s.ids), t(m.weights.embed.t), t(m.weights.embed_norm), b(s.h) }, .{ n, 1, 1 }, .{ 1024, 1, 1 }, true);
+    const tlayers = tapLayers(m);
     const total = @as(usize, m.layers) * out.repeat;
     const split: usize = if (decode and out.spans == null and m.first_chunk < total) m.first_chunk else 0;
     const every: usize = if (decode) 0 else commitEvery(n, total);
     const slab: usize = s.prefill_rows * H * 4;
     for (0..total) |li| {
         const i = li % m.layers;
-        if (out.taps != null or out.feature_taps != null) for (tap_layers, 0..) |l, k| if (l == i) {
+        if (out.taps != null or out.feature_taps != null) for (tlayers, 0..) |l, k| if (l == i) {
             if (out.taps) |tp| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(tp.h, k * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
             if (out.feature_taps) |ft| try x.tap(ft, b(s.h), k);
         };
@@ -519,7 +540,7 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
         }
     }
     if (out.finals or out.feature_taps != null or out.logits != .none) try final(x);
-    if (out.feature_taps) |ft| try x.tap(ft, b(s.finals), tap_layers.len);
+    if (out.feature_taps) |ft| if (tlayers.len < tapCount(m)) try x.tap(ft, b(s.finals), tlayers.len);
     if (out.logits != .none) {
         const first: usize = if (out.logits == .last) n - 1 else 0;
         const rows = n - first;
@@ -629,20 +650,40 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
         x.glue(.msg_depth, .{ .rows = nr, .width = c.hidden, .blocks = m.plan.bank_blocks, .queries = 4, .stride = stride, .scale = scale_h }, &.{ b(s.bank_blocks), b(s.bank_partial), bo(mq, @as(usize, p.core_idx) * 4 * H * 4), b(s.msg) }, .{ n, 1, 1 }, one, true);
         x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
         x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(w.attn_query.?), b(mix) }, .{ n, 1, 1 }, one, true);
-        try x.end();
-        for (0..3) |j| {
-            const hj = if (glob) bo(mix, j * H * 4) else b(mix);
-            const mj = bo(s.msg, j * H * 4);
-            const nwj = t(if (glob) w.in_norm[j].? else w.in_norm[0].?);
-            try x.begin(.norm);
-            x.glue(.msggate_prep, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden }, &.{ hj, mj, b(s.ctrl_in) }, .{ n, 1, 1 }, one, true);
+        if (x.decode) {
+            const gflag: u32 = if (glob) global else 0;
+            const nw1 = t(if (glob) w.in_norm[1].? else w.in_norm[0].?);
+            const nw2 = t(if (glob) w.in_norm[2].? else w.in_norm[0].?);
+            x.glue(.msggate_prep3, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .flags = gflag }, &.{ b(mix), b(s.msg), b(s.ctrl_in) }, .{ n, 3, 1 }, one, true);
             try x.end();
+            const in_slot = n * 2 * H * 2;
+            const z_slot = n * @as(usize, rank) * 2;
             try x.begin(.dense);
-            x.proj(ctrls[j].down, b(s.ctrl_in), b(s.ctrl_z), n);
+            x.mvs(m.plan.n + i, &.{
+                .{ .x = b(s.ctrl_in), .w = ctrls[0].down, .y = b(s.ctrl_z) },
+                .{ .x = bo(s.ctrl_in, in_slot), .w = ctrls[1].down, .y = bo(s.ctrl_z, z_slot) },
+                .{ .x = bo(s.ctrl_in, 2 * in_slot), .w = ctrls[2].down, .y = bo(s.ctrl_z, 2 * z_slot) },
+            }, n);
             try x.end();
             try x.begin(.norm);
-            x.glue(.msggate_apply_norm, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = Q * c.hidden, .eps = c.eps }, &.{ hj, mj, b(s.ctrl_z), t(ctrls[j].forget.t), t(ctrls[j].gain.t), nwj, xin[j] }, .{ n, 1, 1 }, one, true);
+            x.glue(.msggate_apply_norm3, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = Q * c.hidden, .flags = gflag, .eps = c.eps }, &.{ b(mix), b(s.msg), b(s.ctrl_z), t(ctrls[0].forget.t), t(ctrls[1].forget.t), t(ctrls[2].forget.t), t(ctrls[0].gain.t), t(ctrls[1].gain.t), t(ctrls[2].gain.t), t(w.in_norm[0].?), nw1, nw2, b(s.xq) }, .{ n, 3, 1 }, one, true);
             try x.end();
+        } else {
+            try x.end();
+            for (0..3) |j| {
+                const hj = if (glob) bo(mix, j * H * 4) else b(mix);
+                const mj = bo(s.msg, j * H * 4);
+                const nwj = t(if (glob) w.in_norm[j].? else w.in_norm[0].?);
+                try x.begin(.norm);
+                x.glue(.msggate_prep, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden }, &.{ hj, mj, b(s.ctrl_in) }, .{ n, 1, 1 }, one, true);
+                try x.end();
+                try x.begin(.dense);
+                x.proj(ctrls[j].down, b(s.ctrl_in), b(s.ctrl_z), n);
+                try x.end();
+                try x.begin(.norm);
+                x.glue(.msggate_apply_norm, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = Q * c.hidden, .eps = c.eps }, &.{ hj, mj, b(s.ctrl_z), t(ctrls[j].forget.t), t(ctrls[j].gain.t), nwj, xin[j] }, .{ n, 1, 1 }, one, true);
+                try x.end();
+            }
         }
     } else {
         try x.begin(.norm);
@@ -804,17 +845,27 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
         .nvfp4 => |nv| {
             try x.end();
             try x.begin(.experts);
-            x.glue(.nvfp4_w13_swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), b(s.eids), t(nv.w13.weight), t(nv.w13.scale), b(nv.w13.global_scale), b(s.act) }, .{ (I + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
-            x.glue(.nvfp4_w2, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), b(s.eids), t(nv.w2.weight), t(nv.w2.scale), b(nv.w2.global_scale), b(s.ey) }, .{ (H + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
-            x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            if (x.tensor or x.xp_batch) {
+                const e = experts_fp_prefill;
+                e.encodeNvfp4(x.e.*, &m.chunk.?.experts.fp, .{ .w13 = nv.w13, .w2 = nv.w2, .experts = c.experts }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xpFp(H, c.experts), n, .{ .gate = c.gate_cap, .up = c.up_cap });
+            } else {
+                x.glue(.nvfp4_w13_swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), b(s.eids), t(nv.w13.weight), t(nv.w13.scale), b(nv.w13.global_scale), b(s.act) }, .{ (I + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
+                x.glue(.nvfp4_w2, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), b(s.eids), t(nv.w2.weight), t(nv.w2.scale), b(nv.w2.global_scale), b(s.ey) }, .{ (H + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
+                x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            }
             try x.end();
         },
         .mxfp8 => |mx| {
             try x.end();
             try x.begin(.experts);
-            x.glue(.mxfp8_w13_swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), b(s.eids), t(mx.w13.weight), t(mx.w13.scale), b(s.act) }, .{ (I + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
-            x.glue(.mxfp8_w2, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), b(s.eids), t(mx.w2.weight), t(mx.w2.scale), b(s.ey) }, .{ (H + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
-            x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            if (x.tensor or x.xp_batch) {
+                const e = experts_fp_prefill;
+                e.encodeMxfp8(x.e.*, &m.chunk.?.experts.fp, .{ .w13 = mx.w13, .w2 = mx.w2, .experts = c.experts }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xpFp(H, c.experts), n, .{ .gate = c.gate_cap, .up = c.up_cap });
+            } else {
+                x.glue(.mxfp8_w13_swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), b(s.eids), t(mx.w13.weight), t(mx.w13.scale), b(s.act) }, .{ (I + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
+                x.glue(.mxfp8_w2, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), b(s.eids), t(mx.w2.weight), t(mx.w2.scale), b(s.ey) }, .{ (H + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
+                x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            }
             try x.end();
         },
     }

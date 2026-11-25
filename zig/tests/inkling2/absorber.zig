@@ -22,7 +22,7 @@ pub const Absorber = struct {
         stream.* = try lanes.Stream.init(gpa, .{ .id = "prefill", .prompt = ids, .max_new = 1 });
         errdefer stream.deinit(gpa);
         try drafter.drafter().open(stream);
-        return .{ .gpa = gpa, .drafter = drafter, .stream = stream, .row_bytes = @intCast(ik.state.feature_taps * @as(usize, m.config.text.hidden) * 2) };
+        return .{ .gpa = gpa, .drafter = drafter, .stream = stream, .row_bytes = @intCast(drafter.tapRowBytes()) };
     }
 
     pub fn deinit(a: Absorber) void {
