@@ -4,6 +4,38 @@
 >
 > - **Inkling 2 Small (EXL3 2.59 bpw) model pack:** [`heliophage/Inkling-2-Small-EXL3-2.59bpw-TensorFold`](https://huggingface.co/heliophage/Inkling-2-Small-EXL3-2.59bpw-TensorFold) — [`docs/recipes/inkling2-exl3-metal.md`](docs/recipes/inkling2-exl3-metal.md)
 > - **Inkling 2 Mini (native NVFP4/MXFP8):** serves `thinkingmachines/Inkling-2-Mini` directly — [`docs/recipes/inkling2-mini-metal.md`](docs/recipes/inkling2-mini-metal.md)
+>
+> ### Fork Benchmark Overview (Apple Silicon Metal)
+>
+> Measured on **Apple M5 Max** (40-core GPU, 128 GiB, ~614 GB/s) and **Apple M5 Ultra** (80-core GPU, 256 GiB, ~1.2 TB/s) with Metal 4 tensor-unit prefill (`4,096`-row chunks) and bit-identical DSpark speculative decoding (`0` token mismatches vs. plain decoding).
+>
+> #### Summary
+>
+> | Model & Format | Hardware | Weights / Peak Mem | Prefill (`8k` / `32k` / `131k`) | Decode Plain (`512` / `32k` / `131k`) | Decode Drafted (`512` / `32k` / `131k`) | Served `32k` Cached TTFT | Peak Multi-Stream Decode | Fidelity |
+> |---|---|---|---:|---:|---:|---:|---:|---|
+> | **Inkling 2 Small** (EXL3 2.59 bpw, 48 layers) | M5 Ultra (256 GiB) | `190.2 GiB` (`192.1` w/ 8-bit DSpark) | `2,119` / — / `1,618 tok/s` | `39.4` / `37.1` / `31.9 tok/s` | `61.4` / `56.8` / `47.5 tok/s` | `0.23 s` (`51.0 tok/s`) | `102.6 tok/s` E2E (`c=4`, short) | KL `0.0325`, `95.5%` top-1 vs. MXFP8 |
+> | **Inkling 2 Mini** (NVFP4/MXFP8, 48 virtual layers) | M5 Max (128 GiB) | `17.6 GiB` (`18.3` w/ bf16 DSpark) | `2,754` / `2,282` / `1,601 tok/s` | `61.5` / `51.4` / `37.1 tok/s` | `76.0` / `64.2` / `49.0 tok/s` | `0.16 s` (`96.4 tok/s`) | `245.1 tok/s` (`8k c=32`) / `329.2 tok/s` (`24` agents) | KL `0.0011`, `98.6%` top-1 vs. `mlx-lm` |
+> | **Inkling 2 Mini** (NVFP4/MXFP8, 48 virtual layers) | M5 Ultra (256 GiB) | `17.6 GiB` (`18.3` w/ bf16 DSpark; `25.8 GiB` peak at `p8`) | `5,480` / `5,089` / `3,805 tok/s` | `78.3` / `70.9` / `54.1 tok/s` | `107.8` / `93.6` / `74.0 tok/s` | `0.15 s` (`139.9 tok/s`, `44.6×` vs. cold) | `330.5 tok/s` (`8k c=32`) / `355.4 tok/s` (`24` agents) | KL `0.0011`, `98.6%` top-1 vs. `mlx-lm` |
+>
+> #### Inkling 2 Mini — Concurrency & Multi-Turn Coding-Agent Scaling (Drafted BF16)
+>
+> | Workload (`--parallel 32`) | M5 Max Agg / Stream | M5 Ultra Agg / Stream | M5 Ultra TTFT | M5 Ultra Peak Unified Mem |
+> |---|---:|---:|---:|---:|
+> | `8k` shared prefix (`c=1` → `c=8` → `c=32`, 128 gen) | `82.1` → `147.3` → `245.1 tok/s` (`7.7`/st) | `116.5` → `232.0` → `330.5 tok/s` (`10.3`/st) | `0.20 s` → `1.06 s` → `4.54 s` | `64.2 GiB` |
+> | `32k` shared prefix (`c=1` → `c=8` → `c=32`, 128 gen) | `77.5` → `124.9` → `196.8 tok/s` (`6.2`/st) | `111.4` → `187.8` → `263.8 tok/s` (`8.2`/st) | `0.27 s` → `1.32 s` → `5.17 s` | `88.8 GiB` |
+> | Coding agent solo (`1 × 4` turns, `9.3k–20.2k` ctx, `77%` hit) | `97.1` / `101.4 tok/s` | `144.9` / `153.6 tok/s` | `0.85 s` p50 | `64.1 GiB` (full suite, `16 GiB` cache) |
+> | Coding agent team (`4 × 3` turns, `9.3k–16.6k` ctx, `75%` hit) | `135.6` / `39.3 tok/s` | `219.3` / `63.5 tok/s` | `4.04 s` p50 | `64.1 GiB` |
+> | Coding agent swarm (`8 × 3` / `16 × 2` / `24 × 2` turns) | `246.3` / `221.9` / `329.2 tok/s` (`16.5`/ag) | `283.7` / `343.6` / `355.4 tok/s` (`19.8`/ag) | `11.1` / `15.0` / `18.2 s` p50 | `64.1 GiB` |
+>
+> #### Inkling 2 Small (EXL3 2.59 bpw) — Served Multi-Stream (`M5 Ultra`, `--parallel 4 --context 262144`)
+>
+> | Workload | Concurrency | Prompt Tokens | TTFT p50 | Decode (`tok/s`) | Aggregate E2E (`tok/s`) | Peak Memory |
+> |---|---:|---:|---:|---:|---:|---:|
+> | Short decode (`c=1` / `c=2` / `c=4`) | `1` / `2` / `4` | `139` | `0.37` / `0.40` / `0.49 s` | `65.5` / `41.7` / `28.1` | `64.7` / `82.1` / `102.6` | `197.3`–`199.1 GiB` |
+> | Long context (`8k` / `32k` / `128k`, `c=1`) | `1` | `10.3k` / `40.3k` / `155.2k` | `5.81` / `23.40` / `112.80 s` | `51.6` / `56.1` / `42.2` | `40.0` / `24.2` / `7.5` | `202.1`–`209.5 GiB` |
+> | Cached `32k` (`c=1`, 100% hit) | `1` | `40,247` | `0.23 s` | `51.0` | `49.0` | `205.3 GiB` |
+>
+> Full benchmark methodology, kernel breakdowns, and serving flags live in [`docs/recipes/inkling2-exl3-metal.md`](docs/recipes/inkling2-exl3-metal.md) and [`docs/recipes/inkling2-mini-metal.md`](docs/recipes/inkling2-mini-metal.md).
 
 <p align="center">
   <a href="https://ko-fi.com/ashxhart">Help Support TensorFold</a> ·
