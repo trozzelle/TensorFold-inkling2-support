@@ -5,7 +5,7 @@ TensorFold serves `thinkingmachines/Inkling-2-Mini` directly from the Hugging Fa
 - dense projections, short convolutions, norms, attention-residual queries, rank-64 cross-pass `MessageGate` controllers, routers, and unembedding in bf16;
 - the 24 physical layers unrolled into 48 virtual layers (`6` prelude + `12 × 3` looped core passes + `6` postlude), each virtual layer owning its own KV and short-convolution state.
 
-Text only, one to eight concurrent streams (`--parallel 1` through `8`, default `1`); drafts come from the checkpoint's 3-layer DSpark draft head (kept in bf16 by default), with an in-memory prompt cache for multi-turn reuse and chunked prefill interleaving (`--decode-share`). The checkpoint's `model.visual.*` tensors are skipped at load (`--vision` is refused).
+Text only, one to 32 concurrent streams (`--parallel 1` through `32`, default `1`); drafts come from the checkpoint's 3-layer DSpark draft head (kept in bf16 by default), with an in-memory prompt cache for multi-turn reuse and chunked prefill interleaving (`--decode-share`). The checkpoint's `model.visual.*` tensors are skipped at load (`--vision` is refused).
 
 ## Model directory
 
@@ -35,7 +35,7 @@ Point TensorFold directly at the downloaded `thinkingmachines/Inkling-2-Mini` sn
 - On a 128 GB Mac (default 75% load limit), `74.1 GiB` remains for KV caches and prompt snapshots — `1,048,576` token slots across up to 8 streams, with `8.0 GiB` reserved for the prompt cache (`--prompt-cache-gib`, `0` disables it). On a 32–64 GB Mac, lower `--load-limit-gb` or `INKLING_PREFILL_ROWS=512` if tighter scratch/cache bounds are needed.
 - Virtual layer geometry mirrors Small's KV footprint per token: 40 sliding virtual layers (1,024-token window, ring sized to `alignForward(window + prefill_rows + 64, 256)`) and 8 global virtual layers (`8` KV heads × `128` dims in bf16 = `32 KiB/token`). Each admitted stream reserves the fixed sliding-ring and convolution floor plus `32 KiB/token` dynamically.
 - **Prompt chunk path (M5 tensor units):** on GPUs with tensor units, prompt chunks take `.chunk` (`INKLING_PREFILL_ROWS`, default `4,096`): dense projections, routers, and Pass 1–2 `MessageGate` `forget`/`gain` projections (`ctrl_nax`) run as tensor-unit GEMMs, attention runs parameterized `pattn` (`NQ=24, G=3`), and routed experts run `xp_fp` (single-list GPU sort into 32-row windows with exact in-register bf16 dequantization of both NVFP4 `e2m1 × e4m3` and MXFP8 `e4m3 × ue8m0` into `mma_16x32`, `SoftcappedSwiGLU`, and pick-ordered combine). GPUs without tensor units (or `INKLING_PROMPT_PATH=per_op`) fall back to the per-operation prompt path (`512`-row default).
-- **Decode path:** single-stream decode steps (`1..16` rows, including draft verification) use per-row NVFP4/MXFP8 expert kernels at 1 row and bit-identical GPU-grouped (`<= 4`-slot tile) kernels (`ik_fp_group` + `*_g`) at `2..16` rows, GQA=3 split-K attention (`attn_split` with `ik_attn_part_w_g3` shared K/V loads at long contexts), and fused Pass 1–2 decode controllers (`ik_loop_attn_prep`/`prep3` & `ik_loop_mlp_prep` → stacked `mvs` `down_proj` → coalesced multi-threadgroup `ik_msggate_fg_decode`/`fg_decode3` + `ik_norm3_f32`), keeping 1-row steps, 16-row windows, and drafted verification bit-identical. Wide multi-stream shared decode batches (`segments.len > 1` and `rows >= 12`, up to 64 rows) switch routed experts to `xp_fp`, and concurrent DSpark holds batch their draft projections, unembedding, and `fold_w` Markov scoring across active streams (`ikd_fold_pick_batch`, with lazy `27.9 MiB` batch scratch allocated only when `c > 1`).
+- **Decode path:** single-stream decode steps (`1..16` rows, including draft verification) use per-row NVFP4/MXFP8 expert kernels at 1 row and bit-identical GPU-grouped (`<= 4`-slot tile) kernels (`ik_fp_group` + `*_g`) at `2..16` rows, GQA=3 split-K attention (`attn_split` with `ik_attn_part_w_g3` shared K/V loads at long contexts), and fused Pass 1–2 decode controllers (`ik_loop_attn_prep`/`prep3` & `ik_loop_mlp_prep` → stacked `mvs` `down_proj` → coalesced multi-threadgroup `ik_msggate_fg_decode`/`fg_decode3` + `ik_norm3_f32`), keeping 1-row steps, 16-row windows, and drafted verification bit-identical. Wide multi-stream shared decode batches (up to `32` streams / `128` rows) switch routed experts to `xp_fp` from `12` rows and dense projections + unembedding to tensor-unit `gemmRows` from `64` rows, while concurrent DSpark holds batch their draft projections, unembedding, and `fold_w` Markov scoring in groups of up to `8` streams (`ikd_fold_pick_batch`, with lazy `27.9 MiB` batch scratch allocated only when `c > 1`).
 - **Host-side switches:** `INKLING_WARM_WAIT=0`, `INKLING_FIRST_CHUNK=N`, `INKLING_ROUND_TIMING=1`, `INKLING_PREFILL_ROWS`, `INKLING_PROMPT_PATH`, `--decode-share`, and `launchd` settings (`ProcessType: Interactive`) behave identically to [`inkling2-exl3-metal.md`](inkling2-exl3-metal.md).
 
 ## Drafts
@@ -75,7 +75,21 @@ Loaded in `3.8–4.7 s` (`18.3 GiB` weights incl. `0.80 GiB` bf16 DSpark, `1.45 
 | 32k cached, exact hit (`c=1`) | 1 | 32,046 (`32,045` hit) | `0.16 s` | `96.4` | `96.4` | `80.8×` lower TTFT; identical output SHA |
 | 32k cached, new suffix (`c=1`) | 1 | 32,043 (`28,705` hit) | `1.61 s` | `84.1` | `84.1` | `7.9×` lower TTFT |
 
-Shared forward calibration at startup (48 virtual layers, tapped): single-stream `1..8` rows `16.6..32.7 ms`; multi-stream shared `16` rows `45.8 ms`, `24` rows `55.4 ms`, `32` rows `64.5 ms`, `48` rows `84.3 ms`, `64` rows `102.8 ms`.
+Shared forward calibration at startup (48 virtual layers, tapped, `--parallel 32`): single-stream `1..8` rows `16.1..32.4 ms`; multi-stream shared `16` rows `44.5 ms`, `24` rows `54.4 ms`, `32` rows `64.5 ms`, `48` rows `84.3 ms`, `64` rows `86.4 ms`, `96` rows `99.2 ms`, `128` rows `112.2 ms`.
+
+### High-concurrency scaling at 8k and 32k context (`--parallel 32`, `128` output tokens/stream)
+
+Reply-boundary cached shared document prefix (`8.7k` or `32.1k` tokens, `100%` hit so every stream allocates its own independent full KV cache — `~59 GiB` live KV at 32k `c=32` — and decodes unique questions simultaneously):
+
+| `c` | 8k Drafted agg / stream (`tok/s`) | 8k Plain (`--no-drafts`) agg / wall (`tok/s`) | 32k Drafted agg / stream (`tok/s`) | 32k Plain (`--no-drafts`) agg / wall (`tok/s`) |
+|---:|---:|---:|---:|---:|
+| `1` | `82.1` / `82.1` | — | `77.5` / `77.5` | — |
+| `2` | `111.6` / `55.8` | — | `90.4` / `45.2` | — |
+| `4` | `128.4` / `32.1` | — | `106.0` / `26.5` | — |
+| `8` | `147.3` / `18.4` | — | `124.9` / `15.6` | — |
+| `16` | `176.4` / `11.0` | `183.4` / `151.2` | `155.3` / `9.7` | `141.4` / `119.9` |
+| `24` | `205.8` / `8.6` | `203.7` / `164.1` | `181.3` / `7.6` | `155.6` / `129.0` |
+| `32` | `245.1` / `7.7` | `227.7` / `178.3` | `196.8` / `6.2` | `167.0` / `135.5` |
 
 ## Fidelity
 
@@ -87,6 +101,6 @@ Checked against the `mlx-lm` reference implementation of `inkling2_loop` over 51
 
 ## Limits
 
-- Up to 8 concurrent streams (`--parallel 1` through `8`, default `1`); values outside `1..8` are refused.
+- Up to 32 concurrent streams (`--parallel 1` through `32`, default `1`); values outside `1..32` are refused.
 - `--vision` is refused (`model.visual.*` tensors are skipped at load).
 - Like Small, the server does not yet split Inkling's raw channel markers (`<|message_model|><|content_thinking|>`). Send `chat_template_kwargs {"enable_thinking": false}`, or serve with `--no-thinking`, for replies without thinking.
