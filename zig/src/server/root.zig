@@ -24,6 +24,15 @@ test {
     _ = @import("kimi_reply_test.zig");
     _ = @import("kimi_stream_test.zig");
     _ = @import("kimi_http_test.zig");
+    _ = @import("inkling2_reply_test.zig");
+    _ = @import("inkling2_boundary_test.zig");
+    _ = @import("inkling2_chat_test.zig");
+    _ = @import("inkling2_ks51_test.zig");
+    _ = @import("inkling2_ks53_test.zig");
+    _ = @import("inkling2_required_test.zig");
+    _ = @import("inkling2_native_required_test.zig");
+    _ = @import("inkling2_stop_test.zig");
+    _ = @import("inkling2_thinking_test.zig");
     _ = @import("profile_line.zig");
     _ = @import("auth_scope_test.zig");
     _ = @import("family_sampling.zig");
