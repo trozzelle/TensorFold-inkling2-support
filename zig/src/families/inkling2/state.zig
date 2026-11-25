@@ -12,9 +12,9 @@ const experts_fp_prefill = @import("experts_fp_prefill.zig");
 /// Rows of a verify window at most (the pending token and its copy drafts).
 pub const window_rows = 16;
 /// Total rows across all concurrent streams in one shared decode round.
-pub const batch_rows = 64;
+pub const batch_rows = 128;
 /// Maximum concurrent streams in one shared decode round.
-pub const max_streams = 8;
+pub const max_streams = 32;
 /// Maximum 16-row slabs of stacked attention-input matvecs per layer in one shared decode round.
 pub const max_mvs_slabs = batch_rows / window_rows;
 /// Rows of a prompt chunk at most when a load does not ask for others (`model.Options.prefill_rows`): a chunk reads every weight
@@ -577,10 +577,10 @@ test "inkling2 state: the drafter's taps are eight hidden rows a row, a shared d
     try std.testing.expectEqual(@as(usize, 8), feature_taps);
 }
 
-test "inkling2 state: batch scratch holds 64 decode rows while keeping split partials at 16" {
+test "inkling2 state: batch scratch holds 128 decode rows while keeping split partials at 16" {
     const c = small;
-    try std.testing.expectEqual(@as(usize, 64), batch_rows);
-    try std.testing.expectEqual(@as(usize, 8), max_streams);
+    try std.testing.expectEqual(@as(usize, 128), batch_rows);
+    try std.testing.expectEqual(@as(usize, 32), max_streams);
     // xq must hold 3 * batch_rows even at minimum prefill_rows = 64
     const sz64 = try sizes(&c, 4096, .{ .rows = 64, .path = .chunk });
     inline for (fields, 0..) |f, i| {
@@ -641,8 +641,8 @@ test "inkling2 state: the scratch's per-row buffers follow the prompt chunk's ro
     const b4096 = try scratchBytes(&small, 0, .{ .rows = default_prefill_rows });
     const b512 = try scratchBytes(&small, 0, .{ .rows = 512 });
     const b2048 = try scratchBytes(&small, 0, .{ .rows = 2048 });
-    try std.testing.expect(b4096 > 2_868_139_264 and b4096 < 3_000_000_000);
-    try std.testing.expect(b512 > 398_834_944 and b512 < 520_000_000);
+    try std.testing.expect(b4096 > 2_868_139_264 and b4096 < 3_100_000_000);
+    try std.testing.expect(b512 > 398_834_944 and b512 < 600_000_000);
     try std.testing.expect(b2048 > b512);
     for ([_]usize{ 0, 63, 100, 8192 + 64 }) |rows| {
         try std.testing.expectError(error.InvalidInkling2PrefillRows, sizes(&small, 256, .{ .rows = rows }));

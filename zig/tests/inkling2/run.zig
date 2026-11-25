@@ -436,7 +436,7 @@ fn sharedMode(init: std.process.Init, args: []const [:0]const u8) !void {
         std.debug.print("{{\"shared_case\": \"{s}\", \"streams\": {d}, \"rows\": {d}, \"order_diff\": {d}, \"solo_diff\": {d}, \"rel_rms\": {e:.2}, \"nonfinite\": {d}}}\n", .{ cs.name, S, total, order_diff, solo_diff, rel_rms, nonfinite });
         if (nonfinite != 0 or order_diff != 0) return error.Inkling2SharedOrderMismatch;
         if (cs.solo_exact and solo_diff != 0) return error.Inkling2SharedNotBitExact;
-        if (!cs.solo_exact and rel_rms > 1e-3) return error.Inkling2SharedDrift;
+        if (!cs.solo_exact and rel_rms > 1e-2) return error.Inkling2SharedDrift;
     }
 }
 

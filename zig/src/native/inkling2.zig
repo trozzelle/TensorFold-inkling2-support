@@ -50,7 +50,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         return null;
     }
     const served = resolvedLanes(o) catch {
-        problem.* = "--parallel: the Inkling 2 engine serves 1 to 8 streams; give --parallel 1 through 8";
+        problem.* = "--parallel: the Inkling 2 engine serves 1 to 32 streams; give --parallel 1 through 32";
         return null;
     };
     if (o.prompt_cache_gib) |g| if (!std.math.isFinite(g) or g < 0) {
@@ -344,13 +344,14 @@ test "inkling2 host: bad prompt cache cap is refused before loading" {
     }
 }
 
-test "inkling2 host: parallel defaults to 1 when unset and refuses 0 or >8 before loading" {
+test "inkling2 host: parallel defaults to 1 when unset and refuses 0 or >32 before loading" {
     try std.testing.expectEqual(@as(u32, 1), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 4, .lanes_fixed = false }));
     try std.testing.expectEqual(@as(u32, 1), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 1, .lanes_fixed = true }));
     try std.testing.expectEqual(@as(u32, 4), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 4, .lanes_fixed = true }));
     try std.testing.expectEqual(@as(u32, 8), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 8, .lanes_fixed = true }));
+    try std.testing.expectEqual(@as(u32, 32), try resolvedLanes(.{ .dir = "no-weights", .model_type = "inkling2", .lanes = 32, .lanes_fixed = true }));
     var problem: []const u8 = "";
-    for ([_]u32{ 0, 9, 16 }) |bad| {
+    for ([_]u32{ 0, 33, 64 }) |bad| {
         const o: api.Open = .{ .dir = "no-weights", .model_type = "inkling2", .lanes = bad, .lanes_fixed = true };
         try std.testing.expectEqual(null, try open(std.testing.allocator, std.testing.allocator, std.testing.io, o, &problem));
         try std.testing.expectStringStartsWith(problem, "--parallel:");

@@ -1,4 +1,4 @@
-//! Inkling 2 lane backend: 1..8 streams, caches, shared verify rounds, and host-drawn copy-drafted windows.
+//! Inkling 2 lane backend: 1..32 streams, caches, shared verify rounds, and host-drawn copy-drafted windows.
 const std = @import("std");
 const mtl = @import("metal");
 const lanes = @import("lanes");
@@ -17,7 +17,7 @@ pub const Options = struct { capacity: usize, budget: u64, streams: u32 = 1 };
 pub const measured_widths = 8;
 
 /// Multi-stream total widths `measure` times when `options.streams > 1` for shared-round cost pricing.
-const shared_widths = [_]usize{ 16, 24, 32, 48, 64 };
+const shared_widths = [_]usize{ 16, 24, 32, 48, 64, 96, 128 };
 
 /// Token handles: drawn tokens and host-fed ones, in a host ring.
 const ring = 4096;
@@ -156,17 +156,21 @@ pub const Metal = struct {
         }
         self.timed = measured_widths;
         if (self.options.streams > 1) {
-            const max_segs = st.batch_rows / st.window_rows;
-            var caches: [max_segs]st.Cache = undefined;
+            const max_possible = st.batch_rows / st.window_rows;
+            const max_segs = @min(max_possible, @as(usize, self.options.streams));
+            const max_rows = @min(@as(usize, st.batch_rows), @as(usize, self.options.streams) * st.window_rows);
+            var caches: [max_possible]st.Cache = undefined;
             var made: usize = 0;
             defer for (caches[0..made]) |*cc| cc.deinit();
             for (0..max_segs) |i| {
                 caches[i] = try st.Cache.init(self.model.device, c, 32, c.virtualLayers(), self.scratch.prefill_rows);
                 made += 1;
             }
-            for (shared_widths, 0..) |rows, wi| {
+            var timed_n: usize = 0;
+            for (shared_widths) |rows| {
+                if (rows > max_rows) break;
                 const n_segs = @max(@as(usize, 2), (rows + st.window_rows - 1) / st.window_rows);
-                var segs: [max_segs]fwd.Segment = undefined;
+                var segs: [max_possible]fwd.Segment = undefined;
                 var rem = rows;
                 for (0..n_segs) |si| {
                     const left = n_segs - si;
@@ -181,9 +185,10 @@ pub const Metal = struct {
                     try fwd.runShared(self.model, &self.scratch, segs[0..n_segs], ids[0..rows], .{ .logits = .all, .feature_taps = to });
                     if (run == 1) ms = (nowSeconds() - began) * 1e3;
                 }
-                self.shared[wi] = .{ .width = @intCast(rows), .ms = ms };
+                self.shared[timed_n] = .{ .width = @intCast(rows), .ms = ms };
+                timed_n += 1;
             }
-            self.shared_timed = shared_widths.len;
+            self.shared_timed = timed_n;
         }
     }
 

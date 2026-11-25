@@ -165,6 +165,9 @@ pub const Segment = struct { cache: *st.Cache, rows: usize };
 /// Multi-stream shared decode rounds at or above this total row count switch routed experts to the sorted tensor-unit
 /// chain (`xp` / `xp_fp`) when available, keeping solo decode windows on the per-row kernels for exactness.
 pub const batch_xp_from: usize = 12;
+/// Multi-stream shared decode rounds at or above this total row count switch dense projections and unembedding
+/// to tensor-unit GEMM so wide concurrent batches read dense weights once instead of per 16-row matvec slab.
+pub const batch_dense_from: usize = 64;
 
 /// out = in W^T on `e` for `rows` rows of the bf16 [d.n, d.k] matrix `d` (torch's Linear layout), in slabs of at most 16:
 /// the row-count kernel of the slab, whose bits do not depend on the slab. `in` rows are d.k wide, `out` rows d.n.
@@ -194,6 +197,8 @@ const Enc = struct {
     tensor: bool = false,
     /// Whether a multi-stream decode round routes its experts through the sorted tensor-unit chain (`xp`).
     xp_batch: bool = false,
+    /// Whether a multi-stream decode round routes its dense projections through tensor-unit GEMM.
+    dense_batch: bool = false,
     spans: ?*counters.Recorder = null,
     ablate: ?*Ablation = null,
 
@@ -291,13 +296,13 @@ const Enc = struct {
     /// out = in W^T for `rows` rows of the bf16 [d.n, d.k] matrix `d`, bf16 out: the chunk kernels' tensor-unit GEMM (bf16 operands,
     /// f32 sums in an order that does not depend on the rows or the tile), or the matvec slabs of the decode and per-operation paths.
     fn proj(x: Enc, d: wts.Dense, in: B, out: B, rows: usize) void {
-        if (x.tensor) return x.gemm(d, in, out, rows, .bf16);
+        if (x.tensor or x.dense_batch) return x.gemm(d, in, out, rows, .bf16);
         x.mv(d, in, out, rows);
     }
 
     /// The tensor-unit GEMM into rows of `d.n` values of `kind` (the router's logits are f32).
     fn gemm(x: Enc, d: wts.Dense, in: B, out: B, rows: usize, kind: dense_prefill.Out) void {
-        std.debug.assert(x.tensor);
+        std.debug.assert(x.tensor or x.dense_batch);
         dense_prefill.gemmRows(x.e.*, &x.m.chunk.?.dense, view(dense_prefill.Mat, in), .{ .buf = d.t.buffer, .off = d.t.offset, .n = d.n, .k = d.k }, view(dense_prefill.Mat, out), kind, rows, d.n);
     }
 
@@ -491,7 +496,8 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
     var enc = cb.compute(.serial);
     var open = true; // `enc` is not yet ended
     const xp_batch = decode and segments.len > 1 and n >= batch_xp_from and m.chunk != null and s.path != .per_op;
-    const x = Enc{ .e = &enc, .m = m, .s = s, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .xp_batch = xp_batch, .spans = out.spans, .ablate = out.ablate };
+    const dense_batch = decode and segments.len > 1 and n >= batch_dense_from and m.chunk != null and s.path != .per_op;
+    const x = Enc{ .e = &enc, .m = m, .s = s, .n = n, .decode = decode, .tensor = !decode and m.chunk != null, .xp_batch = xp_batch, .dense_batch = dense_batch, .spans = out.spans, .ablate = out.ablate };
     if (out.spans) |sp| sp.beginCommand(cb) catch |err| {
         enc.end();
         return err;
@@ -563,7 +569,9 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
         const first: usize = if (out.logits == .last) n - 1 else 0;
         const rows = n - first;
         try x.begin(.dense);
-        x.mv(m.weights.unembed, bo(s.finals, first * H * 2), b(s.logits), rows);
+        if (x.dense_batch) {
+            x.gemm(m.weights.unembed, bo(s.finals, first * H * 2), b(s.logits), rows, .bf16);
+        } else x.mv(m.weights.unembed, bo(s.finals, first * H * 2), b(s.logits), rows);
         try x.end();
         try x.begin(.activation);
         x.glue(.softcap, .{ .rows = @intCast(rows), .width = c.vocab, .extent = c.unpadded_vocab, .cap = c.logit_cap }, &.{b(s.logits)}, .{ c.vocab, rows, 1 }, .{ 256, 1, 1 }, false);
@@ -675,7 +683,9 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
             const in_slot = n * 2 * H * 2;
             const z_slot = n * @as(usize, rank) * 2;
             try x.begin(.dense);
-            x.mvs(m.plan.n + i, &.{
+            if (x.dense_batch) {
+                for (0..3) |j| x.gemm(ctrls[j].down, bo(s.ctrl_in, j * in_slot), bo(s.ctrl_z, j * z_slot), n, .bf16);
+            } else x.mvs(m.plan.n + i, &.{
                 .{ .x = b(s.ctrl_in), .w = ctrls[0].down, .y = b(s.ctrl_z) },
                 .{ .x = bo(s.ctrl_in, in_slot), .w = ctrls[1].down, .y = bo(s.ctrl_z, z_slot) },
                 .{ .x = bo(s.ctrl_in, 2 * in_slot), .w = ctrls[2].down, .y = bo(s.ctrl_z, 2 * z_slot) },
@@ -737,7 +747,7 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
         try x.end();
     }
     try x.begin(.dense);
-    if (x.decode) {
+    if (x.decode and !x.dense_batch) {
         x.mvs(i, &.{ .{ .x = xq, .w = w.q, .y = b(s.q) }, .{ .x = xk, .w = w.k, .y = b(s.k) }, .{ .x = xv, .w = w.v, .y = b(s.v) }, .{ .x = xq, .w = w.r, .y = b(s.r) }, .{ .x = xq, .w = w.gate, .y = b(s.gate) }, .{ .x = xq, .w = w.sink, .y = b(s.sink) } }, n);
     } else {
         x.proj(w.q, xq, b(s.q), n);
