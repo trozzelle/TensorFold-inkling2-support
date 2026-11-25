@@ -265,7 +265,7 @@ pub fn partBytes(c: *const cfg.Text, capacity: usize) usize {
 /// and read by the experts). A layer runs them in that order, each finished before the next starts (one serial encoder), and each
 /// starts at the front of the buffer. The per-operation path has no `stage`: its depth mix is `ai` and its table `pb`, and they are
 /// empty on the other paths.
-pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums", "ftaps", "ptaps", "stage", "h_pre", "blocks_pre", "bank_blocks", "bank_partial", "msg", "ctrl_in", "ctrl_z" };
+pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums", "ftaps", "ptaps", "stage", "h_pre", "blocks_pre", "bank_blocks", "bank_partial", "msg", "ctrl_in", "ctrl_z", "fp_grp" };
 
 /// The segment tables of the stacked attention-input matvecs: one `seg_slot` bytes of up to `max_segs` entries a layer.
 pub const max_segs = 6;
@@ -354,6 +354,7 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, ch: C
     if (comptime named(name, "msg")) return if (looped) R * 4 * H * 4 else 0;
     if (comptime named(name, "ctrl_in")) return if (looped) @max(R, max_queries * batch_rows) * 2 * H * 2 else 0;
     if (comptime named(name, "ctrl_z")) return if (c.loop) |lp| @max(R, max_queries * batch_rows) * @as(usize, lp.gate_rank) * 2 else 0;
+    if (comptime named(name, "fp_grp")) return if (is_exl3) 0 else 4096;
     @compileError("a scratch buffer without a size: " ++ name);
 }
 
@@ -442,6 +443,8 @@ pub const Scratch = struct {
     msg: mtl.Buffer,
     ctrl_in: mtl.Buffer,
     ctrl_z: mtl.Buffer,
+    /// Grouped NVFP4/MXFP8 decode routing tables and indirect dispatch arguments (empty for EXL3).
+    fp_grp: mtl.Buffer,
     /// Positions of the longest cache this scratch serves: the split attention's partials hold that many keys' blocks.
     capacity: usize,
     /// Rows of a prompt chunk at most: every per-row buffer holds that many.
@@ -754,6 +757,7 @@ test "inkling2 state: Mini sizes segs for 48 virtual layers, skips EXL3 scratch,
         if (comptime named(f, "msg")) try std.testing.expectEqual(per_op_prefill_rows * 4 * 2304 * 4, sz[i]);
         if (comptime named(f, "ctrl_in")) try std.testing.expectEqual(per_op_prefill_rows * 2 * 2304 * 2, sz[i]);
         if (comptime named(f, "ctrl_z")) try std.testing.expectEqual(per_op_prefill_rows * 64 * 2, sz[i]);
+        if (comptime named(f, "fp_grp")) try std.testing.expectEqual(@as(usize, 4096), sz[i]);
         if (comptime named(f, "ftaps")) try std.testing.expectEqual(batch_rows * 4 * 2304 * 2, sz[i]);
         if (comptime named(f, "ptaps")) try std.testing.expectEqual(per_op_prefill_rows * 4 * 2304 * 2, sz[i]);
     }
@@ -765,10 +769,10 @@ test "inkling2 state: Mini sizes segs for 48 virtual layers, skips EXL3 scratch,
         if (comptime named(f, "ctrl_z")) try std.testing.expectEqual(max_queries * batch_rows * 64 * 2, sz_chunk[i]);
         if (comptime named(f, "stage")) try std.testing.expectEqual(@max(experts_fp_prefill.xpBytes(64, 2304, 128), attention_prefill.tableBytesFor(64, 24)), sz_chunk[i]);
     }
-    // Small still gets 0 bytes for loop buffers
+    // Small still gets 0 bytes for loop and FP-group buffers
     const sm = try sizes(&small, 0, .{ .rows = default_prefill_rows });
     inline for (fields, 0..) |f, i| {
-        if (comptime (named(f, "h_pre") or named(f, "blocks_pre") or named(f, "bank_blocks") or named(f, "bank_partial") or named(f, "msg") or named(f, "ctrl_in") or named(f, "ctrl_z")))
+        if (comptime (named(f, "h_pre") or named(f, "blocks_pre") or named(f, "bank_blocks") or named(f, "bank_partial") or named(f, "msg") or named(f, "ctrl_in") or named(f, "ctrl_z") or named(f, "fp_grp")))
             try std.testing.expectEqual(@as(usize, 0), sm[i]);
     }
     const total = try scratchBytes(&mini, 0, ch);

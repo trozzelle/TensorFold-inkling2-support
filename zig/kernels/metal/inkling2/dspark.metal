@@ -476,6 +476,113 @@ inline float ikd_scatter(thread float* v, uint lane) {
   }
 }
 
+constant uint IKD_MAX_BATCH = 8;
+
+struct ikd_fold_batch_args {
+  uint vocab, valid, flags, count, base_stride;
+  float cap;
+  uint slot_map[IKD_MAX_BATCH];
+};
+
+// Batched fold-and-pick over 1..IKD_MAX_BATCH active streams sharing one DRAM read of fold_w [vocab][256]. All 256
+// threads cooperatively stage 32 rows of fold_w at a time into threadgroup memory across 8 tiles covering the group's
+// 256 vocabulary ids; simdgroup sg processes stream sg (when sg < count), reading base at slot_map[sg] * base_stride
+// and latent at sg * 256, and writing best, best_id, and (with IKD_MASS) mass at sg * groups + group. Bit-identical
+// to count calls of ikd_fold_pick without IKD_LOGITS. Dispatch ceil(vocab / 256) groups of 256 threads.
+[[kernel, max_total_threads_per_threadgroup(256)]] void ikd_fold_pick_batch(constant ikd_fold_batch_args& a [[buffer(0)]],
+    const device bfloat* base [[buffer(1)]], const device bfloat* latent [[buffer(2)]], const device bfloat* fw [[buffer(3)]],
+    const device bfloat* fb [[buffer(4)]], device float* best [[buffer(5)]], device uint* best_id [[buffer(6)]],
+    device float* mass [[buffer(7)]], uint group [[threadgroup_position_in_grid]],
+    uint t [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup bfloat fw_s[32][IKD_RANK];
+  const uint groups = (a.vocab + 255) / 256;
+  const bool active = sg < a.count;
+  const device bfloat* base_s = active ? base + ulong(a.slot_map[sg]) * a.base_stride : base;
+  float4 l0 = 0.0f, l1 = 0.0f;
+  if (active) {
+    const device bfloat* lat = latent + ulong(sg) * IKD_RANK + 8 * lane;
+    l0 = float4(*(const device bfloat4*)lat);
+    l1 = float4(*(const device bfloat4*)(lat + 4));
+  }
+  const uint c4 = t & 63, r0 = t >> 6;
+  float my_val = -INFINITY, my_sum = 0.0f;
+  uint my_id = 0;
+  for (uint tile = 0; tile < 8; ++tile) {
+    const uint v0 = group * 256 + tile * 32;
+    _Pragma("clang loop unroll(full)")
+    for (uint rr = 0; rr < 32; rr += 4) {
+      const uint r = rr + r0;
+      const uint vr = min(v0 + r, a.vocab - 1);
+      *(threadgroup bfloat4*)(&fw_s[r][c4 * 4]) = *(const device bfloat4*)(fw + ulong(vr) * IKD_RANK + c4 * 4);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active) {
+      float pd[32];
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < 32; ++r) {
+        const threadgroup bfloat* w = &fw_s[r][8 * lane];
+        const float4 x0 = float4(*(const threadgroup bfloat4*)w), x1 = float4(*(const threadgroup bfloat4*)(w + 4));
+        float s = x0.x * l0.x;
+        s = fma(x0.y, l0.y, s);
+        s = fma(x0.z, l0.z, s);
+        s = fma(x0.w, l0.w, s);
+        s = fma(x1.x, l1.x, s);
+        s = fma(x1.y, l1.y, s);
+        s = fma(x1.z, l1.z, s);
+        pd[r] = fma(x1.w, l1.w, s);
+      }
+      const float dot = ikd_scatter(pd, lane);
+      const uint v = v0 + lane;
+      float score = -INFINITY;
+      if (v < a.vocab) {
+        const float bias = float(bfloat(float(bfloat(dot)) + float(fb[v])));
+        const float z = float(base_s[v]) + bias;
+        score = v < a.valid ? precise::tanh(z / a.cap) * a.cap : -INFINITY;
+      }
+      const float mine = score;
+      uint at = v;
+      for (ushort d = 16; d > 0; d >>= 1) {
+        const float o = simd_shuffle_xor(score, d);
+        const uint oi = simd_shuffle_xor(at, d);
+        if (o > score || (o == score && oi < at)) { score = o; at = oi; }
+      }
+      float s_mass = 0.0f;
+      if (a.flags & IKD_MASS) s_mass = simd_sum(mine == -INFINITY ? 0.0f : precise::exp(mine - score));
+      if (lane == tile) {
+        my_val = score;
+        my_id = at;
+        my_sum = s_mass;
+      }
+    }
+    if (tile < 7) threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (!active) return;
+  float b = simd_broadcast(my_val, ushort(0));
+  uint bi = simd_broadcast(my_id, ushort(0));
+  _Pragma("clang loop unroll(full)")
+  for (uint k = 1; k < 8; ++k) {
+    const float vk = simd_broadcast(my_val, ushort(k));
+    const uint ik = simd_broadcast(my_id, ushort(k));
+    if (vk > b || (vk == b && ik < bi)) { b = vk; bi = ik; }
+  }
+  const ulong out_i = ulong(sg) * groups + group;
+  if (lane == 0) {
+    best[out_i] = b;
+    best_id[out_i] = bi;
+  }
+  if (a.flags & IKD_MASS) {
+    float m = 0.0f;
+    _Pragma("clang loop unroll(full)")
+    for (uint k = 0; k < 8; ++k) {
+      const float vk = simd_broadcast(my_val, ushort(k));
+      const float sk = simd_broadcast(my_sum, ushort(k));
+      if (vk != -INFINITY) m += sk * precise::exp(vk - b);
+    }
+    if (lane == 0) mass[out_i] = m;
+  }
+}
+
 struct ikd_pick_args { uint groups, step, flags; };
 
 // The step's proposal: the best of every group's best, ties to the lower id, into seq[a.step + 1]. With IKD_MASS also its probability

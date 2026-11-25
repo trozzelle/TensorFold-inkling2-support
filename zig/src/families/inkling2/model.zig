@@ -14,9 +14,10 @@ const dense_prefill = @import("dense_prefill.zig");
 const attention_prefill = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
 const experts_fp_prefill = @import("experts_fp_prefill.zig");
+const ctrl_prefill = @import("ctrl_prefill.zig");
 
-pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_part_w", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap", "ik_nop", "ik_copy_f32", "ik_msg_depth", "ik_msggate_prep", "ik_msggate_apply_norm", "ik_msggate_prep3", "ik_msggate_apply_norm3", "ik_attn_part_g3", "ik_attn_part_w_g3", "ik_nvfp4_w13_swiglu", "ik_nvfp4_w2", "ik_mxfp8_w13_swiglu", "ik_mxfp8_w2" };
-pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_part_w, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap, nop, copy_f32, msg_depth, msggate_prep, msggate_apply_norm, msggate_prep3, msggate_apply_norm3, attn_part_g3, attn_part_w_g3, nvfp4_w13_swiglu, nvfp4_w2, mxfp8_w13_swiglu, mxfp8_w2 };
+pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_part_w", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap", "ik_nop", "ik_copy_f32", "ik_msg_depth", "ik_msggate_prep", "ik_msggate_apply_norm", "ik_msggate_prep3", "ik_msggate_apply_norm3", "ik_msggate_blend_norm", "ik_msggate_fg_decode", "ik_msggate_fg_decode3", "ik_norm3_f32", "ik_loop_attn_prep", "ik_loop_attn_prep3", "ik_loop_mlp_prep", "ik_attn_part_g3", "ik_attn_part_w_g3", "ik_nvfp4_w13_swiglu", "ik_nvfp4_w2", "ik_mxfp8_w13_swiglu", "ik_mxfp8_w2", "ik_fp_group", "ik_nvfp4_w13_swiglu_g", "ik_nvfp4_w2_g", "ik_mxfp8_w13_swiglu_g", "ik_mxfp8_w2_g" };
+pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_part_w, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap, nop, copy_f32, msg_depth, msggate_prep, msggate_apply_norm, msggate_prep3, msggate_apply_norm3, msggate_blend_norm, msggate_fg_decode, msggate_fg_decode3, norm3_f32, loop_attn_prep, loop_attn_prep3, loop_mlp_prep, attn_part_g3, attn_part_w_g3, nvfp4_w13_swiglu, nvfp4_w2, mxfp8_w13_swiglu, mxfp8_w2, fp_group, nvfp4_w13_swiglu_g, nvfp4_w2_g, mxfp8_w13_swiglu_g, mxfp8_w2_g };
 
 comptime {
     // `pipe` indexes the pipelines by the enum's order: each member is its kernel's name without the ik_ prefix
@@ -42,6 +43,7 @@ pub const Chunk = struct {
         exl3: experts_prefill.Pipes,
         fp: experts_fp_prefill.Pipes,
     },
+    ctrl: ?ctrl_prefill.Pipes = null,
 
     /// Compiles default 48/8 EXL3 chunk kernels for `device`, which has tensor units (`error.NeedsTensorUnits` otherwise).
     pub fn init(device: mtl.Device, gpa: std.mem.Allocator) !Chunk {
@@ -59,10 +61,13 @@ pub const Chunk = struct {
         if (quant == .exl3) {
             return .{ .dense = dense, .attention = attention, .experts = .{ .exl3 = try experts_prefill.Pipes.init(device, gpa) } };
         }
-        return .{ .dense = dense, .attention = attention, .experts = .{ .fp = try experts_fp_prefill.Pipes.init(device, gpa) } };
+        var fp = try experts_fp_prefill.Pipes.init(device, gpa);
+        errdefer fp.deinit();
+        return .{ .dense = dense, .attention = attention, .experts = .{ .fp = fp }, .ctrl = try ctrl_prefill.Pipes.init(device, gpa) };
     }
 
     pub fn deinit(c: *Chunk) void {
+        if (c.ctrl) |*p| p.deinit();
         switch (c.experts) {
             inline else => |*e| e.deinit(),
         }

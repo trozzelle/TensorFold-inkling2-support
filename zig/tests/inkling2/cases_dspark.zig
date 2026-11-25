@@ -40,6 +40,8 @@ const AttnArgs = extern struct { heads: u32, kv: u32, end: u32, window: u32, rin
 const EwArgs = extern struct { rows: u32, width: u32 };
 const ProjArgs = extern struct { n: u32, at: u32, hidden: u32 };
 const FoldArgs = extern struct { vocab: u32, valid: u32, flags: u32, cap: f32 };
+const MAX_BATCH = 8;
+const FoldBatchArgs = extern struct { vocab: u32, valid: u32, flags: u32, count: u32, base_stride: u32, cap: f32, slot_map: [MAX_BATCH]u32 };
 const PickArgs = extern struct { groups: u32, step: u32, flags: u32 };
 const TArgs = extern struct { vocab: u32 };
 const LOGITS: u32 = 1; // the fold's flags: also write every id's logit
@@ -107,6 +109,7 @@ pub fn run(g: *const h.Gpu, r: std.Random) !void {
     try caseGru(c, r);
     try caseFold(c, r);
     try caseMass(c, r);
+    try caseFoldBatch(c, r);
     try caseFoldT(c, r);
     try caseQmv(c, r);
     try caseMixMini(g, r);
@@ -1178,6 +1181,127 @@ fn caseMass(c: Ctx, r: std.Random) !void {
     try c.time("ikd_fold_pick with mass, 201024 ids", "ikd_fold_pick", &.{ bytes(&fa), bo(x.base, 0), bs(x.latent), bs(x.fw), bs(x.fb), bs(x.best), bs(x.best_id), bs(x.logits), bs(x.mass) }, .{ x.groups, 1, 1 }, .{ 256, 1, 1 }, 50);
     const pa: PickArgs = .{ .groups = @intCast(x.groups), .step = 0, .flags = MASS };
     try c.time("ikd_pick with mass, 786 groups", "ikd_pick", &.{ bytes(&pa), bs(x.best), bs(x.best_id), bs(x.seq), bs(x.mass), bs(x.prob) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, 200);
+}
+
+/// Batched fold-and-pick over 1, 2, 4 and 8 streams (with and without MASS, non-trivial slot_map and base_stride,
+/// 8-byte offset weights, planted ties and masked ids): bit-identical to individual calls of ikd_fold_pick.
+fn caseFoldBatch(c: Ctx, r: std.Random) !void {
+    const g = c.g;
+    const groups = (V + 255) / 256;
+    const stride_rows: usize = 3;
+    const step: usize = 1;
+    const base = try g.buf(MAX_BATCH * stride_rows * V * 2);
+    const latent = try g.buf(MAX_BATCH * RANK * 2);
+    const fw = try g.buf(V * RANK * 2 + 16);
+    const fb = try g.buf(V * 2 + 16);
+    const best_b = try g.buf(MAX_BATCH * groups * 4);
+    const best_id_b = try g.buf(MAX_BATCH * groups * 4);
+    const mass_b = try g.buf(MAX_BATCH * groups * 4);
+    const best_s = try g.buf(groups * 4);
+    const best_id_s = try g.buf(groups * 4);
+    const mass_s = try g.buf(groups * 4);
+    defer for ([_]mtl.Buffer{ base, latent, fw, fb, best_b, best_id_b, mass_b, best_s, best_id_s, mass_s }) |b| b.deinit();
+    const bv = h.fill16(base, MAX_BATCH * stride_rows * V, r, 12.0);
+    _ = fillGrid(latent, MAX_BATCH * RANK, r, 16, 16);
+    const wv = fillGrid(fw, V * RANK + 8, r, 127, 1024)[4..];
+    const fbv = h.fill16(fb, V + 8, r, 0.5)[4..];
+    // Plant ties (within a tile, across tiles in a group, across groups) and high masked ids in slot 3.
+    const planted_row = bv[(3 * stride_rows + step) * V ..][0..V];
+    for ([_][2]usize{ .{ 1000, 1001 }, .{ 70000, 70255 }, .{ 5, 150000 } }) |tie| {
+        planted_row[tie[0]] = h.bf(25);
+        planted_row[tie[1]] = h.bf(25);
+        @memcpy(wv[tie[1] * RANK ..][0..RANK], wv[tie[0] * RANK ..][0..RANK]);
+        fbv[tie[1]] = fbv[tie[0]];
+    }
+    for ([_]usize{ VALID, VALID + 1, 200500, V - 1 }) |v| planted_row[v] = h.bf(30);
+    const maps = [_]struct { count: u32, map: [MAX_BATCH]u32 }{
+        .{ .count = 1, .map = .{ 3, 0, 0, 0, 0, 0, 0, 0 } },
+        .{ .count = 2, .map = .{ 6, 3, 0, 0, 0, 0, 0, 0 } },
+        .{ .count = 4, .map = .{ 7, 3, 0, 5, 0, 0, 0, 0 } },
+        .{ .count = 8, .map = .{ 3, 7, 0, 5, 1, 6, 2, 4 } },
+    };
+    const poison: u8 = 0xab;
+    var ch: h.Check = .{ .name = "fold pick batch" };
+    for (maps) |cfg_m| {
+        for ([_]bool{ false, true }) |with_mass| {
+            const flags: u32 = if (with_mass) MASS else 0;
+            @memset(best_b.slice(u8, MAX_BATCH * groups * 4), poison);
+            @memset(best_id_b.slice(u8, MAX_BATCH * groups * 4), poison);
+            @memset(mass_b.slice(u8, MAX_BATCH * groups * 4), poison);
+            const fba: FoldBatchArgs = .{
+                .vocab = V,
+                .valid = VALID,
+                .flags = flags,
+                .count = cfg_m.count,
+                .base_stride = @intCast(stride_rows * V),
+                .cap = 30.0,
+                .slot_map = cfg_m.map,
+            };
+            try c.go("ikd_fold_pick_batch", &.{
+                bytes(&fba),
+                bo(base, step * V * 2),
+                bs(latent),
+                bo(fw, 8),
+                bo(fb, 8),
+                bs(best_b),
+                bs(best_id_b),
+                bs(mass_b),
+            }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
+            for (0..cfg_m.count) |s| {
+                const slot: usize = cfg_m.map[s];
+                const fa: FoldArgs = .{ .vocab = V, .valid = VALID, .flags = flags, .cap = 30.0 };
+                try c.go("ikd_fold_pick", &.{
+                    bytes(&fa),
+                    bo(base, (slot * stride_rows + step) * V * 2),
+                    bo(latent, s * RANK * 2),
+                    bo(fw, 8),
+                    bo(fb, 8),
+                    bs(best_s),
+                    bs(best_id_s),
+                    bs(latent),
+                    bs(mass_s),
+                }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
+                const off = s * groups * 4;
+                const len = groups * 4;
+                ch.same(best_b.slice(u8, MAX_BATCH * len)[off..][0..len], best_s.slice(u8, len));
+                ch.same(best_id_b.slice(u8, MAX_BATCH * len)[off..][0..len], best_id_s.slice(u8, len));
+                if (with_mass) ch.same(mass_b.slice(u8, MAX_BATCH * len)[off..][0..len], mass_s.slice(u8, len));
+            }
+            // Inactive stream slots and (when MASS is off) all mass bytes must stay untouched.
+            const tail_off = @as(usize, cfg_m.count) * groups * 4;
+            for ([_]mtl.Buffer{ best_b, best_id_b }) |buf| {
+                var ok = true;
+                for (buf.slice(u8, MAX_BATCH * groups * 4)[tail_off..]) |b| ok = ok and b == poison;
+                ch.n += 1;
+                if (!ok) ch.bad += 1;
+            }
+            const mass_check_from: usize = if (with_mass) tail_off else 0;
+            var mass_ok = true;
+            for (mass_b.slice(u8, MAX_BATCH * groups * 4)[mass_check_from..]) |b| mass_ok = mass_ok and b == poison;
+            ch.n += 1;
+            if (!mass_ok) ch.bad += 1;
+        }
+    }
+    try ch.done();
+    const ta: FoldBatchArgs = .{
+        .vocab = V,
+        .valid = VALID,
+        .flags = MASS,
+        .count = MAX_BATCH,
+        .base_stride = @intCast(stride_rows * V),
+        .cap = 30.0,
+        .slot_map = .{ 0, 1, 2, 3, 4, 5, 6, 7 },
+    };
+    try c.time("ikd_fold_pick_batch x8 with mass, 201024 ids", "ikd_fold_pick_batch", &.{
+        bytes(&ta),
+        bo(base, step * V * 2),
+        bs(latent),
+        bo(fw, 8),
+        bo(fb, 8),
+        bs(best_b),
+        bs(best_id_b),
+        bs(mass_b),
+    }, .{ groups, 1, 1 }, .{ 256, 1, 1 }, 50);
 }
 
 // ---- ikd_fold_t ----
