@@ -1,5 +1,6 @@
-//! Inkling 2 Small with EXL3 experts served by the lane host: one to eight streams, shared verify rounds, interleaved
-//! prefill, plain and copy-drafted rounds, and the DSpark draft head's drafts when the model folder has its weights.
+//! Inkling 2 (EXL3 and native NVFP4/MXFP8 checkpoints) served by the lane host: one to eight streams, shared verify
+//! rounds, interleaved prefill, plain and copy-drafted rounds, and the DSpark draft head's drafts when the model folder
+//! has its weights.
 const std = @import("std");
 const mtl = @import("metal");
 const api = @import("engine_api");
@@ -45,11 +46,11 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         return null;
     }
     if (o.vision != null) {
-        problem.* = "--vision: the Inkling 2 EXL3 engine reads text only; serve without --vision";
+        problem.* = "--vision: the Inkling 2 engine reads text only; serve without --vision";
         return null;
     }
     const served = resolvedLanes(o) catch {
-        problem.* = "--parallel: the Inkling 2 EXL3 engine serves 1 to 8 streams; give --parallel 1 through 8";
+        problem.* = "--parallel: the Inkling 2 engine serves 1 to 8 streams; give --parallel 1 through 8";
         return null;
     };
     if (o.prompt_cache_gib) |g| if (!std.math.isFinite(g) or g < 0) {
@@ -82,7 +83,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     // with drafts, the model also loads the draft head's weights (mtp.safetensors) when the folder has them: they are among the
     // checkpoint's shards, so the budget below counts them
     const model = fl.Model.load(gpa, io, o.dir, .{ .drafts = o.drafts, .draft_bits = bits, .prefill_rows = prefill_rows }) catch |err| {
-        problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 EXL3 engine cannot load this checkpoint ({s}){s}", .{ @errorName(err), if (o.drafts) "; with drafts on it also loads mtp.safetensors, which --no-drafts skips" else "" });
+        problem.* = try std.fmt.allocPrint(a, "the native Inkling 2 engine cannot load this checkpoint ({s}){s}", .{ @errorName(err), if (o.drafts) "; with drafts on it also loads mtp.safetensors, which --no-drafts skips" else "" });
         return null;
     };
     errdefer model.deinit();
@@ -119,7 +120,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = "--load-limit-gb is not a load limit: give a number of GB above 0, or leave it out for 75% of RAM";
         return null;
     };
-    const fits = fl.budget.longest(c, c.layers, room, c.max_context, model.prefill_rows);
+    const fits = fl.budget.longest(c, c.virtualLayers(), room, c.max_context, model.prefill_rows);
     const window: i64 = o.context orelse @intCast(@min(fits, fl.budget.default_window_most));
     if (window < 1 or window > fits) {
         problem.* = try std.fmt.allocPrint(a, "--context {d}: this Mac's Inkling 2 caches fit {d} tokens under its load limit (75% of RAM, or --load-limit-gb, or INKLING_LOAD_LIMIT_GB)", .{ window, fits });
@@ -128,7 +129,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     }
     // the partials of this window come off what the caches may hold
     const budget = room - fl.state.partBytes(c, @as(usize, @intCast(window)) + 1);
-    const fixed_one = fl.state.cacheBytes(c, 1, c.layers, model.prefill_rows);
+    const fixed_one = fl.state.cacheBytes(c, 1, c.virtualLayers(), model.prefill_rows);
     if (!fitsFixedFloor(c, budget, model.prefill_rows, served)) {
         const most_fit: u64 = budget / fixed_one;
         problem.* = try std.fmt.allocPrint(a, "--parallel {d}: {d} Inkling 2 streams need {d:.2} GiB of fixed rings, more than the {d:.2} GiB left for caches ({d} fit)", .{ served, served, gib(@as(u64, served) * fixed_one), gib(budget), most_fit });
@@ -244,7 +245,7 @@ fn resolvedLanes(o: api.Open) !u32 {
 }
 
 fn fitsFixedFloor(c: *const fl.config.Text, budget: u64, prefill_rows: usize, served: u32) bool {
-    const fixed_one = fl.state.cacheBytes(c, 1, c.layers, prefill_rows);
+    const fixed_one = fl.state.cacheBytes(c, 1, c.virtualLayers(), prefill_rows);
     return @as(u64, served) * fixed_one <= budget;
 }
 
@@ -382,7 +383,7 @@ test "inkling2 host: fixed-floor check accepts streams that fit and refuses when
         .logit_cap = 0,
         .max_context = 262144,
     };
-    const fixed_one = fl.state.cacheBytes(&c, 1, c.layers, 4096);
+    const fixed_one = fl.state.cacheBytes(&c, 1, c.virtualLayers(), 4096);
     try std.testing.expect(fitsFixedFloor(&c, 22 * (1 << 30), 4096, 4));
     try std.testing.expect(fitsFixedFloor(&c, 4 * fixed_one, 4096, 4));
     try std.testing.expect(!fitsFixedFloor(&c, 4 * fixed_one - 1, 4096, 4));

@@ -398,3 +398,227 @@ inline float ik_as_sget(thread const float (&s)[8], uint kg) {
   const float4 gt = float4(*(const device bfloat4*)(gate + at));
   *(device bfloat4*)(att + at) = bfloat4(o / (1.0f + exp(-gt)));
 }
+
+// G=3 specialization (24 q heads in 8 kv groups of 3, 128 dims): 24 simdgroups = 8 key groups x 3 q heads (1 q head/sg).
+[[kernel, max_total_threads_per_threadgroup(768)]] void ik_attn_part_g3(constant ik_args& a [[buffer(0)]],
+    const device bfloat* qn [[buffer(1)]], const device bfloat* keys [[buffer(2)]], const device bfloat* values [[buffer(3)]],
+    const device bfloat* reln [[buffer(4)]], const device bfloat* proj [[buffer(5)]], device float* part [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float tmax[8][3], tsum[8][3];
+  threadgroup float4 tacc[8][3][32];
+  const uint D = a.dim, g = tg.x, t = tg.y, p = a.pos + t;
+  const uint lo = (a.window > 0 && p + 1 > a.window) ? p + 1 - a.window : 0;
+  const uint base = (a.queries + tg.z) * IK_AS_KEYS;
+  const uint wrap = base - base % a.ring;
+  const uint from = max(lo, base), to = min(p + 1, base + IK_AS_KEYS);
+  device float* slots = part + ((ulong(t) * a.heads + g * 3) * a.blocks + tg.z) * IK_AS_SLOT;
+  const ulong head_step = ulong(a.blocks) * IK_AS_SLOT;
+  if (from >= to) {
+    for (uint i = tid; i < 3 * IK_AS_SLOT; i += 768)
+      slots[(i / IK_AS_SLOT) * head_step + i % IK_AS_SLOT] = i % IK_AS_SLOT == 0 ? -INFINITY : 0.0f;
+    return;
+  }
+  const uint kg = sg & 7, hh = sg >> 3, head = g * 3 + hh;
+  const uint k0 = base + 32 * kg, key = k0 + lane;
+  const bool reads_bias = key >= from && key < to && p - key < a.extent;
+  const float4 q = float4(*(const device bfloat4*)(qn + (ulong(t) * a.heads + head) * D + 4 * lane));
+  const IkRelFold bias{reln, proj};
+  float s;
+  {
+    bfloat4 kr[32];
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < 32; ++i)
+      kr[i] = *(const device bfloat4*)(keys + (ulong(min(max(k0 + i, from), to - 1) - wrap) * a.kv + g) * D + 4 * lane);
+    const float bz = reads_bias ? bias.one(t, a.heads, head, a.extent, p - key) : 0.0f;
+    float pd[32];
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < 32; ++i) {
+      const float4 k = float4(kr[i]);
+      float x = q.x * k.x;
+      x = fma(q.y, k.y, x);
+      x = fma(q.z, k.z, x);
+      pd[i] = fma(q.w, k.w, x);
+    }
+    float x = ik_as_scatter(pd, lane);
+    if (key >= from && key < to) {
+      x = x * a.scale;
+      if (p - key < a.extent) x += bz;
+    } else {
+      x = -INFINITY;
+    }
+    s = x;
+  }
+  const float mx = simd_max(s);
+  if (lane == 0) tmax[kg][hh] = mx;
+  bfloat4 vr[32];
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 0; i < 32; ++i)
+    vr[i] = *(const device bfloat4*)(values + (ulong(min(max(k0 + i, from), to - 1) - wrap) * a.kv + g) * D + 4 * lane);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float m = tmax[0][hh];
+  for (uint k = 1; k < 8; ++k) m = max(m, tmax[k][hh]);
+  const float w = exp(s - m);
+  const float ls = simd_sum(w);
+  if (lane == 0) tsum[kg][hh] = ls;
+  float4 acc = 0.0f;
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 0; i < 32; ++i)
+    acc = fma(float4(simd_broadcast(w, ushort(i))), float4(vr[i]), acc);
+  tacc[kg][hh][lane] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < 96) {
+    const uint h = tid / 32, c = tid % 32;
+    float4 o = tacc[0][h][c];
+    for (uint k = 1; k < 8; ++k) o += tacc[k][h][c];
+    device float* dst = slots + h * head_step + 2 + 4 * c;
+    *(device float2*)dst = o.xy;
+    *(device float2*)(dst + 2) = o.zw;
+  }
+  if (tid < 3) {
+    float mm = tmax[0][tid], ll = tsum[0][tid];
+    for (uint k = 1; k < 8; ++k) { mm = max(mm, tmax[k][tid]); ll += tsum[k][tid]; }
+    slots[tid * head_step] = mm;
+    slots[tid * head_step + 1] = ll;
+  }
+}
+
+// G=3 shared-KV global window attention: 3 simdgroups (96 threads), one per q head in the kv group, bit-identical to ik_attn_part_g3.
+[[kernel, max_total_threads_per_threadgroup(96)]] void ik_attn_part_w_g3(constant ik_args& a [[buffer(0)]],
+    const device bfloat* qn [[buffer(1)]], const device bfloat* keys [[buffer(2)]], const device bfloat* values [[buffer(3)]],
+    const device bfloat* reln [[buffer(4)]], const device bfloat* proj [[buffer(5)]], device float* part [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup bfloat4 tbuf[32][32];
+  const uint D = a.dim, g = tg.x, hh = sg, head = g * 3 + hh;
+  const uint blk = a.blocks - 1 - tg.z;
+  const uint base = (a.queries + blk) * IK_AS_KEYS;
+  const uint wrap = base - base % a.ring;
+  const uint win_to = min(a.pos + a.rows, base + IK_AS_KEYS);
+  const ulong head_step = ulong(a.blocks) * IK_AS_SLOT;
+  if (base >= win_to) {
+    for (uint t = 0; t < a.rows; ++t) {
+      device float* slots = part + ((ulong(t) * a.heads + g * 3) * a.blocks + blk) * IK_AS_SLOT;
+      for (uint i = tid; i < 3 * IK_AS_SLOT; i += 96)
+        slots[(i / IK_AS_SLOT) * head_step + i % IK_AS_SLOT] = i % IK_AS_SLOT == 0 ? -INFINITY : 0.0f;
+    }
+    return;
+  }
+  const IkRelFold bias{reln, proj};
+  for (uint t0 = 0; t0 < a.rows; t0 += IK_AS_WTILE) {
+    const uint nr = min(IK_AS_WTILE, a.rows - t0);
+    const uint tile_to = min(a.pos + t0 + nr, base + IK_AS_KEYS);
+    if (base >= tile_to) {
+      for (uint r = 0; r < nr; ++r) {
+        const uint t = t0 + r;
+        device float* slots = part + ((ulong(t) * a.heads + g * 3) * a.blocks + blk) * IK_AS_SLOT;
+        for (uint i = tid; i < 3 * IK_AS_SLOT; i += 96)
+          slots[(i / IK_AS_SLOT) * head_step + i % IK_AS_SLOT] = i % IK_AS_SLOT == 0 ? -INFINITY : 0.0f;
+      }
+      continue;
+    }
+    bool row_live[IK_AS_WTILE];
+    float s_tile[IK_AS_WTILE][8];
+    float m_tile[IK_AS_WTILE];
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < IK_AS_WTILE; ++r) {
+      row_live[r] = r < nr && base < min(a.pos + t0 + r + 1, base + IK_AS_KEYS);
+      m_tile[r] = -INFINITY;
+    }
+    for (uint kg = 0; kg < 8; ++kg) {
+      const uint k0 = base + 32 * kg, key = k0 + lane;
+      for (uint idx = tid; idx < 1024; idx += 96) {
+        const uint ki = idx >> 5, ln = idx & 31;
+        tbuf[ki][ln] = *(const device bfloat4*)(keys + (ulong(min(max(k0 + ki, base), tile_to - 1) - wrap) * a.kv + g) * D + 4 * ln);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const bool kg_bias = (a.pos + t0) < k0 + 31 + a.extent;
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < IK_AS_WTILE; ++r) {
+        if (row_live[r]) {
+          const uint t = t0 + r, p = a.pos + t;
+          const uint to = min(p + 1, base + IK_AS_KEYS);
+          const float4 qr = float4(*(const device bfloat4*)(qn + (ulong(t) * a.heads + head) * D + 4 * lane));
+          float pd[32];
+          _Pragma("clang loop unroll(full)")
+          for (uint i = 0; i < 32; ++i) {
+            const float4 k = float4(tbuf[i][lane]);
+            float x = qr.x * k.x;
+            x = fma(qr.y, k.y, x);
+            x = fma(qr.z, k.z, x);
+            pd[i] = fma(qr.w, k.w, x);
+          }
+          float x = ik_as_scatter(pd, lane);
+          if (key >= base && key < to) {
+            x = x * a.scale;
+            if (kg_bias && p - key < a.extent) x += bias.one(t, a.heads, head, a.extent, p - key);
+          } else {
+            x = -INFINITY;
+          }
+          ik_as_sput(s_tile[r], kg, x);
+          const float mx = simd_max(x);
+          m_tile[r] = kg == 0 ? mx : max(m_tile[r], mx);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float l_tile[IK_AS_WTILE];
+    float4 acc_tile[IK_AS_WTILE];
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < IK_AS_WTILE; ++r) { l_tile[r] = 0.0f; acc_tile[r] = 0.0f; }
+    for (uint kg = 0; kg < 8; ++kg) {
+      const uint k0 = base + 32 * kg;
+      for (uint idx = tid; idx < 1024; idx += 96) {
+        const uint ki = idx >> 5, ln = idx & 31;
+        tbuf[ki][ln] = *(const device bfloat4*)(values + (ulong(min(max(k0 + ki, base), tile_to - 1) - wrap) * a.kv + g) * D + 4 * ln);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      float w_row[IK_AS_WTILE];
+      float4 ak[IK_AS_WTILE];
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < IK_AS_WTILE; ++r) {
+        ak[r] = 0.0f;
+        w_row[r] = 0.0f;
+        if (row_live[r]) {
+          const float w = exp(ik_as_sget(s_tile[r], kg) - m_tile[r]);
+          w_row[r] = w;
+          const float ls = simd_sum(w);
+          l_tile[r] = kg == 0 ? ls : (l_tile[r] + ls);
+        }
+      }
+      _Pragma("clang loop unroll(full)")
+      for (uint i = 0; i < 32; ++i) {
+        const float4 v = float4(tbuf[i][lane]);
+        _Pragma("clang loop unroll(full)")
+        for (uint r = 0; r < IK_AS_WTILE; ++r) {
+          if (row_live[r]) ak[r] = fma(float4(simd_broadcast(w_row[r], ushort(i))), v, ak[r]);
+        }
+      }
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < IK_AS_WTILE; ++r) {
+        if (row_live[r]) acc_tile[r] = kg == 0 ? ak[r] : (acc_tile[r] + ak[r]);
+      }
+      if (kg < 7) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    _Pragma("clang loop unroll(full)")
+    for (uint r = 0; r < IK_AS_WTILE; ++r) {
+      if (r < nr) {
+        const uint t = t0 + r, p = a.pos + t;
+        const uint to = min(p + 1, base + IK_AS_KEYS);
+        device float* slot = part + ((ulong(t) * a.heads + head) * a.blocks + blk) * IK_AS_SLOT;
+        if (base >= to) {
+          if (lane == 0) { slot[0] = -INFINITY; slot[1] = 0.0f; }
+          device float* dst = slot + 2 + 4 * lane;
+          *(device float2*)dst = float2(0.0f);
+          *(device float2*)(dst + 2) = float2(0.0f);
+        } else {
+          if (lane == 0) { slot[0] = m_tile[r]; slot[1] = l_tile[r]; }
+          device float* dst = slot + 2 + 4 * lane;
+          *(device float2*)dst = acc_tile[r].xy;
+          *(device float2*)(dst + 2) = acc_tile[r].zw;
+        }
+      }
+    }
+    if (t0 + IK_AS_WTILE < a.rows) threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}

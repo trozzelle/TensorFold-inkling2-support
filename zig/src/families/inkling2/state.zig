@@ -56,8 +56,8 @@ pub const PromptPath = enum {
     per_op,
 };
 
-/// What a scratch is made for: the rows of a prompt chunk at most, and the path they take.
-pub const Chunking = struct { rows: usize, path: PromptPath = .chunk };
+/// What a scratch is made for: the rows of a prompt chunk at most, the path they take, and the expert storage format.
+pub const Chunking = struct { rows: usize, path: PromptPath = .chunk, quant: cfg.Quant = .exl3 };
 
 /// What INKLING_PROMPT_PATH asks of a load, to compare the paths and to test the fallbacks on a GPU and a pack that need none:
 /// `per_op` runs prompt chunks on the per-operation kernels whatever the GPU; `rows` (every layer) or `rows:3,7` (those layers)
@@ -264,7 +264,7 @@ pub fn partBytes(c: *const cfg.Text, capacity: usize) usize {
 /// and read by the experts). A layer runs them in that order, each finished before the next starts (one serial encoder), and each
 /// starts at the front of the buffer. The per-operation path has no `stage`: its depth mix is `ai` and its table `pb`, and they are
 /// empty on the other paths.
-pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums", "ftaps", "ptaps", "stage" };
+pub const fields = [_][]const u8{ "ids", "h", "nr", "blocks", "ai", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dyn", "kc", "vc", "qn", "reln", "pb", "att", "o", "ya", "res", "ns", "mi", "xm", "logits32", "eids", "ew", "texp", "tslot", "ttok", "gu", "act", "ey", "moe", "ym", "exl3", "fin", "finals", "logits", "segs", "part", "planes", "sums", "ftaps", "ptaps", "stage", "h_pre", "blocks_pre", "bank_blocks", "bank_partial", "msg", "ctrl_in", "ctrl_z" };
 
 /// The segment tables of the stacked attention-input matvecs: one `seg_slot` bytes of up to `max_segs` entries a layer.
 pub const max_segs = 6;
@@ -297,11 +297,14 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, ch: C
     const gen_slots = genericRows(ch) * c.topk; // the per-row expert path's
     const tiles = tileRows(gen_slots, c.experts);
     const per_op = ch.path == .per_op;
+    const looped = c.loop != null;
+    const is_exl3 = ch.quant == .exl3;
+    const ai_rows: usize = @max(if (per_op) R else 0, if (looped) @as(usize, batch_rows) else 0);
     if (comptime named(name, "ids")) return R * 4;
     if (comptime named(name, "h")) return R * H * 2;
     if (comptime named(name, "nr")) return R * H * 4;
     if (comptime named(name, "blocks")) return maxBlocks(c) * R * H * 4;
-    if (comptime named(name, "ai")) return if (per_op) R * max_queries * H * 4 else 0;
+    if (comptime named(name, "ai")) return ai_rows * max_queries * H * 4;
     if (comptime named(name, "xq")) return @max(R, max_queries * batch_rows) * H * 2;
     if (comptime (named(name, "xk") or named(name, "xv"))) return R * H * 2;
     if (comptime named(name, "q")) return R * qw * 2;
@@ -320,33 +323,42 @@ fn bytesOf(comptime name: []const u8, c: *const cfg.Text, capacity: usize, ch: C
     if (comptime named(name, "xm")) return R * H * 2;
     if (comptime named(name, "logits32")) return R * c.experts * 4;
     if (comptime (named(name, "eids") or named(name, "ew"))) return picks * 4;
-    if (comptime (named(name, "texp") or named(name, "tslot") or named(name, "ttok"))) return tiles * 4;
-    if (comptime named(name, "gu")) return gen_slots * 2 * I * 2;
+    if (comptime (named(name, "texp") or named(name, "tslot") or named(name, "ttok"))) return if (is_exl3) tiles * 4 else 0;
+    if (comptime named(name, "gu")) return if (is_exl3) gen_slots * 2 * I * 2 else 0;
     if (comptime named(name, "act")) return gen_slots * I * 2;
     if (comptime named(name, "ey")) return gen_slots * H * 2;
     if (comptime (named(name, "moe") or named(name, "ym"))) return R * H * 2;
-    if (comptime named(name, "exl3")) return ex;
+    if (comptime named(name, "exl3")) return if (is_exl3) ex else 0;
     if (comptime named(name, "fin")) return R * H * 4;
     if (comptime named(name, "finals")) return (R + 7) * H * 2;
     if (comptime named(name, "logits")) return batch_rows * @as(usize, c.vocab) * 2;
-    if (comptime named(name, "segs")) return @as(usize, c.layers) * max_mvs_slabs * seg_slot;
+    if (comptime named(name, "segs")) return @as(usize, c.virtualLayers()) * max_mvs_slabs * seg_slot;
     if (comptime named(name, "part")) return partBytes(c, capacity);
-    if (comptime named(name, "planes")) return win_slots * 2 * H * 4; // the decode chain's w13 output per slot as two f32 K halves
-    if (comptime named(name, "sums")) return win_slots * H * 4; // its w2 output per slot before the output rotation, f32
+    if (comptime named(name, "planes")) return if (is_exl3) win_slots * 2 * H * 4 else 0; // the decode chain's w13 output per slot as two f32 K halves
+    if (comptime named(name, "sums")) return if (is_exl3) win_slots * H * 4 else 0; // its w2 output per slot before the output rotation, f32
     if (comptime named(name, "ftaps")) return batch_rows * feature_taps * H * 2; // a shared decode round's rows of the drafter's taps
     if (comptime named(name, "ptaps")) return R * feature_taps * H * 2; // a prompt chunk's
     if (comptime named(name, "stage")) return if (per_op) 0 else @max(experts_prefill.xpBytes(R), @max(attention_prefill.tableBytes(R), R * max_queries * H * 4));
+    if (comptime named(name, "h_pre")) return if (looped) R * H * 2 else 0;
+    if (comptime named(name, "blocks_pre")) return if (c.loop) |lp| (lp.core_start / c.block) * R * H * 4 else 0;
+    if (comptime named(name, "bank_blocks")) return if (c.loop) |lp| ((lp.core_end - lp.core_start) / c.block - 1) * R * H * 4 else 0;
+    if (comptime named(name, "bank_partial")) return if (looped) R * H * 4 else 0;
+    if (comptime named(name, "msg")) return if (looped) R * 4 * H * 4 else 0;
+    if (comptime named(name, "ctrl_in")) return if (looped) R * 2 * H * 2 else 0;
+    if (comptime named(name, "ctrl_z")) return if (c.loop) |lp| R * @as(usize, lp.gate_rank) * 2 else 0;
     @compileError("a scratch buffer without a size: " ++ name);
 }
 
 /// Bytes of each Scratch buffer, in `fields` order, for a load's `ch` and caches of up to `capacity` positions.
 fn sizes(c: *const cfg.Text, capacity: usize, ch: Chunking) ![fields.len]usize {
-    @setEvalBranchQuota(20000);
+    @setEvalBranchQuota(30000);
     if (!validPrefillRows(ch.rows)) return error.InvalidInkling2PrefillRows;
     const H: usize = c.hidden;
     const I: usize = c.expert_inter;
-    const tiles = tileRows(genericRows(ch) * c.topk, c.experts);
-    const ex = @max(try exl3.scratchBytes(H, 2 * I, tiles), try exl3.scratchBytes(I, H, tiles));
+    const ex: usize = if (ch.quant == .exl3) blk: {
+        const tiles = tileRows(genericRows(ch) * c.topk, c.experts);
+        break :blk @max(try exl3.scratchBytes(H, 2 * I, tiles), try exl3.scratchBytes(I, H, tiles));
+    } else 0;
     var out: [fields.len]usize = undefined;
     inline for (fields, 0..) |f, i| out[i] = bytesOf(f, c, capacity, ch, ex);
     return out;
@@ -413,6 +425,15 @@ pub const Scratch = struct {
     /// A prompt layer's relative-bias table, attention-input depth mix and experts' tables and planes on the tensor units, one
     /// stage at a time (see `fields`); empty on the per-operation path.
     stage: mtl.Buffer,
+    /// Looped-core scratch (empty when `c.loop == null`): saved prelude state and finished blocks, cross-pass bank
+    /// blocks and partial state, cross-pass messages, and controller gate inputs/latents.
+    h_pre: mtl.Buffer,
+    blocks_pre: mtl.Buffer,
+    bank_blocks: mtl.Buffer,
+    bank_partial: mtl.Buffer,
+    msg: mtl.Buffer,
+    ctrl_in: mtl.Buffer,
+    ctrl_z: mtl.Buffer,
     /// Positions of the longest cache this scratch serves: the split attention's partials hold that many keys' blocks.
     capacity: usize,
     /// Rows of a prompt chunk at most: every per-row buffer holds that many.
@@ -424,7 +445,7 @@ pub const Scratch = struct {
     expected: [batch_rows + 1]f64,
 
     pub fn init(device: mtl.Device, c: *const cfg.Text, capacity: usize, ch: Chunking) !Scratch {
-        @setEvalBranchQuota(10000);
+        @setEvalBranchQuota(20000);
         const sz = try sizes(c, capacity, ch);
         var s: Scratch = undefined;
         s.capacity = capacity;
@@ -452,6 +473,34 @@ pub const Scratch = struct {
 
 /// Inkling 2 Small's text config, as the size checks need it.
 pub const small = cfg.Text{ .hidden = 4608, .layers = 48, .vocab = 201024, .unpadded_vocab = 200058, .local = .{ .q = 48, .kv = 8, .dim = 128 }, .global = .{ .q = 48, .kv = 8, .dim = 128 }, .window = 1024, .d_rel = 16, .rel_extent = 1024, .log_floor = 8192, .log_alpha = 0.1, .eps = 1e-6, .qk_clip = 22.627, .rel_clip = 8, .block = 6, .experts = 384, .topk = 8, .expert_inter = 2304, .route_scale = 8, .gate_cap = 4, .up_cap = 25, .logit_cap = 30, .max_context = 1048576 };
+
+/// Inkling 2 Mini's text config, as the size checks need it.
+pub const mini = cfg.Text{
+    .hidden = 2304,
+    .layers = 24,
+    .vocab = 201024,
+    .unpadded_vocab = 200058,
+    .local = .{ .q = 24, .kv = 8, .dim = 128 },
+    .global = .{ .q = 24, .kv = 8, .dim = 128 },
+    .window = 1024,
+    .d_rel = 16,
+    .rel_extent = 1024,
+    .log_floor = 8192,
+    .log_alpha = 0.1,
+    .eps = 1e-6,
+    .qk_clip = 22.627417,
+    .rel_clip = 8,
+    .block = 6,
+    .experts = 128,
+    .topk = 8,
+    .expert_inter = 1152,
+    .route_scale = 8,
+    .gate_cap = 4,
+    .up_cap = 25,
+    .logit_cap = 30,
+    .max_context = 1048576,
+    .loop = .{ .core_start = 6, .core_end = 18, .num_passes = 3, .gate_rank = 64 },
+};
 
 test "inkling2 state: tiles pad each expert to 8 rows; a cache's bytes; the split attention's partials" {
     try std.testing.expectEqual(@as(usize, 64), tileRows(8, 384));
@@ -670,4 +719,37 @@ test "inkling2 state: a cache's layers hold whole blocks of 64 positions, the va
     try std.testing.expectEqual(@as(usize, cache.slots[1]) * cache.row, cache.values(1) - cache.keys(1));
     // the last position of the context is inside the keys, and the block it ends in is whole
     try std.testing.expect(cache.values(0) >= cachePositions(cache.capacity) * kvBytes(&small) / 2);
+}
+
+test "inkling2 state: Mini sizes segs for 48 virtual layers, skips EXL3 scratch, and allocates loop buffers" {
+    @setEvalBranchQuota(100000);
+    const ch: Chunking = .{ .rows = per_op_prefill_rows, .path = .per_op, .quant = .nvfp4 };
+    const sz = try sizes(&mini, 0, ch);
+    inline for (fields, 0..) |f, i| {
+        if (comptime named(f, "segs")) try std.testing.expectEqual(@as(usize, 48) * max_mvs_slabs * seg_slot, sz[i]);
+        if (comptime named(f, "blocks")) try std.testing.expectEqual(@as(usize, 4) * per_op_prefill_rows * 2304 * 4, sz[i]);
+        if (comptime (named(f, "texp") or named(f, "tslot") or named(f, "ttok") or named(f, "gu") or named(f, "exl3") or named(f, "planes") or named(f, "sums")))
+            try std.testing.expectEqual(@as(usize, 0), sz[i]);
+        if (comptime named(f, "ai")) try std.testing.expectEqual(per_op_prefill_rows * max_queries * 2304 * 4, sz[i]);
+        if (comptime named(f, "h_pre")) try std.testing.expectEqual(per_op_prefill_rows * 2304 * 2, sz[i]);
+        if (comptime named(f, "blocks_pre")) try std.testing.expectEqual(@as(usize, 1) * per_op_prefill_rows * 2304 * 4, sz[i]);
+        if (comptime named(f, "bank_blocks")) try std.testing.expectEqual(@as(usize, 1) * per_op_prefill_rows * 2304 * 4, sz[i]);
+        if (comptime named(f, "bank_partial")) try std.testing.expectEqual(per_op_prefill_rows * 2304 * 4, sz[i]);
+        if (comptime named(f, "msg")) try std.testing.expectEqual(per_op_prefill_rows * 4 * 2304 * 4, sz[i]);
+        if (comptime named(f, "ctrl_in")) try std.testing.expectEqual(per_op_prefill_rows * 2 * 2304 * 2, sz[i]);
+        if (comptime named(f, "ctrl_z")) try std.testing.expectEqual(per_op_prefill_rows * 64 * 2, sz[i]);
+    }
+    // Looped decode keeps ai sized for batch_rows even on the chunk path
+    const sz_chunk = try sizes(&mini, 0, .{ .rows = 512, .path = .chunk, .quant = .nvfp4 });
+    inline for (fields, 0..) |f, i| {
+        if (comptime named(f, "ai")) try std.testing.expectEqual(batch_rows * max_queries * 2304 * 4, sz_chunk[i]);
+    }
+    // Small still gets 0 bytes for loop buffers
+    const sm = try sizes(&small, 0, .{ .rows = default_prefill_rows });
+    inline for (fields, 0..) |f, i| {
+        if (comptime (named(f, "h_pre") or named(f, "blocks_pre") or named(f, "bank_blocks") or named(f, "bank_partial") or named(f, "msg") or named(f, "ctrl_in") or named(f, "ctrl_z")))
+            try std.testing.expectEqual(@as(usize, 0), sm[i]);
+    }
+    const total = try scratchBytes(&mini, 0, ch);
+    try std.testing.expect(total < 750 << 20);
 }

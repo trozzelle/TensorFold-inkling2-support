@@ -1,4 +1,4 @@
-//! A native Inkling 2 model with EXL3 experts: config, plan, the checkpoint in Metal buffers and every pipeline.
+//! A native Inkling 2 model (EXL3 or native NVFP4/MXFP8 experts): config, plan, checkpoint buffers, and pipelines.
 const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
@@ -14,8 +14,8 @@ const dense_prefill = @import("dense_prefill.zig");
 const attention_prefill = @import("attention_prefill.zig");
 const experts_prefill = @import("experts_prefill.zig");
 
-pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_part_w", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap", "ik_nop" };
-pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_part_w, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap, nop };
+pub const glue_names = [_][:0]const u8{ "ik_embed", "ik_rms", "ik_norm", "ik_depth", "ik_resid", "ik_out", "ik_copy", "ik_softcap", "ik_conv", "ik_conv_dyn", "ik_ring", "ik_prep", "ik_relbias", "ik_attn", "ik_router", "ik_route", "ik_tiles", "ik_swiglu", "ik_combine", "ik_matvec_1", "ik_matvec_2", "ik_matvec_4", "ik_matvec_8", "ik_matvec_16", "ik_matvec_32", "ik_mvs_8", "ik_mvs_16", "ik_rdn", "ik_rdn3", "ik_rrdn", "ik_attn_part", "ik_attn_part_w", "ik_attn_merge", "ik_xd_pair", "ik_xd_mid", "ik_xd_down", "ik_xd_finish", "ik_conv_ring", "ik_conv_dyn_ring", "ik_conv_out", "ik_tap", "ik_nop", "ik_copy_f32", "ik_msg_depth", "ik_msggate_prep", "ik_msggate_apply_norm", "ik_attn_part_g3", "ik_attn_part_w_g3", "ik_nvfp4_w13_swiglu", "ik_nvfp4_w2", "ik_mxfp8_w13_swiglu", "ik_mxfp8_w2" };
+pub const Glue = enum { embed, rms, norm, depth, resid, out, copy, softcap, conv, conv_dyn, ring, prep, relbias, attn, router, route, tiles, swiglu, combine, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32, mvs_8, mvs_16, rdn, rdn3, rrdn, attn_part, attn_part_w, attn_merge, xd_pair, xd_mid, xd_down, xd_finish, conv_ring, conv_dyn_ring, conv_out, tap, nop, copy_f32, msg_depth, msggate_prep, msggate_apply_norm, attn_part_g3, attn_part_w_g3, nvfp4_w13_swiglu, nvfp4_w2, mxfp8_w13_swiglu, mxfp8_w2 };
 
 comptime {
     // `pipe` indexes the pipelines by the enum's order: each member is its kernel's name without the ik_ prefix
@@ -67,7 +67,7 @@ pub const Model = struct {
     checkpoint: ck.Checkpoint,
     weights: wts.Weights,
     glue: [glue_names.len]mtl.Pipeline,
-    exl3: exl3.Pipelines,
+    exl3: ?exl3.Pipelines = null,
     /// The chunk path's kernels; null where prompt chunks run on the per-operation kernels (a GPU without tensor units, shapes the
     /// chunk kernels are not written for, or INKLING_PROMPT_PATH=per_op).
     chunk: ?Chunk,
@@ -104,19 +104,31 @@ pub const Model = struct {
             std.log.err("inkling2: {s}", .{why.text()});
             return err;
         };
-        if (m.config.quant != .exl3) return error.NotAnInkling2Exl3Pack;
+        if (m.config.quant != .exl3 and m.config.quant != .nvfp4) return error.UnsupportedInkling2Quant;
         const t = &m.config.text;
         try geometry(t);
-        var prec: [cfg.max_layers]plan.Precision = @splat(.exl3);
+        var prec: [cfg.max_layers]plan.Precision = @splat(if (m.config.quant == .exl3) .exl3 else .nvfp4);
         m.plan = try plan.build(t, prec[0..t.layers]);
-        m.layers = opts.layers orelse t.layers;
-        if (m.layers > t.layers) return error.InvalidInkling2Layers;
+        const vtotal = t.virtualLayers();
+        m.layers = opts.layers orelse vtotal;
+        if (m.layers > vtotal) return error.InvalidInkling2Layers;
+        var phys_layers: u32 = 0;
+        for (0..m.layers) |vi| phys_layers = @max(phys_layers, m.plan.at(@intCast(vi)).physical + 1);
         m.device = try mtl.Device.init();
         errdefer m.device.deinit();
         m.queue = try m.device.queue();
         errdefer m.queue.deinit();
         // prompt chunks run on the tensor units where the GPU has them and the shapes fit; elsewhere on the per-operation kernels
-        const reason: ?[]const u8 = if (request.per_op) "INKLING_PROMPT_PATH asks for them" else if (!m.device.tensorUnits()) "this GPU has no tensor units" else if (!chunkGeometry(t)) "this config's shapes are not the tensor-unit kernels'" else null;
+        const reason: ?[]const u8 = if (request.per_op)
+            "INKLING_PROMPT_PATH asks for them"
+        else if (!m.device.tensorUnits())
+            "this GPU has no tensor units"
+        else if (m.config.quant != .exl3)
+            "native NVFP4/MXFP8 checkpoints run prompts on the per-operation kernels"
+        else if (!chunkGeometry(t))
+            "this config's shapes are not the tensor-unit kernels'"
+        else
+            null;
         if (reason) |r| {
             m.chunk = null;
             std.log.info("inkling2: prompt chunks run on the per-operation kernels: {s}", .{r});
@@ -125,19 +137,28 @@ pub const Model = struct {
         m.prefill_rows = opts.prefill_rows orelse st.defaultPrefillRows(if (m.chunk == null) .per_op else .chunk);
         m.checkpoint = ck.Checkpoint.init(gpa);
         errdefer m.checkpoint.deinit();
-        var p = if (m.layers == 0) pack.Pack{ .arena = std.heap.ArenaAllocator.init(gpa), .layers = &.{} } else try pack.Pack.read(gpa, io, dir, t.layers, t.experts);
-        defer p.deinit();
-        m.weights = try wts.load(gpa, m.device, &m.checkpoint, t, &m.plan, &p, dir, m.layers);
+        if (m.config.quant == .exl3) {
+            var p = if (phys_layers == 0) pack.Pack{ .arena = std.heap.ArenaAllocator.init(gpa), .layers = &.{} } else try pack.Pack.read(gpa, io, dir, t.layers, t.experts);
+            defer p.deinit();
+            m.weights = try wts.load(gpa, m.device, &m.checkpoint, t, &m.plan, &p, dir, phys_layers);
+        } else {
+            m.weights = try wts.loadNative(gpa, io, m.device, &m.checkpoint, t, prec[0..t.layers], dir, phys_layers);
+            m.plan = try plan.build(t, prec[0..t.layers]);
+        }
         errdefer m.weights.deinit(gpa);
         // a layer the chain cannot take (see `weights.xdOk`), or that INKLING_PROMPT_PATH names, runs its experts through the per-row
         // grouped projections in a chunk, and in a decode window too: `xd_ok` is what both paths read
-        for (m.weights.layers, 0..) |*l, i| if ((request.rows >> @intCast(i)) & 1 != 0) {
-            l.xd_ok = false;
+        for (m.weights.layers, 0..) |*l, i| if ((request.rows >> @intCast(i)) & 1 != 0) switch (l.experts) {
+            .exl3 => |*ex| ex.xd_ok = false,
+            else => {},
         };
         if (m.chunk != null) {
             var per_row: usize = 0;
-            for (m.weights.layers) |l| per_row += @intFromBool(!l.xd_ok);
-            if (per_row > 0) std.log.info("inkling2: prompt chunks take the per-row expert projections on {d} of {d} layers: {s}", .{ per_row, m.layers, if (request.rows != 0) "INKLING_PROMPT_PATH asks for them, for decode windows too" else "their experts are not all K2 or K3, which the tensor-unit chain needs" });
+            for (m.weights.layers) |l| switch (l.experts) {
+                .exl3 => |ex| per_row += @intFromBool(!ex.xd_ok),
+                else => {},
+            };
+            if (per_row > 0) std.log.info("inkling2: prompt chunks take the per-row expert projections on {d} of {d} layers: {s}", .{ per_row, m.weights.layers.len, if (request.rows != 0) "INKLING_PROMPT_PATH asks for them, for decode windows too" else "their experts are not all K2 or K3, which the tensor-unit chain needs" });
         }
         {
             const lib = try mtl.Library.fromSource(m.device, ks.inkling2_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
@@ -150,11 +171,14 @@ pub const Model = struct {
             }
         }
         errdefer for (m.glue) |x| x.deinit();
-        m.exl3 = try exl3.Pipelines.load(m.device);
-        errdefer m.exl3.deinit();
+        m.exl3 = if (m.config.quant == .exl3) try exl3.Pipelines.load(m.device) else null;
+        errdefer if (m.exl3) |*ex| ex.deinit();
         m.draft = null;
         if (opts.drafts) {
-            if (m.config.mtp) |mtp| m.draft = try dspark_weights.load(gpa, io, m.device, &m.checkpoint, dir, mtp, opts.draft_bits) else std.log.info("inkling2: the config has no mtp_config; the draft head stays off", .{});
+            if (m.config.mtp) |mtp| {
+                if (mtp.hidden != 4608 or mtp.layers != 5 or mtp.taps_n != 8) return error.UnsupportedInkling2DraftHead;
+                m.draft = try dspark_weights.load(gpa, io, m.device, &m.checkpoint, dir, mtp, opts.draft_bits);
+            } else std.log.info("inkling2: the config has no mtp_config; the draft head stays off", .{});
         }
         return m;
     }
@@ -167,19 +191,22 @@ pub const Model = struct {
     /// kernels with the per-row expert projections where a layer's experts need them, or the per-operation kernels.
     pub fn promptPath(m: *const Model) st.PromptPath {
         if (m.chunk == null) return .per_op;
-        for (m.weights.layers) |l| if (!l.xd_ok) return .chunk_rows;
+        for (m.weights.layers) |l| switch (l.experts) {
+            .exl3 => |ex| if (!ex.xd_ok) return .chunk_rows,
+            else => return .per_op,
+        };
         return .chunk;
     }
 
     /// What a scratch for this load's prompt chunks is made for.
     pub fn chunking(m: *const Model) st.Chunking {
-        return .{ .rows = m.prefill_rows, .path = m.promptPath() };
+        return .{ .rows = m.prefill_rows, .path = m.promptPath(), .quant = m.config.quant };
     }
 
     pub fn deinit(m: *Model) void {
         if (m.draft) |*w| w.deinit(m.gpa);
         if (m.chunk) |*chunk| chunk.deinit();
-        m.exl3.deinit();
+        if (m.exl3) |*ex| ex.deinit();
         for (m.glue) |x| x.deinit();
         m.weights.deinit(m.gpa);
         m.checkpoint.deinit();
@@ -189,10 +216,12 @@ pub const Model = struct {
     }
 };
 
-/// The shapes the kernels are written for: both layer kinds 48 x 128 queries over 8 x 128 keys (six query heads to a key
-/// head), d_rel 16, top-8, one relative extent for both kinds.
+/// The shapes the kernels are written for: both layer kinds with GQA=6 (48/8) or GQA=3 (24/8) heads of 128 dims,
+/// d_rel 16, top-8, one relative extent for both kinds.
 fn geometry(t: *const cfg.Text) !void {
-    const ok = t.local.q == t.global.q and t.local.kv == t.global.kv and t.local.q == 6 * t.local.kv and
+    const gqa = t.local.q / t.local.kv;
+    const ok = t.local.q == t.global.q and t.local.kv == t.global.kv and
+        (gqa == 6 or gqa == 3) and t.local.q == gqa * t.local.kv and
         t.local.dim == 128 and t.global.dim == 128 and t.d_rel == 16 and t.topk == 8 and t.experts <= 384 and
         t.window == t.rel_extent and t.hidden % 128 == 0 and t.expert_inter % 128 == 0 and st.maxBlocks(t) <= 9;
     if (!ok) return error.UnsupportedInkling2Geometry;

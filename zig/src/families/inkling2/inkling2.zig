@@ -27,6 +27,7 @@ test {
     _ = @import("dspark_test.zig");
     _ = plan;
     _ = expert_pack;
+    _ = weights;
     _ = dspark;
     _ = state;
     _ = snapshot;

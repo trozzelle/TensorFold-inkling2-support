@@ -256,7 +256,7 @@ fn runLeg(gpa: std.mem.Allocator, m: *ik.Model, s: *ik.state.Scratch, tp: ik.for
     const H: usize = c.hidden;
     const T = ids.len;
     const L: usize = m.layers;
-    const full = m.layers == c.layers;
+    const full = m.layers == c.virtualLayers();
     const row = rowBytes(c);
     const tap_row: usize = ik.state.feature_taps * H;
     var snap: ?ik.snapshot.Snap = null;

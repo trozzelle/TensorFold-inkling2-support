@@ -251,3 +251,59 @@ test "the real checkpoint's 24 shard headers and mtp.safetensors match the map (
     try t.expectEqual(@as(usize, 84), mtp.expected);
     try t.expect(mtp.clean());
 }
+
+test "the virtual-layer plan for Mini unfolds 24 physical layers into 48 virtual layers with prelude save and pass resets" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: config.Why = .{};
+    const c = try config.parse(a, config_test.mini, &why);
+    var prec: [24]plan.Precision = undefined;
+    for (&prec, 0..) |*p, i| p.* = if (i < 20) .nvfp4 else .mxfp8;
+    const pl = try plan.build(&c.text, &prec);
+    try t.expectEqual(@as(u32, 48), pl.n);
+    try t.expectEqual(@as(u32, 8), pl.count(.global));
+    try t.expectEqual(@as(u32, 40), pl.count(.local));
+    try t.expectEqual(@as(u32, 4), pl.max_blocks);
+    try t.expectEqual(@as(u32, 1), pl.pre_blocks);
+    try t.expectEqual(@as(u32, 1), pl.bank_blocks);
+    try t.expectEqual(@as(u32, 12), pl.core_len);
+    try t.expectEqual(@as(u32, 5), pl.final_sources);
+    // Prelude 0..5 -> phys 0..5, pass 0
+    for (0..6) |v| {
+        const l = pl.at(@intCast(v));
+        try t.expectEqual(@as(u32, @intCast(v)), l.physical);
+        try t.expectEqual(@as(u8, 0), l.pass);
+        try t.expect(!l.save_prelude and !l.reset_from_prelude);
+    }
+    // Pass 0: v=6..17 -> phys 6..17, save_prelude on v=6 only
+    try t.expect(pl.at(6).save_prelude and !pl.at(6).reset_from_prelude and pl.at(6).pass == 0);
+    try t.expectEqual(@as(u32, 1), pl.at(6).blocks_in);
+    // Pass 1: v=18..29 -> phys 6..17, reset_from_prelude on v=18, pass 1, core_idx 0..11
+    try t.expect(pl.at(18).reset_from_prelude and pl.at(18).pass == 1 and pl.at(18).physical == 6 and pl.at(18).core_idx == 0);
+    try t.expectEqual(@as(u32, 1), pl.at(18).blocks_in);
+    try t.expectEqual(@as(u32, 17), pl.at(29).physical);
+    try t.expectEqual(@as(u16, 11), pl.at(29).core_idx);
+    // Pass 2: v=30..41 -> phys 6..17, reset_from_prelude on v=30, pass 2
+    try t.expect(pl.at(30).reset_from_prelude and pl.at(30).pass == 2 and pl.at(30).physical == 6);
+    // Postlude: v=42..47 -> phys 18..23, pass 0
+    try t.expectEqual(@as(u32, 18), pl.at(42).physical);
+    try t.expectEqual(@as(u8, 0), pl.at(42).pass);
+    try t.expectEqual(@as(u32, 3), pl.at(42).blocks_in);
+    try t.expectEqual(plan.Precision.mxfp8, pl.at(44).precision); // phys 20
+}
+
+test "Mini's real safetensors headers match the weight map (TF_INKLING2_MINI=<dir>)" {
+    const dir = std.mem.span(std.c.getenv("TF_INKLING2_MINI") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: config.Why = .{};
+    const c = try config.parse(a, config_test.mini, &why);
+    const model = try names.check(a, &c, try headerOf(a, dir, "model-00001-of-00001.safetensors"), .model);
+    try t.expectEqual(@as(usize, 1244), model.expected);
+    try t.expect(model.clean());
+    const mtp = try names.check(a, &c, try headerOf(a, dir, "mtp.safetensors"), .mtp);
+    try t.expectEqual(@as(usize, 54), mtp.expected);
+    try t.expect(mtp.clean());
+}

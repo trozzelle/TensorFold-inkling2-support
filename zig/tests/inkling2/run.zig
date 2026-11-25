@@ -1,4 +1,4 @@
-//! Inkling 2 (EXL3 experts) on real weights: load check, layer dumps, teacher-forced finals, exactness, greedy, decode and prompt-path profiles (usage).
+//! Inkling 2 (EXL3 or native NVFP4/MXFP8 experts) on real weights: load check, layer dumps, teacher-forced finals, exactness, greedy, decode and prompt-path profiles (usage).
 const std = @import("std");
 const mtl = @import("metal");
 const tf = @import("tensorfold");
@@ -101,7 +101,14 @@ fn check(init: std.process.Init, args: []const [:0]const u8) !void {
     var bytes: usize = 0;
     for (m.checkpoint.shards.items) |sh| bytes += sh.bytes;
     const w = m.weights.widths;
-    std.debug.print("{{\"layers\": {d}, \"expert_files\": {d}, \"k2\": {d}, \"k3\": {d}, \"k4\": {d}, \"gib\": {d:.2}, \"seconds\": {d:.1}}}\n", .{ m.layers, m.weights.expert_buffers.len, w[2], w[3], w[4], @as(f64, @floatFromInt(bytes)) / (1 << 30), @as(f64, @floatFromInt(now() - t0)) / 1e9 });
+    var nvfp4_layers: usize = 0;
+    var mxfp8_layers: usize = 0;
+    for (m.weights.layers) |l| switch (l.experts) {
+        .nvfp4 => nvfp4_layers += 1,
+        .mxfp8 => mxfp8_layers += 1,
+        .exl3 => {},
+    };
+    std.debug.print("{{\"quant\": \"{s}\", \"layers\": {d}, \"physical_layers\": {d}, \"virtual_layers\": {d}, \"expert_files\": {d}, \"nvfp4\": {d}, \"mxfp8\": {d}, \"k2\": {d}, \"k3\": {d}, \"k4\": {d}, \"gib\": {d:.2}, \"seconds\": {d:.1}}}\n", .{ @tagName(m.config.quant), m.layers, m.weights.layers.len, m.plan.n, m.weights.expert_buffers.len, nvfp4_layers, mxfp8_layers, w[2], w[3], w[4], @as(f64, @floatFromInt(bytes)) / (1 << 30), @as(f64, @floatFromInt(now() - t0)) / 1e9 });
 }
 
 fn readIds(init: std.process.Init, path: []const u8) !std.json.Parsed([]u32) {
@@ -228,7 +235,7 @@ fn finalsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     const c = &m.config.text;
     const capacity = longest + 1;
-    var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers, m.prefill_rows);
+    var cache = try ik.state.Cache.init(m.device, c, capacity, c.virtualLayers(), m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
@@ -262,7 +269,7 @@ fn exactMode(init: std.process.Init, args: []const [:0]const u8) !void {
     if (all.len > m.prefill_rows) return error.IdsExceedThePrefillRows;
     const c = &m.config.text;
     const H: usize = c.hidden;
-    const full = m.layers == c.layers;
+    const full = m.layers == c.virtualLayers();
     const cont = all.len - at;
     const capacity = all.len + 1;
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
@@ -444,7 +451,7 @@ fn greedyMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     const c = &m.config.text;
     const capacity = ids.value.len + steps + 1;
-    var cache = try ik.state.Cache.init(m.device, c, capacity, c.layers, m.prefill_rows);
+    var cache = try ik.state.Cache.init(m.device, c, capacity, c.virtualLayers(), m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, capacity, m.chunking());
     defer s.deinit();
@@ -485,7 +492,7 @@ fn tapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     const c = &m.config.text;
     const H: usize = c.hidden;
-    const L: usize = c.layers;
+    const L: usize = c.virtualLayers();
     const R: usize = m.prefill_rows;
     // the longest cache a prompt and its steps fill
     var longest: usize = 0;
@@ -592,7 +599,7 @@ fn ftapsMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const row: usize = ik.state.feature_taps * @as(usize, c.hidden);
     var s = try ik.state.Scratch.init(m.device, c, T + 1, m.chunking());
     defer s.deinit();
-    var cache = try ik.state.Cache.init(m.device, c, T + 1, c.layers, m.prefill_rows);
+    var cache = try ik.state.Cache.init(m.device, c, T + 1, c.virtualLayers(), m.prefill_rows);
     defer cache.deinit();
     const taps = try init.gpa.alloc(u16, T * row);
     defer init.gpa.free(taps);
@@ -629,7 +636,7 @@ fn profileMode(init: std.process.Init, args: []const [:0]const u8) !void {
     defer m.deinit();
     if (rows > m.prefill_rows) return error.RowsExceedThePrefillRows;
     const c = &m.config.text;
-    const full = m.layers == c.layers;
+    const full = m.layers == c.virtualLayers();
     const capacity = pos + rows * steps + 1;
     var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
     defer cache.deinit();
@@ -722,7 +729,7 @@ fn wallMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const m = try ik.Model.load(init.gpa, init.io, args[1], try options(L));
     defer m.deinit();
     const c = &m.config.text;
-    const full = m.layers == c.layers;
+    const full = m.layers == c.virtualLayers();
     const capacity = pos + rows * steps + 1;
     var cache = try ik.state.Cache.init(m.device, c, capacity, m.layers, m.prefill_rows);
     defer cache.deinit();
@@ -851,7 +858,7 @@ fn prefillMode(init: std.process.Init, args: []const [:0]const u8) !void {
     const m = try ik.Model.load(gpa, init.io, args[1], load);
     defer m.deinit();
     const c = &m.config.text;
-    const full = m.layers == c.layers;
+    const full = m.layers == c.virtualLayers();
     var cache = try ik.state.Cache.init(m.device, c, T + 1, m.layers, m.prefill_rows);
     defer cache.deinit();
     var s = try ik.state.Scratch.init(m.device, c, @max(T + 1, ik.state.window_rows), m.chunking());

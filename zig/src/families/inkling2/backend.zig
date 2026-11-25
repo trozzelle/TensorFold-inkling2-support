@@ -129,7 +129,7 @@ pub const Metal = struct {
     /// A 16-token prompt on a throwaway cache: the first request skips the GPU's first touch of every weight.
     pub fn warm(self: *Metal) !void {
         const c = &self.model.config.text;
-        var cache = try st.Cache.init(self.model.device, c, 32, c.layers, self.scratch.prefill_rows);
+        var cache = try st.Cache.init(self.model.device, c, 32, c.virtualLayers(), self.scratch.prefill_rows);
         defer cache.deinit();
         var ids: [st.window_rows]u32 = undefined;
         for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37);
@@ -139,7 +139,7 @@ pub const Metal = struct {
     /// Times widths 1..`measured_widths` (and `shared_widths` when `options.streams > 1`) on throwaway caches.
     pub fn measure(self: *Metal) !void {
         const c = &self.model.config.text;
-        var cache = try st.Cache.init(self.model.device, c, 32, c.layers, self.scratch.prefill_rows);
+        var cache = try st.Cache.init(self.model.device, c, 32, c.virtualLayers(), self.scratch.prefill_rows);
         defer cache.deinit();
         var ids: [st.batch_rows]u32 = undefined;
         for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37);
@@ -161,7 +161,7 @@ pub const Metal = struct {
             var made: usize = 0;
             defer for (caches[0..made]) |*cc| cc.deinit();
             for (0..max_segs) |i| {
-                caches[i] = try st.Cache.init(self.model.device, c, 32, c.layers, self.scratch.prefill_rows);
+                caches[i] = try st.Cache.init(self.model.device, c, 32, c.virtualLayers(), self.scratch.prefill_rows);
                 made += 1;
             }
             for (shared_widths, 0..) |rows, wi| {
@@ -244,7 +244,7 @@ pub const Metal = struct {
         if (ids.len == 0 or ids.len + stream.max_new > self.options.capacity or self.caches.contains(stream)) return error.InvalidInkling2Prompt;
         const c = &self.model.config.text;
         const capacity = ids.len + stream.max_new + 1;
-        const need = st.cacheBytes(c, capacity, c.layers, self.scratch.prefill_rows);
+        const need = st.cacheBytes(c, capacity, c.virtualLayers(), self.scratch.prefill_rows);
         try admitBudget(self.held, need, self.options.budget, self.caches.count());
         self.held += need;
         errdefer self.held -= need;
@@ -256,7 +256,7 @@ pub const Metal = struct {
         if (self.room) |r| r.fit(r.ctx, self.options.budget - self.held, stream.reuse.saved, ids);
         const cache = try self.gpa.create(st.Cache);
         errdefer self.gpa.destroy(cache);
-        cache.* = try st.Cache.init(self.model.device, c, capacity, c.layers, self.scratch.prefill_rows);
+        cache.* = try st.Cache.init(self.model.device, c, capacity, c.virtualLayers(), self.scratch.prefill_rows);
         errdefer cache.deinit();
         cache.setResident(self.follow);
         try self.caches.put(self.gpa, stream, cache);
@@ -325,21 +325,21 @@ pub const Metal = struct {
     /// Validates the drafter's tap layers (`fwd.tap_layers` + finals) and enables row tapping on forwards.
     fn prepareFn(ptr: *anyopaque, taps: []const u32) !void {
         const self = cast(ptr);
-        if (!tapsAre(taps, self.model.config.text.layers)) return error.UnsupportedInkling2Taps;
+        if (!tapsAre(taps, self.model.config.text.virtualLayers())) return error.UnsupportedInkling2Taps;
         self.tapped = true;
     }
 
     /// Rows [start, start + count) of the stream's latest tapped rows, on the device.
     fn featuresFn(ptr: *anyopaque, stream: *lanes.Stream, taps: []const u32, start: u64, count: u32) !be.Features {
         const self = cast(ptr);
-        if (!self.tapped or !tapsAre(taps, self.model.config.text.layers)) return error.UnpreparedInkling2Taps;
+        if (!self.tapped or !tapsAre(taps, self.model.config.text.virtualLayers())) return error.UnpreparedInkling2Taps;
         return featuresOf(try self.cacheOf(stream), self.tapBytes(), start, count, self.tap_gen);
     }
 
     /// The prompt pass handing `sink` each chunk's tapped rows as it makes them.
     fn prefillFeaturesFn(ptr: *anyopaque, stream: *lanes.Stream, taps: []const u32, sink: be.FeatureSink) !void {
         const self = cast(ptr);
-        if (!self.tapped or !tapsAre(taps, self.model.config.text.layers)) return error.UnpreparedInkling2Taps;
+        if (!self.tapped or !tapsAre(taps, self.model.config.text.virtualLayers())) return error.UnpreparedInkling2Taps;
         self.sink = sink;
         defer self.sink = null;
         return prefillFn(ptr, stream);
@@ -461,7 +461,7 @@ pub const Metal = struct {
         const self = cast(ptr);
         if (self.caches.fetchRemove(stream)) |entry| {
             const c = &self.model.config.text;
-            self.held -= st.cacheBytes(c, entry.value.capacity, c.layers, self.scratch.prefill_rows);
+            self.held -= st.cacheBytes(c, entry.value.capacity, c.virtualLayers(), self.scratch.prefill_rows);
             entry.value.deinit();
             self.gpa.destroy(entry.value);
             if (self.room) |r| r.fit(r.ctx, self.options.budget - self.held, null, &.{});
@@ -475,7 +475,7 @@ pub const Metal = struct {
     /// The prompt cache's Snapshots functions: a stream's caches at a mark, copied on the GPU.
     pub fn snapBytes(ptr: *anyopaque, at: u32) u64 {
         const c = &cast(ptr).model.config.text;
-        return snapshot.bytes(c, c.layers, at);
+        return snapshot.bytes(c, c.virtualLayers(), at);
     }
 
     pub fn snapSave(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {

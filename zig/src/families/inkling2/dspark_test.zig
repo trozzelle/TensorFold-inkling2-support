@@ -181,7 +181,7 @@ const Fixture = struct {
                 .expert_buffers = &.{},
             },
             .glue = f.pipes,
-            .exl3 = undefined,
+            .exl3 = null,
             .chunk = null, // no chunk kernels: prompt chunks take the per-operation path
             .draft = w,
             .warm_wait = true,
@@ -800,7 +800,7 @@ test "inkling2 prompt path: the chunk kernels where the load has them, the per-r
     try fwd.run(f.model, &chunk, &cache, &ids, prompt);
     try t.expectError(error.Inkling2ScratchForAnotherPromptPath, fwd.run(f.model, &per_op, &cache, &ids, prompt));
     var layer: wts.Layer = undefined;
-    layer.xd_ok = false;
+    layer.experts = .{ .exl3 = .{ .w13 = undefined, .w2 = undefined, .xd_ok = false } };
     f.model.weights.layers = (&layer)[0..1];
     defer f.model.weights.layers = &.{};
     try t.expectEqual(state.PromptPath.chunk_rows, f.model.promptPath());
@@ -808,7 +808,7 @@ test "inkling2 prompt path: the chunk kernels where the load has them, the per-r
     var rows = try state.Scratch.init(f.device, c, 256, .{ .rows = 64, .path = .chunk_rows });
     defer rows.deinit();
     try fwd.run(f.model, &rows, &cache, &ids, prompt);
-    layer.xd_ok = true;
+    layer.experts.exl3.xd_ok = true;
     try t.expectEqual(state.PromptPath.chunk, f.model.promptPath());
     try t.expectError(error.Inkling2ScratchForAnotherPromptPath, fwd.run(f.model, &rows, &cache, &ids, prompt));
 }

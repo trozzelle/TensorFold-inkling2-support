@@ -110,9 +110,9 @@ fn checked(f: mtl.CommandBuffer) !void {
     }
 }
 
-/// Most spans one layer opens (a global layer with dynamic convolutions is the most), so a recorder's capacity is
+/// Most spans one layer opens (a looped global layer with controllers and dynamic convolutions is the most), so a recorder's capacity is
 /// `spans_per_layer * layers * repeat` plus the final's.
-pub const spans_per_layer = 32;
+pub const spans_per_layer = 48;
 /// Rows recorded for the drafter and kernel studies: the inputs of the drafter's tapped layers, every layer's expert
 /// picks, and the MoE inputs of `xm_layers` (layouts: h [7][n][H] bf16, eids [layers][n][8] u32, xm [2][n][H] bf16).
 pub const Taps = struct { h: mtl.Buffer, eids: mtl.Buffer, xm: ?mtl.Buffer = null };
@@ -137,6 +137,8 @@ const Seg = struct { x: B, w: wts.Dense, y: B };
 const part_group = [3]usize{ 32, 24, 1 };
 /// ik_attn_part_w's threadgroup: 6 simdgroups, one per q head in a key head's group, sharing each 32-key slice in threadgroup memory.
 const part_w_group = [3]usize{ 32, 6, 1 };
+/// ik_attn_part_w_g3's threadgroup: 3 simdgroups, one per q head in a key head's group.
+const part_w_g3_group = [3]usize{ 32, 3, 1 };
 
 /// A stream's rows in a forward: the next `rows` of ids at positions cache.len.., its keys and values into its cache.
 pub const Segment = struct { cache: *st.Cache, rows: usize };
@@ -368,7 +370,7 @@ const Enc = struct {
 
     /// The routed experts' grouped tiles through one EXL3 projection (in_ids: tokens for w13, slots for w2).
     fn experts(x: Enc, w: exl3.Experts, in: B, k: usize, in_rows: usize, out: B, slots: usize, rows: usize, in_ids: mtl.Buffer) !void {
-        try exl3.encodeIndexed(&x.m.exl3, x.e.*, w, .{ .buffer = in.buf, .offset = in.off }, .{ .buffer = out.buf, .offset = out.off }, .{ .buffer = x.s.exl3 }, .{
+        try exl3.encodeIndexed(&x.m.exl3.?, x.e.*, w, .{ .buffer = in.buf, .offset = in.off }, .{ .buffer = out.buf, .offset = out.off }, .{ .buffer = x.s.exl3 }, .{
             .count = rows,
             .x_stride = k,
             .y_stride = w.n,
@@ -390,13 +392,14 @@ const Enc = struct {
         std.debug.assert(rows <= st.batch_rows);
         const slots = rows * c.topk;
         const a = Args{ .rows = @intCast(slots), .cap = c.gate_cap, .thr = c.up_cap };
-        const w13 = bo(l.w13.descriptors.buffer, l.w13.descriptors.offset);
-        const w2 = bo(l.w2.descriptors.buffer, l.w2.descriptors.offset);
+        const ex = l.experts.exl3;
+        const w13 = bo(ex.w13.descriptors.buffer, ex.w13.descriptors.offset);
+        const w2 = bo(ex.w2.descriptors.buffer, ex.w2.descriptors.offset);
         // two 16-column output tiles a pair or down threadgroup, one simdgroup per 128 columns in mid and finish
-        x.glue(.xd_pair, a, &.{ b(s.xm), b(s.eids), w13, b(s.planes) }, .{ l.w13.n / 32, slots, 2 }, .{ 128, 1, 1 }, true);
-        x.glue(.xd_mid, a, &.{ b(s.planes), b(s.eids), w13, b(s.act) }, .{ l.w13.n / 128, slots, 1 }, .{ 32, 1, 1 }, true);
-        x.glue(.xd_down, a, &.{ b(s.act), b(s.eids), w2, b(s.sums) }, .{ l.w2.n / 32, slots, 1 }, .{ 128, 1, 1 }, true);
-        x.glue(.xd_finish, a, &.{ b(s.sums), b(s.eids), w2, b(s.ew), b(s.moe) }, .{ l.w2.n / 128, rows, 1 }, .{ 256, 1, 1 }, true);
+        x.glue(.xd_pair, a, &.{ b(s.xm), b(s.eids), w13, b(s.planes) }, .{ ex.w13.n / 32, slots, 2 }, .{ 128, 1, 1 }, true);
+        x.glue(.xd_mid, a, &.{ b(s.planes), b(s.eids), w13, b(s.act) }, .{ ex.w13.n / 128, slots, 1 }, .{ 32, 1, 1 }, true);
+        x.glue(.xd_down, a, &.{ b(s.act), b(s.eids), w2, b(s.sums) }, .{ ex.w2.n / 32, slots, 1 }, .{ 128, 1, 1 }, true);
+        x.glue(.xd_finish, a, &.{ b(s.sums), b(s.eids), w2, b(s.ew), b(s.moe) }, .{ ex.w2.n / 128, rows, 1 }, .{ 256, 1, 1 }, true);
     }
 
     /// The layer's routed experts for the chunk's (or shared decode batch's) rows through the tensor-unit chain
@@ -405,8 +408,9 @@ const Enc = struct {
         const c = &x.m.config.text;
         const s = x.s;
         const e = experts_prefill;
-        std.debug.assert((x.tensor or x.xp_batch) and l.xd_ok);
-        e.encode(x.e.*, &x.m.chunk.?.experts, .{ .w13 = l.w13, .w2 = l.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
+        const ex = l.experts.exl3;
+        std.debug.assert((x.tensor or x.xp_batch) and ex.xd_ok);
+        e.encode(x.e.*, &x.m.chunk.?.experts, .{ .w13 = ex.w13, .w2 = ex.w2 }, view(e.B, b(s.xm)), .{ .ids = view(e.B, b(s.eids)), .weights = view(e.B, b(s.ew)) }, view(e.B, b(s.moe)), s.xp(), x.n, .{ .gate = c.gate_cap, .up = c.up_cap });
     }
 };
 
@@ -436,7 +440,7 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
         total_rows += seg.rows;
     }
     if (total_rows != n) return error.Inkling2RowsExceeded;
-    if ((out.finals or out.feature_taps != null or out.logits != .none) and m.layers != c.layers) return error.Inkling2PartialModel;
+    if ((out.finals or out.feature_taps != null or out.logits != .none) and m.layers != m.plan.n) return error.Inkling2PartialModel;
     // a chunk takes the path the model does, and the scratch's buffers are made for it
     if (!decode and s.path != m.promptPath()) return error.Inkling2ScratchForAnotherPromptPath;
     for (ids) |id| if (id >= c.vocab) return error.InvalidInkling2Token;
@@ -465,12 +469,35 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
     const total = @as(usize, m.layers) * out.repeat;
     const split: usize = if (decode and out.spans == null and m.first_chunk < total) m.first_chunk else 0;
     const every: usize = if (decode) 0 else commitEvery(n, total);
+    const slab: usize = s.prefill_rows * H * 4;
     for (0..total) |li| {
         const i = li % m.layers;
         if (out.taps != null or out.feature_taps != null) for (tap_layers, 0..) |l, k| if (l == i) {
             if (out.taps) |tp| x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), bo(tp.h, k * n * H * 2) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
             if (out.feature_taps) |ft| try x.tap(ft, b(s.h), k);
         };
+        const pl = m.plan.at(@intCast(i));
+        if (pl.save_prelude) {
+            try x.begin(.norm);
+            x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h), b(s.h_pre) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            for (0..m.plan.pre_blocks) |bk| {
+                x.glue(.copy_f32, .{ .rows = nr, .width = c.hidden }, &.{ bo(s.blocks, bk * slab), bo(s.blocks_pre, bk * slab) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            }
+            try x.end();
+        }
+        if (pl.reset_from_prelude) {
+            try x.begin(.norm);
+            const src0 = m.plan.pre_blocks + 1;
+            for (0..m.plan.bank_blocks) |bk| {
+                x.glue(.copy_f32, .{ .rows = nr, .width = c.hidden }, &.{ bo(s.blocks, (src0 + bk) * slab), bo(s.bank_blocks, bk * slab) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            }
+            x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), b(s.bank_partial) }, .{ n, 1, 1 }, .{ 1024, 1, 1 }, true);
+            x.glue(.copy, .{ .rows = nr, .width = c.hidden }, &.{ b(s.h_pre), b(s.h) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            for (0..m.plan.pre_blocks) |bk| {
+                x.glue(.copy_f32, .{ .rows = nr, .width = c.hidden }, &.{ bo(s.blocks_pre, bk * slab), bo(s.blocks, bk * slab) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            }
+            try x.end();
+        }
         try layer(x, segments, @intCast(i));
         if (out.taps) |tp| {
             // eight u32 picks a row are sixteen 16-bit words: the bf16 copy moves them bit for bit
@@ -569,7 +596,7 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     const s = x.s;
     const c = &m.config.text;
     const p = m.plan.at(i);
-    const w = &m.weights.layers[i];
+    const w = &m.weights.layers[p.physical];
     const n = x.n;
     const nr: u32 = @intCast(n);
     const H: usize = c.hidden;
@@ -580,6 +607,8 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     const stride: u32 = @intCast(s.prefill_rows);
     const slab: usize = s.prefill_rows * H * 4;
     const glob = p.kind == .global;
+    const has_msg = p.pass > 0;
+    const split_qkv = glob or has_msg;
     const one = .{ 1024, 1, 1 };
     const scale_h: f32 = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(H))));
     // the input's unweighted norm; a boundary layer's goes straight into its block slot
@@ -589,25 +618,51 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     const xrow: usize = n * H * 2;
     const xin = [3]B{ b(s.xq), if (x.decode) bo(s.xq, xrow) else b(s.xk), if (x.decode) bo(s.xq, 2 * xrow) else b(s.xv) };
     const xq = xin[0];
-    const xk = if (glob) xin[1] else xq;
-    const xv = if (glob) xin[2] else xq;
-    try x.begin(.norm);
-    if (x.decode) {
-        const nm = w.in_norm;
-        const norms = [3]B{ t(nm[0].?), t(nm[1] orelse nm[0].?), t(nm[2] orelse nm[0].?) };
-        // the global layers' three queries take the wider instance of the kernel
-        x.glue(if (w.attn_query != null and Q > 1) .rdn3 else .rdn, .{ .rows = nr, .width = c.hidden, .queries = if (w.attn_query != null) Q else 0, .blocks = K, .stride = stride, .eps = c.eps, .scale = scale_h }, &.{ b(s.h), b(s.blocks), nrd, if (w.attn_query) |q| t(q) else b(s.nr), norms[0], norms[1], norms[2], xq }, .{ n, 1, 1 }, one, true);
-    } else x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
-    if (w.attn_query) |q| {
-        if (!x.decode) {
-            // the depth mix of the attention input: at the front of the stage on the chunk kernels (the attention and the experts use it
-            // after the norms have read it), a buffer of its own on the per-operation path
-            const mix = if (x.tensor) s.stage else s.ai;
-            x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(q), b(mix) }, .{ n, 1, 1 }, one, true);
-            for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .flags = f32_in, .eps = c.eps }, &.{ bo(mix, j * H * 4), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
+    const xk = if (split_qkv) xin[1] else xq;
+    const xv = if (split_qkv) xin[2] else xq;
+    if (has_msg) {
+        const ctrls = w.controllers.?;
+        const mq = m.weights.message_queries.?;
+        const rank = c.loop.?.gate_rank;
+        const mix = if (x.tensor) s.stage else s.ai;
+        try x.begin(.norm);
+        x.glue(.msg_depth, .{ .rows = nr, .width = c.hidden, .blocks = m.plan.bank_blocks, .queries = 4, .stride = stride, .scale = scale_h }, &.{ b(s.bank_blocks), b(s.bank_partial), bo(mq, @as(usize, p.core_idx) * 4 * H * 4), b(s.msg) }, .{ n, 1, 1 }, one, true);
+        x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
+        x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(w.attn_query.?), b(mix) }, .{ n, 1, 1 }, one, true);
+        try x.end();
+        for (0..3) |j| {
+            const hj = if (glob) bo(mix, j * H * 4) else b(mix);
+            const mj = bo(s.msg, j * H * 4);
+            const nwj = t(if (glob) w.in_norm[j].? else w.in_norm[0].?);
+            try x.begin(.norm);
+            x.glue(.msggate_prep, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden }, &.{ hj, mj, b(s.ctrl_in) }, .{ n, 1, 1 }, one, true);
+            try x.end();
+            try x.begin(.dense);
+            x.proj(ctrls[j].down, b(s.ctrl_in), b(s.ctrl_z), n);
+            try x.end();
+            try x.begin(.norm);
+            x.glue(.msggate_apply_norm, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = Q * c.hidden, .eps = c.eps }, &.{ hj, mj, b(s.ctrl_z), t(ctrls[j].forget.t), t(ctrls[j].gain.t), nwj, xin[j] }, .{ n, 1, 1 }, one, true);
+            try x.end();
         }
-    } else for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .eps = c.eps }, &.{ b(s.h), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
-    try x.end();
+    } else {
+        try x.begin(.norm);
+        if (x.decode) {
+            const nm = w.in_norm;
+            const norms = [3]B{ t(nm[0].?), t(nm[1] orelse nm[0].?), t(nm[2] orelse nm[0].?) };
+            // the global layers' three queries take the wider instance of the kernel
+            x.glue(if (w.attn_query != null and Q > 1) .rdn3 else .rdn, .{ .rows = nr, .width = c.hidden, .queries = if (w.attn_query != null) Q else 0, .blocks = K, .stride = stride, .eps = c.eps, .scale = scale_h }, &.{ b(s.h), b(s.blocks), nrd, if (w.attn_query) |q| t(q) else b(s.nr), norms[0], norms[1], norms[2], xq }, .{ n, 1, 1 }, one, true);
+        } else x.glue(.rms, .{ .rows = nr, .width = c.hidden, .eps = 1e-6 }, &.{ b(s.h), nrd }, .{ n, 1, 1 }, one, true);
+        if (w.attn_query) |q| {
+            if (!x.decode) {
+                // the depth mix of the attention input: at the front of the stage on the chunk kernels (the attention and the experts use it
+                // after the norms have read it), a buffer of its own on the per-operation path
+                const mix = if (x.tensor) s.stage else s.ai;
+                x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K, .queries = Q, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), nrd, t(q), b(mix) }, .{ n, 1, 1 }, one, true);
+                for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = Q * c.hidden, .flags = f32_in, .eps = c.eps }, &.{ bo(mix, j * H * 4), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
+            }
+        } else for (0..Q) |j| x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .eps = c.eps }, &.{ b(s.h), t(w.in_norm[j].?), xin[j] }, .{ n, 1, 1 }, one, true);
+        try x.end();
+    }
     try x.begin(.dense);
     if (x.decode) {
         x.mvs(i, &.{ .{ .x = xq, .w = w.q, .y = b(s.q) }, .{ .x = xk, .w = w.k, .y = b(s.k) }, .{ .x = xv, .w = w.v, .y = b(s.v) }, .{ .x = xq, .w = w.r, .y = b(s.r) }, .{ .x = xq, .w = w.gate, .y = b(s.gate) }, .{ .x = xq, .w = w.sink, .y = b(s.sink) } }, n);
@@ -660,10 +715,11 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
             // Shared-KV global window attention wins once there are enough 256-key blocks to saturate the GPU; shorter contexts
             // keep per-row threadgroups for full occupancy.
             const shared_part = glob and ((seg.rows >= 3 and blocks >= 96) or (seg.rows >= 2 and blocks >= 256));
+            const g3 = hd.q == 3 * hd.kv;
             if (shared_part) {
-                x.glue(.attn_part_w, a, &.{ bo(s.qn, base * qw * 2), keys, values, bo(s.reln, base * @as(usize, hd.q) * c.d_rel * 2), t(w.rel_proj), b(s.part) }, .{ hd.kv, 1, blocks }, part_w_group, true);
+                x.glue(if (g3) .attn_part_w_g3 else .attn_part_w, a, &.{ bo(s.qn, base * qw * 2), keys, values, bo(s.reln, base * @as(usize, hd.q) * c.d_rel * 2), t(w.rel_proj), b(s.part) }, .{ hd.kv, 1, blocks }, if (g3) part_w_g3_group else part_w_group, true);
             } else {
-                x.glue(.attn_part, a, &.{ bo(s.qn, base * qw * 2), keys, values, bo(s.reln, base * @as(usize, hd.q) * c.d_rel * 2), t(w.rel_proj), b(s.part) }, .{ hd.kv, seg.rows, blocks }, part_group, true);
+                x.glue(if (g3) .attn_part_g3 else .attn_part, a, &.{ bo(s.qn, base * qw * 2), keys, values, bo(s.reln, base * @as(usize, hd.q) * c.d_rel * 2), t(w.rel_proj), b(s.part) }, .{ hd.kv, seg.rows, blocks }, part_group, true);
             }
             x.glue(.attn_merge, a, &.{ b(s.part), bo(s.sink, base * @as(usize, hd.q) * 2), bo(s.gate, base * qw * 2), bo(s.att, base * qw * 2) }, .{ hd.q, seg.rows, 1 }, .{ 32, 1, 1 }, true);
             base += seg.rows;
@@ -692,16 +748,33 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     x.proj(w.o, b(s.att), b(s.o), n);
     try x.end();
     try x.conv(segments, .{ .static = w.attn_conv }, b(s.o), b(s.o), b(s.ya), i, 2, H, 0);
-    try x.begin(.norm);
-    if (x.decode) {
-        x.glue(.rrdn, .{ .rows = nr, .width = c.hidden, .blocks = K, .stride = stride, .flags = if (p.boundary) boundary else 0, .eps = c.eps, .scale = scale_h }, &.{ b(s.h), b(s.ya), b(s.res), b(s.blocks), b(s.ns), t(w.mlp_query), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
-    } else {
+    if (has_msg) {
+        const ctrls = w.controllers.?;
+        const rank = c.loop.?.gate_rank;
+        try x.begin(.norm);
         x.glue(.resid, .{ .rows = nr, .width = c.hidden, .flags = if (p.boundary) boundary else 0 }, &.{ b(s.h), b(s.ya), b(s.res) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
         x.glue(.rms, .{ .rows = nr, .width = c.hidden, .flags = f32_in, .eps = 1e-6 }, &.{ b(s.res), b(s.ns) }, .{ n, 1, 1 }, one, true);
         x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K + @intFromBool(p.boundary), .queries = 1, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), b(s.ns), t(w.mlp_query), b(s.mi) }, .{ n, 1, 1 }, one, true);
-        x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .flags = f32_in, .eps = c.eps }, &.{ b(s.mi), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
+        x.glue(.msggate_prep, .{ .rows = nr, .width = c.hidden, .stride = c.hidden }, &.{ b(s.mi), bo(s.msg, 3 * H * 4), b(s.ctrl_in) }, .{ n, 1, 1 }, one, true);
+        try x.end();
+        try x.begin(.dense);
+        x.proj(ctrls[3].down, b(s.ctrl_in), b(s.ctrl_z), n);
+        try x.end();
+        try x.begin(.norm);
+        x.glue(.msggate_apply_norm, .{ .rows = nr, .width = c.hidden, .dim = rank, .stride = c.hidden, .eps = c.eps }, &.{ b(s.mi), bo(s.msg, 3 * H * 4), b(s.ctrl_z), t(ctrls[3].forget.t), t(ctrls[3].gain.t), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
+        try x.end();
+    } else {
+        try x.begin(.norm);
+        if (x.decode) {
+            x.glue(.rrdn, .{ .rows = nr, .width = c.hidden, .blocks = K, .stride = stride, .flags = if (p.boundary) boundary else 0, .eps = c.eps, .scale = scale_h }, &.{ b(s.h), b(s.ya), b(s.res), b(s.blocks), b(s.ns), t(w.mlp_query), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
+        } else {
+            x.glue(.resid, .{ .rows = nr, .width = c.hidden, .flags = if (p.boundary) boundary else 0 }, &.{ b(s.h), b(s.ya), b(s.res) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            x.glue(.rms, .{ .rows = nr, .width = c.hidden, .flags = f32_in, .eps = 1e-6 }, &.{ b(s.res), b(s.ns) }, .{ n, 1, 1 }, one, true);
+            x.glue(.depth, .{ .rows = nr, .width = c.hidden, .blocks = K + @intFromBool(p.boundary), .queries = 1, .stride = stride, .scale = scale_h }, &.{ b(s.blocks), b(s.ns), t(w.mlp_query), b(s.mi) }, .{ n, 1, 1 }, one, true);
+            x.glue(.norm, .{ .rows = nr, .width = c.hidden, .stride = c.hidden, .flags = f32_in, .eps = c.eps }, &.{ b(s.mi), t(w.mlp_norm), b(s.xm) }, .{ n, 1, 1 }, one, true);
+        }
+        try x.end();
     }
-    try x.end();
     try x.begin(.route);
     if (x.tensor) {
         x.gemm(w.router, b(s.xm), b(s.logits32), n, .f32);
@@ -710,21 +783,41 @@ fn layer(x: Enc, segments: []const Segment, i: u32) !void {
     // a layer's experts take a chain when it can (the decode chain in a window, or the tensor-unit chain in a chunk or
     // wide shared decode batch) and the per-row path when it cannot: the chains read picks as routed and sort them themselves
     const slots = n * c.topk;
-    const rows = st.tileRows(slots, c.experts);
-    const chain = w.xd_ok and (x.decode or x.tensor);
-    if (!chain) x.glue(.tiles, .{ .rows = @intCast(slots), .width = c.experts, .queries = c.topk, .stride = @intCast(rows) }, &.{ b(s.eids), b(s.texp), b(s.tslot), b(s.ttok) }, .{ 1, 1, 1 }, one, true);
-    try x.end();
     const I: usize = c.expert_inter;
-    try x.begin(.experts);
-    if (chain) {
-        if (x.tensor or x.xp_batch) x.xp(w) else x.xd(w, n);
-    } else {
-        try x.experts(w.w13, b(s.xm), H, n, b(s.gu), slots, rows, s.ttok);
-        x.glue(.swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.gu), b(s.act) }, .{ I, slots, 1 }, .{ 256, 1, 1 }, false);
-        try x.experts(w.w2, b(s.act), I, slots, b(s.ey), slots, rows, s.tslot);
-        x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+    switch (w.experts) {
+        .exl3 => |ex| {
+            const rows = st.tileRows(slots, c.experts);
+            const chain = ex.xd_ok and (x.decode or x.tensor);
+            if (!chain) x.glue(.tiles, .{ .rows = @intCast(slots), .width = c.experts, .queries = c.topk, .stride = @intCast(rows) }, &.{ b(s.eids), b(s.texp), b(s.tslot), b(s.ttok) }, .{ 1, 1, 1 }, one, true);
+            try x.end();
+            try x.begin(.experts);
+            if (chain) {
+                if (x.tensor or x.xp_batch) x.xp(w) else x.xd(w, n);
+            } else {
+                try x.experts(ex.w13, b(s.xm), H, n, b(s.gu), slots, rows, s.ttok);
+                x.glue(.swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.gu), b(s.act) }, .{ I, slots, 1 }, .{ 256, 1, 1 }, false);
+                try x.experts(ex.w2, b(s.act), I, slots, b(s.ey), slots, rows, s.tslot);
+                x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            }
+            try x.end();
+        },
+        .nvfp4 => |nv| {
+            try x.end();
+            try x.begin(.experts);
+            x.glue(.nvfp4_w13_swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), b(s.eids), t(nv.w13.weight), t(nv.w13.scale), b(nv.w13.global_scale), b(s.act) }, .{ (I + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
+            x.glue(.nvfp4_w2, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), b(s.eids), t(nv.w2.weight), t(nv.w2.scale), b(nv.w2.global_scale), b(s.ey) }, .{ (H + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
+            x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            try x.end();
+        },
+        .mxfp8 => |mx| {
+            try x.end();
+            try x.begin(.experts);
+            x.glue(.mxfp8_w13_swiglu, .{ .rows = @intCast(slots), .width = c.expert_inter, .dim = c.hidden, .queries = c.topk, .cap = c.gate_cap, .thr = c.up_cap }, &.{ b(s.xm), b(s.eids), t(mx.w13.weight), t(mx.w13.scale), b(s.act) }, .{ (I + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
+            x.glue(.mxfp8_w2, .{ .rows = @intCast(slots), .width = c.hidden, .dim = c.expert_inter }, &.{ b(s.act), b(s.eids), t(mx.w2.weight), t(mx.w2.scale), b(s.ey) }, .{ (H + 3) / 4, slots, 1 }, .{ 128, 1, 1 }, true);
+            x.glue(.combine, .{ .rows = nr, .width = c.hidden, .queries = c.topk }, &.{ b(s.ey), b(s.ew), b(s.moe) }, .{ H, n, 1 }, .{ 256, 1, 1 }, false);
+            try x.end();
+        },
     }
-    try x.end();
     if (x.decode) {
         try x.convOut(segments, w.mlp_conv, b(s.moe), b(s.res), b(s.h), i, H);
     } else {
